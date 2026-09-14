@@ -61,7 +61,9 @@ export const CHAINS: Record<'mainnet' | 'sepolia', ChainSetup> = {
     aavePool: '0x6Ae43d3271ff6888e7Fc43Fd7321a503ff738951',
     // Aave's Sepolia DAI is also the token behind the DAI/WETH 0.05% pool Kohaku's tests use.
     demoTokenOut: { address: '0xFF34B3d4Aee8ddCd6F9AFFFB6Fe49bD371b8a357', symbol: 'DAI', uniswapFee: 500 },
-    publicRpc: 'https://ethereum-sepolia-rpc.publicnode.com',
+    // publicnode's Sepolia log index is incomplete (drops ~half the Tornado Deposit logs); tenderly and
+    // rpc.sepolia.ethpandaops.io return complete eth_getLogs results.
+    publicRpc: 'https://sepolia.gateway.tenderly.co',
     pimlicoPublicBundler: 'https://public.pimlico.io/v2/11155111/rpc',
   },
 };

@@ -17,7 +17,7 @@ import { syncLeaves } from '../src/merkle.js';
 import { commitmentHex, createNote, nullifierHashHex, toNoteString } from '../src/note.js';
 import { createTornadoProver, type TornadoProver } from '../src/prover.js';
 import { paymasterHash, encodePaymasterData, DUMMY_SIGNATURE } from '@tornado-4337/relayer';
-import { ANVIL_KEYS, startHarness, type Harness } from './harness.js';
+import { startHarness, type Harness } from './harness.js';
 
 const log = (m: string) => console.log(`[e2e] ${m}`);
 
@@ -40,8 +40,7 @@ describe('withdraw -> swap -> Aave supply, atomically over ERC-4337 with the thi
     const chain = setup.chain;
 
     // --- 1. A depositor shields 0.1 ETH into the fresh instance. -------------
-    const depositor = privateKeyToAccount(ANVIL_KEYS[4]!);
-    await h.setBalance(depositor.address, parseEther('10'));
+    const depositor = await h.newFundedAccount(parseEther('10'));
     const depositorWallet = createWalletClient({ account: depositor, chain, transport: http(h.rpcUrl) });
     const note = createNote();
     log(`note: ${toNoteString(note, 'eth', '0.1', chain.id)}`);

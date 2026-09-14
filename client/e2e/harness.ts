@@ -10,7 +10,7 @@ import {
   type Hex,
   type PublicClient,
 } from 'viem';
-import { privateKeyToAccount } from 'viem/accounts';
+import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 
 import { createRelayerApp, RelayerService } from '@tornado-4337/relayer';
 import { CHAINS, type ChainSetup } from '../src/chains.js';
@@ -41,6 +41,8 @@ export interface Harness {
   zap: Address;
   relayer: RelayerService;
   setBalance(address: Address, wei: bigint): Promise<void>;
+  /** A brand-new EOA funded with `wei` (default 10 ETH). */
+  newFundedAccount(wei?: bigint): Promise<ReturnType<typeof privateKeyToAccount>>;
   mine(blocks?: number): Promise<void>;
   stop(): Promise<void>;
 }
@@ -94,11 +96,22 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
   const setBalance = (address: Address, wei: bigint) => testClient.setBalance({ address, value: wei });
   const mine = (blocks = 1) => testClient.mine({ blocks });
 
-  const deployer = privateKeyToAccount(ANVIL_KEYS[0]!);
-  const relayerSigner = privateKeyToAccount(ANVIL_KEYS[1]!);
-  const executor = privateKeyToAccount(ANVIL_KEYS[2]!);
-  const utility = privateKeyToAccount(ANVIL_KEYS[3]!);
+  // Fresh keys, not the well-known anvil ones: on public testnets those EOAs are frequently
+  // EIP-7702-delegated by tutorials, which breaks the bundler's beneficiary accounting.
+  const deployerKey = generatePrivateKey();
+  const relayerKey = generatePrivateKey();
+  const executorKey = generatePrivateKey();
+  const utilityKey = generatePrivateKey();
+  const deployer = privateKeyToAccount(deployerKey);
+  const relayerSigner = privateKeyToAccount(relayerKey);
+  const executor = privateKeyToAccount(executorKey);
+  const utility = privateKeyToAccount(utilityKey);
   for (const a of [deployer, relayerSigner, executor, utility]) await setBalance(a.address, parseEther('1000'));
+  const newFundedAccount = async (wei = parseEther('10')) => {
+    const account = privateKeyToAccount(generatePrivateKey());
+    await setBalance(account.address, wei);
+    return account;
+  };
 
   const wallet = createWalletClient({ account: deployer, chain, transport: http(rpcUrl) });
 
@@ -146,11 +159,16 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
   const altoInstance = Instance.alto({
     rpcUrl,
     entrypoints: [setup.entryPoint],
-    executorPrivateKeys: [ANVIL_KEYS[2]!],
-    utilityPrivateKey: ANVIL_KEYS[3]!,
+    executorPrivateKeys: [executorKey],
+    utilityPrivateKey: utilityKey,
     safeMode: false,
     port: altoPort,
   });
+  if (process.env.ALTO_LOG_FILE) {
+    // Raw bundler log for debugging (every message alto prints).
+    const { appendFileSync } = await import('node:fs');
+    altoInstance.on('message', (m: string) => appendFileSync(process.env.ALTO_LOG_FILE!, m + '\n'));
+  }
   await altoInstance.start();
   const bundlerUrl = `http://127.0.0.1:${altoPort}`;
   log(`alto bundler on ${bundlerUrl}`);
@@ -163,7 +181,7 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
       bundlerUrl,
       entryPoint: setup.entryPoint,
       paymaster,
-      signerKey: ANVIL_KEYS[1]!,
+      signerKey: relayerKey,
       instances: opts.canonicalInstances ? Object.values(setup.tornadoEth) : [instance],
       serviceFeeBps: opts.serviceFeeBps ?? 30n,
       signatureTtlSec: 300,
@@ -195,6 +213,7 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
     zap,
     relayer,
     setBalance,
+    newFundedAccount,
     mine,
     async stop() {
       await new Promise<void>((r) => server.close(() => r()));

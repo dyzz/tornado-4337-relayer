@@ -89,12 +89,18 @@ MAINNET_RPC_URL=https://ethereum-rpc.publicnode.com pnpm --filter @tornado-4337/
 Set `TORNADO_ARTIFACTS_DIR` to a directory holding `tornado.json` and `tornadoProvingKey.bin`
 (e.g. tornado-cli's `circuits/`); otherwise they are downloaded once into `client/artifacts/`.
 
-Kohaku SDK integration (Sepolia fork, real Tornado pools, real Kohaku SDK with the patch):
+Kohaku SDK integration (Sepolia fork, real Tornado pools, real Kohaku SDK with the patch; shield with
+the SDK, unshield in `paymaster` mode with a wrap-and-supply-to-Aave tail call):
 
 ```bash
 pnpm --filter @tornado-4337/kohaku-integration setup   # clone kohaku @ pinned commit, apply patch, build
-SEPOLIA_RPC_URL=<archive-capable sepolia rpc> pnpm --filter @tornado-4337/kohaku-integration e2e
+pnpm --filter @tornado-4337/kohaku-integration e2e     # ~5 min, most of it SDK sync
 ```
+
+Two testnet pitfalls the harness works around: publicnode's Sepolia `eth_getLogs` silently drops about
+half of the Tornado `Deposit` logs (the default fork RPC is tenderly's gateway, and the Kohaku host feeds
+the SDK through a gap-checked `externalSyncProvider`), and the well-known anvil keys are EIP-7702-delegated
+on Sepolia, which breaks the bundler's beneficiary accounting (the harness uses fresh keys).
 
 ## Deploy for real
 
@@ -116,14 +122,15 @@ Point a Kohaku host at it by adding `relayer: { url }` to the chain's `paymaster
 (see `kohaku-integration/example/withdraw-with-relayer.ts`). Any viem/permissionless wallet can use
 the relayer as an ERC-7677 paymaster client: `createPaymasterClient({ transport: http(RELAYER_URL) })`.
 
-## Economics (from the mainnet-fork e2e)
+## Economics (from the e2e runs, 0.1 ETH note, ~1.1 gwei)
 
-| | wei |
-| --- | --- |
-| fee bound in the proof | 1 604 324 488 614 492 |
-| actual gas cost | 899 983 318 112 160 |
-| refund to user | 259 890 266 176 116 |
-| paymaster net (margin + 0.3 % service fee) | +385 582 723 203 636 |
+| | mainnet fork (swap + Aave) | Sepolia fork via Kohaku SDK (wrap + Aave) |
+| --- | --- | --- |
+| fee bound in the proof | 0.001604 ETH | 0.001428 ETH |
+| actual gas cost | 0.000900 ETH | — |
+| refund to user | 0.000260 ETH | 0.000217 ETH |
+| paymaster net (10 % margin + 0.3 % service fee) | +0.000386 ETH | — |
+| landed on the user | 247.09 aUSDC | 0.098572 aWETH |
 
 ## Notes and limits
 

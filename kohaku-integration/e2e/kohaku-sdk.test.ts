@@ -43,7 +43,13 @@ interface IGenericPaymasterWithdrawalPayload {
 }
 
 import { aavePoolAbi, erc20Abi, loadArtifacts, paymasterAdminAbi, zapAbi } from '@tornado-4337/client';
-import { ANVIL_KEYS, startHarness, type Harness } from '@tornado-4337/client/e2e/harness';
+import { startHarness, type Harness } from '@tornado-4337/client/e2e/harness';
+import { createRobustSyncProvider } from './robust-sync-provider.js';
+
+interface SnapshotState {
+  sync: { lastSyncedBlock: Hex };
+  deposits: { depositsTuples: [string, unknown[]][] };
+}
 
 const here = dirname(fileURLToPath(import.meta.url));
 const SNAPSHOT = join(here, '..', 'vendor', 'kohaku', 'packages', 'tornado-cash', 'tests', 'state.11155111.json');
@@ -61,11 +67,42 @@ describe('Kohaku SDK -> thin relayer paymaster (Sepolia fork)', () => {
     h = await startHarness({ chainKey: 'sepolia', canonicalInstances: true, log });
 
     const publicClient = createPublicClient({ chain: h.setup.chain, transport: http(h.rpcUrl), cacheTime: 0 });
+
+    // Kohaku's bundled Sepolia snapshot ends at block 0xa8e25e; the SDK must sync the rest. Public
+    // RPCs drop logs on big ranges, so the host serves that range through a gap-checked provider.
+    const snapshot = JSON.parse(readFileSync(SNAPSHOT, 'utf8')) as Record<string, SnapshotState>;
+    const state = Object.values(snapshot)[0]!;
+    const snapshotBlock = BigInt(state.sync.lastSyncedBlock);
+    const snapshotLeaves = new Map<string, number>();
+    for (const [pool, tuples] of state.deposits.depositsTuples) snapshotLeaves.set(pool.toLowerCase(), tuples.length);
+    const headAtStart = await publicClient.getBlockNumber();
+    const externalSyncProvider = createRobustSyncProvider({
+      client: publicClient,
+      chainId: CHAIN_ID,
+      firstBlock: snapshotBlock,
+      lastBlock: headAtStart,
+      chunk: 2_500n,
+      expectedFirstLeafIndex: (address) => snapshotLeaves.get(address.toLowerCase()),
+      nextIndexAtHead: async (address) =>
+        snapshotLeaves.has(address.toLowerCase())
+          ? Number(
+              await publicClient.readContract({
+                address,
+                abi: [{ type: 'function', name: 'nextIndex', stateMutability: 'view', inputs: [], outputs: [{ type: 'uint32' }] }],
+                functionName: 'nextIndex',
+                blockNumber: headAtStart,
+              }),
+            )
+          : undefined,
+      log,
+    });
+
     const host: Host = {
       keystore: new MnemonicKeystore(TEST_MNEMONIC),
       storage: new MemoryStorage(),
       network: { fetch },
       provider: viemProvider(publicClient),
+      externalSyncProvider,
     };
 
     // The only integration point: a `relayer` entry in the chain's paymaster config.
@@ -83,8 +120,9 @@ describe('Kohaku SDK -> thin relayer paymaster (Sepolia fork)', () => {
     protocol = new TornadoCashProtocol(host, {
       protocolConfig: TornadoCashConfigs[CHAIN_ID],
       paymasterConfig,
-      initialState: async () => JSON.parse(readFileSync(SNAPSHOT, 'utf8')),
+      initialState: async () => snapshot as never,
       artifactsLoader: async () => ({ circuitText: artifacts.circuitText, provingKey: artifacts.provingKey }),
+      minExternalSyncBlocksAmount: 1,
     });
     broadcaster = createTCBroadcaster(host, { paymasterConfig });
 
@@ -104,8 +142,7 @@ describe('Kohaku SDK -> thin relayer paymaster (Sepolia fork)', () => {
     const AMOUNT = parseEther('0.1');
 
     // --- shield ------------------------------------------------------------------
-    const alice = privateKeyToAccount(ANVIL_KEYS[4]!);
-    await h.setBalance(alice.address, parseEther('10'));
+    const alice = await h.newFundedAccount(parseEther('10'));
     const aliceWallet = createWalletClient({ account: alice, chain: setup.chain, transport: http(h.rpcUrl) });
     const { txns } = await protocol.prepareShield({ asset: nativeAsset, amount: AMOUNT });
     for (const tx of txns) {
