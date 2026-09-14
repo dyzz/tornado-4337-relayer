@@ -1,897 +1,214 @@
 # tornado-4337-relayer
 
-**A thin Tornado Cash sponsorship layer for atomic ERC-4337 withdrawals.**
+**Let today's Tornado Cash relayers sponsor atomic ERC-4337 withdrawals — without becoming bundlers.**
 
 English | [简体中文](#简体中文)
 
-This project demonstrates how the existing Tornado Cash relayer model can support ERC-4337 atomic flows **without modifying existing Tornado pool contracts and without requiring Tornado relayers to become bundlers**.
+> Status: working proof of concept — Kohaku wallet integration, mainnet-fork tests, one live run on Sepolia.
+> Experimental, unaudited, not for production.
 
-The relayer stays intentionally thin:
+## What it does
 
-- quote the Tornado withdrawal fee;
-- validate the withdrawal and UserOperation off-chain;
-- sign sponsorship terms for a verifying paymaster.
+A user withdraws a Tornado note and, in the **same transaction**, swaps the funds and deposits them into Aave.
+Gas is paid from the note itself. The receiving account never needs ETH.
 
-The wallet then submits the sponsored UserOperation to a standard ERC-4337 bundler.
+The relayer's job barely changes. It still quotes a fee, checks the withdrawal, and gets paid by the pool.
+The one thing it stops doing is sending the transaction: it **signs** an authorization instead, and the user's
+wallet hands the operation to any ERC-4337 bundler.
 
-This enables flows such as:
+This is meant as an upgrade path for existing relayers, not a way around them:
 
-```text
-Tornado withdraw → swap → Aave supply
-```
+- your pools, your fee policy, your price oracle (the same 1inch oracle `tornado-relayer` uses), your Tor setup;
+- Tornado pool contracts and the circuit are untouched — the proof simply names your paymaster as `relayer`;
+- no custody, no user keys, no bundler to run, no mempool to babysit.
 
-inside **one atomic UserOperation**.
+## How a withdrawal works
 
-> **Status:** working PoC with Kohaku SDK integration, mainnet-fork E2E tests, and a live Sepolia run.  
-> **Warning:** experimental software, not audited and not production-ready.
+1. The wallet asks the relayer for a quote and puts the quoted fee into the ZK proof (`relayer = paymaster`).
+2. The wallet builds a UserOperation: `withdraw` → (swap) → `Aave.supply`, all from a fresh EIP-7702 account.
+3. The relayer checks the proof, root, nullifier and fee, simulates the whole operation, and signs.
+4. The wallet sends the signed operation to a bundler (Pimlico in the demo, but any bundler works).
+5. On-chain: the paymaster's signature is verified, the pool pays the fee to the paymaster, the tail calls run,
+   and `postOp` keeps actual gas + margin + service fee and **refunds the rest** to the user.
 
----
+If any step of the tail reverts, the withdrawal reverts with it. Nothing leaves the pool.
 
-## Why
+## Live run on Sepolia
 
-A traditional Tornado Cash relayer has a narrow, application-specific role:
+Driven end to end by the Kohaku CLI wallet (patched to talk to the relayer), bundled by Pimlico's public endpoint.
 
-```text
-user → Tornado relayer → Tornado pool
-```
-
-ERC-4337 makes atomic post-withdrawal actions possible today, but sponsorship and transaction inclusion do not need to be handled by the same entity.
-
-This project separates those responsibilities:
-
-```text
-                         ┌────────────────────────┐
-User / Kohaku ──────────→│ Tornado thin relayer  │
-                         │ quote / check / sign   │
-                         └───────────┬────────────┘
-                                     │ sponsorship
-                                     ▼
-                         ┌────────────────────────┐
-                         │ Verifying Paymaster    │
-                         └────────────────────────┘
-
-User / Kohaku
-      │
-      │ sponsored UserOperation
-      ▼
-Generic ERC-4337 bundler
-      │
-      ▼
-EntryPoint
-      │
-      ▼
-withdraw → arbitrary atomic actions
-```
-
-The Tornado-specific logic remains with the relayer.
-
-Bundling remains generic infrastructure.
-
----
-
-## What this demonstrates
-
-### Existing Tornado pools stay unchanged
-
-The withdrawal still executes against the existing Tornado pool contract.
-
-The zk proof binds the usual public inputs:
-
-```text
-recipient
-relayer
-fee
-```
-
-In this design:
-
-```text
-relayer = TornadoRelayerPaymaster
-```
-
-so the existing pool pays the relayer fee directly to the paymaster during execution.
-
-No change to the Tornado pool contracts or proving circuit is required.
-
-### The relayer does not become a bundler
-
-The relayer never submits the Ethereum transaction.
-
-It only:
-
-```text
-quote
-→ validate
-→ simulate
-→ sign sponsorship
-→ return authorization
-```
-
-The wallet can submit the resulting UserOperation to any compatible ERC-4337 bundler.
-
-### Sponsorship remains Tornado-specific
-
-The relayer can keep the same kind of application-specific policy Tornado relayers already have:
-
-- supported pools;
-- fee policy;
-- proof / root / nullifier validation;
-- gas pricing;
-- service fees;
-- privacy policy;
-- Tor or other private transport.
-
-### Atomic post-withdrawal actions
-
-Because the withdrawal and following calls execute from the same ERC-4337 account, arbitrary actions can be composed atomically.
-
-For example:
-
-```text
-withdraw ETH
-→ wrap ETH
-→ swap
-→ supply to Aave
-```
-
-or:
-
-```text
-withdraw
-→ swap
-→ transfer
-```
-
-If the atomic execution reverts, the Tornado withdrawal reverts with it as part of the same UserOperation.
-
----
-
-## Architecture
-
-```mermaid
-sequenceDiagram
-    autonumber
-
-    participant W as Kohaku / Wallet
-    participant R as Tornado thin relayer
-    participant B as ERC-4337 bundler
-    participant E as EntryPoint v0.8
-
-    W->>R: tornado_quote
-    R-->>W: fee + paymaster
-
-    W->>W: generate Tornado proof
-    Note over W: recipient = sender<br/>relayer = paymaster<br/>fee = quoted fee
-
-    W->>R: pm_getPaymasterStubData
-    W->>B: eth_estimateUserOperationGas
-
-    W->>R: pm_getPaymasterData
-    R->>R: validate withdraw + fee + UserOp
-    R->>R: simulate withdraw / full op
-    R-->>W: sponsorship signature
-
-    W->>W: sign UserOperation
-    W->>B: eth_sendUserOperation
-
-    B->>E: handleOps(...)
-
-    E->>E: verify paymaster authorization
-    E->>E: Tornado withdraw
-    E->>E: swap / Aave / other tail calls
-    E->>E: paymaster settles gas, fee and refund
-```
-
----
-
-## Packages
-
-| Path | Purpose |
+| | |
 | --- | --- |
-| `contracts/` | `TornadoRelayerPaymaster.sol` and `SwapAndSupplyZap.sol` |
-| `contracts-tornado/` | Upstream Tornado contracts compiled separately for fork testing |
-| `relayer/` | Thin ERC-7677-compatible sponsorship service |
-| `client/` | Reference client, proof generation, state sync and E2E harness |
-| `kohaku-integration/` | Kohaku SDK patch, example host and E2E integration |
+| Paymaster | [`0xA05e1201…6E94`](https://sepolia.etherscan.io/address/0xA05e12016882b2FE01A080b04F5D2F6FC3AC6E94) |
+| Shield 0.1 ETH (Kohaku wallet) | [`0x14c3daaa…73ac`](https://sepolia.etherscan.io/tx/0x14c3daaa20829573465c0c5a96b6eb5fbcbae42a114b8dfedf9c93c5496e73ac) |
+| Unshield → wrap → Aave, one transaction | [`0x5d61d705…7000`](https://sepolia.etherscan.io/tx/0x5d61d705186b06381a29c23a272c7aba92a15b2cb6012c8548105524b41b7000) |
+| Fee bound in the proof / actual gas / refund | 0.00238 ETH / 0.00093 ETH / 0.00103 ETH |
+| Landed in the wallet | 0.09762 aWETH |
+| Paymaster deposit | 0.05 → 0.050417 ETH |
 
----
+Mainnet-fork tests cover ETH (swap → aUSDC) and ERC-20 pools (DAI → aDAI, fee paid and refunded in DAI).
 
-## Paymaster
+## For relayer operators
 
-`TornadoRelayerPaymaster` is a verifying ERC-4337 paymaster.
+```bash
+# 1. deploy the paymaster once (owner key) and give it an EntryPoint deposit
+cd contracts && PRIVATE_KEY=0x… RELAYER_SIGNER=0x<your signing address> DEPOSIT_WEI=100000000000000000 \
+  forge script script/Deploy.s.sol --rpc-url $RPC_URL --broadcast
 
-During validation it checks the relayer's signature over the UserOperation and fee terms.
-
-During execution:
-
-```text
-Tornado pool
-    │
-    ├─ denomination - fee → sender
-    └─ fee → paymaster
+# 2. run the signing service next to your existing relayer
+cd relayer && cp .env.example .env    # PAYMASTER_ADDRESS, RELAYER_PRIVATE_KEY, TORNADO_INSTANCES, SERVICE_FEE_BPS, PRICE_SOURCE
+pnpm start                            # JSON-RPC on :8787 (pm_getPaymasterStubData / pm_getPaymasterData / tornado_quote / tornado_status)
 ```
 
-After execution, `postOp`:
+Economics: the paymaster keeps `actual gas × (1 + margin) + service fee` per withdrawal and re-deposits ETH fees
+automatically; ERC-20 fees accumulate in the contract until you sweep and convert them.
 
-1. calculates the actual gas cost;
-2. keeps gas cost + configured margin + service fee;
-3. refunds the unused part of the quoted fee;
-4. re-deposits retained ETH into EntryPoint.
+## For wallets
 
-For ERC-20 Tornado pools, fees are paid in the pool token and priced off-chain by the relayer.
-
-The current `paymasterAndData` layout is:
-
-```text
-paymaster(20)
-| paymasterVerificationGasLimit(16)
-| paymasterPostOpGasLimit(16)
-| validUntil(6)
-| validAfter(6)
-| fee(32)
-| serviceFee(32)
-| refundTo(20)
-| feeToken(20)
-| tokenPerEth(32)
-| signature(65)
-```
-
----
-
-## Thin relayer
-
-The relayer exposes:
-
-```text
-tornado_quote
-pm_getPaymasterStubData
-pm_getPaymasterData
-tornado_status
-```
-
-The relayer holds only its sponsorship signing key.
-
-It does **not**:
-
-- custody user funds;
-- receive the user's ephemeral sender private key;
-- submit bundles;
-- operate a UserOperation mempool;
-- need to be the bundler.
-
-The wallet remains responsible for choosing a bundler and broadcasting the sponsored UserOperation.
-
-### Sponsorship flow
-
-`pm_getPaymasterData`:
-
-1. decodes the account calls;
-2. finds the sponsored Tornado withdrawal;
-3. checks that `relayer == paymaster`;
-4. verifies that the quoted fee covers the actual UserOperation gas limits;
-5. rejects simultaneous sponsorship of the same nullifier;
-6. simulates the Tornado withdrawal;
-7. optionally asks the bundler to estimate the full UserOperation;
-8. signs the sponsorship terms with a short validity window.
-
----
-
-## Kohaku integration
-
-Kohaku already has a `mode: 'paymaster'` unshield path backed by the trustless PrivacyPaymaster.
-
-This repository adds a second sponsorship model behind the same API, selected per chain by config:
-
-```text
-trustless PrivacyPaymaster        (Kohaku default)
-Tornado relayer-signed Paymaster  (this project)
-```
-
-The integration reuses Kohaku's existing:
-
-- EIP-7702 ephemeral sender;
-- Tornado proof generation;
-- account execution;
-- broadcaster;
-- tail-call support.
-
-The main host-side addition is a relayer endpoint:
+Kohaku hosts add one line to the chain's paymaster config:
 
 ```ts
-const paymasterConfig = {
-  [chainId]: {
-    bundlerUrl: 'https://public.pimlico.io/v2/11155111/rpc',
-    entryPointAddress: '0x4337084D9E255Ff0702461CF8895CE9E3b5Ff108',
-    paymasterAddress: '<TornadoRelayerPaymaster>',
-    poolsAccountsMap: {},
-    relayer: { url: 'https://relayer.example/' },
-  },
-};
+paymasterConfig[chainId] = { ...existing, paymasterAddress: '<paymaster>', relayer: { url: 'https://your-relayer/' } };
 ```
 
-Any viem / permissionless wallet can also use the relayer as an ERC-7677 paymaster client.
+The rest of Kohaku's `mode: 'paymaster'` path (7702 sender, proof, tail calls, broadcaster) is reused.
+Any viem / permissionless stack can use the relayer as an ERC-7677 paymaster client.
+With the patched Kohaku CLI:
 
----
+```bash
+KOHAKU_TORNADO_RELAYER_URL=http://localhost:8787 KOHAKU_TORNADO_PAYMASTER=0x<paymaster> \
+kohaku unshield --protocol tornado --wallet me --next --amount-formatted 0.1 \
+  --tail-calls <zap>:<wrapEthAndSupply(you)>:max --broadcast
+```
 
-## Run locally
-
-Requirements:
-
-- Foundry
-- Node.js >= 22
-- pnpm
-
-Install and test:
+## Run the tests
 
 ```bash
 pnpm install
-
-(cd contracts && forge install && forge build && forge test)
-(cd contracts-tornado && forge build)
-
-pnpm --filter @tornado-4337/relayer test
+(cd contracts && forge install && forge test)                    # paymaster unit tests
+pnpm --filter @tornado-4337/relayer test                          # relayer unit tests
+MAINNET_RPC_URL=… pnpm --filter @tornado-4337/client e2e          # mainnet fork: ETH + DAI flows
+pnpm --filter @tornado-4337/kohaku-integration setup && pnpm --filter @tornado-4337/kohaku-integration e2e   # real Kohaku SDK, Sepolia fork
 ```
 
-Run the full mainnet-fork flow:
+## Repository
 
-```bash
-MAINNET_RPC_URL=https://ethereum-rpc.publicnode.com \
-  pnpm --filter @tornado-4337/client e2e
-```
-
-The harness uses:
-
-- EntryPoint v0.8;
-- `Simple7702Account`;
-- Uniswap V3;
-- Aave V3;
-- a fresh Tornado ETH instance bound to the real Groth16 verifier;
-- an ERC-4337 bundler;
-- the thin relayer.
-
-If `TORNADO_ARTIFACTS_DIR` is not set, the client downloads the Tornado circuit artifacts once into `client/artifacts/`.
-
----
-
-## Kohaku SDK E2E
-
-```bash
-pnpm --filter @tornado-4337/kohaku-integration setup
-pnpm --filter @tornado-4337/kohaku-integration e2e
-```
-
-The test:
-
-- clones Kohaku at a pinned commit;
-- applies the relayer-signed paymaster patch;
-- shields through the real Kohaku SDK;
-- unshields through the relayer / paymaster path;
-- performs atomic tail calls.
-
----
-
-## Run on Sepolia
-
-You need:
-
-- an owner key;
-- a relayer signer key;
-- a user key;
-- enough Sepolia ETH for deployment, paymaster deposit, a note and gas.
-
-### 1. Deploy contracts
-
-```bash
-cd contracts
-
-PRIVATE_KEY=0x<owner> \
-RELAYER_SIGNER=0x<relayer address> \
-DEPOSIT_WEI=50000000000000000 \
-DEPLOY_ZAP=true \
-WETH=0xC558DBdd856501FCd9aaF1E62eae57A9F0629a3c \
-SWAP_ROUTER=0x3bFA4769FB09eefC5a80d6E87c3B9C650f7Ae48E \
-AAVE_POOL=0x6Ae43d3271ff6888e7Fc43Fd7321a503ff738951 \
-forge script script/Deploy.s.sol \
-  --rpc-url https://sepolia.gateway.tenderly.co \
-  --broadcast
-```
-
-### 2. Run the relayer
-
-```bash
-cd relayer
-
-cat > .env <<EOF
-CHAIN_ID=11155111
-RPC_URL=https://sepolia.gateway.tenderly.co
-BUNDLER_URL=https://public.pimlico.io/v2/11155111/rpc
-PAYMASTER_ADDRESS=0x<paymaster>
-RELAYER_PRIVATE_KEY=0x<relayer>
-TORNADO_INSTANCES=0x8C4A04d872a6C1BE37964A21ba3a138525dFF50b,0x8cc930096B4Df705A007c4A039BDFA1320Ed2508,0x6921fd1a97441dd603a997ED6DDF388658daf754
-PRICE_SOURCE=fixed
-FIXED_TOKENS_PER_ETH=0xFF34B3d4Aee8ddCd6F9AFFFB6Fe49bD371b8a357:3000
-EOF
-
-pnpm start
-```
-
-### 3. Shield and withdraw
-
-```bash
-cd client
-
-PRIVATE_KEY=0x<user> \
-  pnpm sepolia deposit
-
-PRIVATE_KEY=0x<user> \
-ZAP=0x<zap> \
-  pnpm sepolia withdraw tornado-eth-0.1-11155111-0x...
-```
-
----
-
-## Live Sepolia run
-
-A live end-to-end flow has been executed with the patched Kohaku CLI, the relayer-signed paymaster, and Pimlico's public Sepolia bundler.
-
-| Item | Value |
+| Path | |
 | --- | --- |
-| `TornadoRelayerPaymaster` | `0xA05e12016882b2FE01A080b04F5D2F6FC3AC6E94` |
-| `SwapAndSupplyZap` | `0x2B247C8ee4556B35d510C0BdBD75194c11C4Ca33` |
-| Kohaku shield 0.1 ETH | `0x14c3daaa20829573465c0c5a96b6eb5fbcbae42a114b8dfedf9c93c5496e73ac` |
-| Kohaku unshield + atomic Aave tail call | `0x5d61d705186b06381a29c23a272c7aba92a15b2cb6012c8548105524b41b7000` |
-| `userOpHash` | `0xf93449c59b5a5e16414b5e6be79d45ea9840f2b4118a3ffdc6b89e75a2a5e46d` |
+| `contracts/` | `TornadoRelayerPaymaster.sol` (verifying paymaster, EntryPoint v0.8), `SwapAndSupplyZap.sol` |
+| `relayer/` | the signing service |
+| `client/` | reference wallet flow, proof generation, e2e harness (anvil fork + alto) |
+| `kohaku-integration/` | patches for `@kohaku-eth/tornado-cash` and `kohaku-cli`, Kohaku e2e |
 
-Sepolia Etherscan:
+## Trust model and limits
 
-- Paymaster: https://sepolia.etherscan.io/address/0xA05e12016882b2FE01A080b04F5D2F6FC3AC6E94
-- Zap: https://sepolia.etherscan.io/address/0x2B247C8ee4556B35d510C0BdBD75194c11C4Ca33
-- Shield tx: https://sepolia.etherscan.io/tx/0x14c3daaa20829573465c0c5a96b6eb5fbcbae42a114b8dfedf9c93c5496e73ac
-- Atomic unshield tx: https://sepolia.etherscan.io/tx/0x5d61d705186b06381a29c23a272c7aba92a15b2cb6012c8548105524b41b7000
-
-Observed live result:
-
-```text
-fee bound in proof : 0.002380 ETH
-actual gas         : 0.000930 ETH
-refund             : 0.001033 ETH
-wallet receives    : 0.097620 aWETH
-paymaster deposit  : 0.05 → 0.050417 ETH
-```
-
-Pimlico is used only for this live demo. The architecture is not tied to a specific bundler.
-
----
-
-## Economics
-
-Example E2E results at roughly 1.1 gwei:
-
-| | 0.1 ETH note, mainnet fork | 100 DAI note, mainnet fork | 0.1 ETH note, Sepolia fork |
-| --- | ---: | ---: | ---: |
-| Flow | swap + Aave | Aave | Kohaku + Aave |
-| Fee bound in proof | 0.001604 ETH | 3.09 DAI | 0.001445 ETH |
-| Actual gas cost | 0.000907 ETH | 0.000755 ETH | — |
-| Refund to user | 0.000253 ETH | 0.57 DAI | 0.000228 ETH |
-| Paymaster keeps | +0.000385 ETH net | 2.52 DAI for ~0.0008 ETH gas | — |
-| Landed on user | 246.96 aUSDC | 96.91 aDAI | 0.098555 aWETH |
-
-Over-quoting is intentionally conservative: the unused part is refunded on-chain.
-
----
-
-## Trust and censorship model
-
-This design does **not** make ERC-4337 censorship-resistant.
-
-There are two independent decisions:
-
-```text
-Tornado relayer:
-"Will I sponsor this UserOperation?"
-
-Bundler:
-"Will I accept and include this UserOperation?"
-```
-
-A relayer can refuse sponsorship.
-
-A bundler can refuse Tornado or other privacy-related UserOperations.
-
-The wallet therefore does not need to use the same infrastructure for sponsorship and inclusion:
-
-```text
-User
-  ↓
-Tornado relayer
-  ← sponsorship authorization
-
-User
-  ↓
-chosen ERC-4337 bundler
-```
-
-Production clients should support multiple bundlers and privacy-preserving transport where possible.
-
----
-
-## Relation to EIP-8141
-
-This project demonstrates the ERC-4337 path that is available **today**.
-
-It is not a claim that ERC-4337 should be the final account-abstraction architecture for Tornado Cash.
-
-The Tornado-specific part is intentionally kept thin:
-
-```text
-fee quoting
-withdrawal validation
-sponsorship policy
-privacy policy
-```
-
-These responsibilities can survive a future migration to native account abstraction.
-
-With an EIP-8141-style architecture, the long-term flow could become substantially simpler:
-
-```text
-User
-  ↓
-Tornado sponsor
-  ← sponsorship
-
-User
-  ↓
-FrameTx
-  ↓
-normal Ethereum mempool
-```
-
-The UserOperation / bundler / EntryPoint layer would no longer be necessary.
-
-For that reason, this project deliberately avoids putting Tornado-specific business logic into the bundler layer.
-
----
-
-## Current limitations
-
-- Experimental software; not audited.
-- The live demo currently uses a third-party ERC-4337 bundler.
-- Bundler censorship remains possible.
-- A sponsored UserOperation that reverts still costs the paymaster gas.
-- ERC-20 fees must eventually be converted back to ETH to replenish the EntryPoint deposit.
-- The current nullifier sponsorship lock is in-memory and is not suitable for horizontally scaled production relayers.
-- Mainnet USDC / USDT Tornado pools remain affected by issuer-level token freezes.
-- ERC-20 fee conversion should be handled by a keeper or operator process, not inside `postOp`.
+- The paymaster trusts the relayer's off-chain checks (that is what makes validation cheap and stake-free).
+  A sponsored operation that reverts on-chain still costs the relayer gas; the pre-signing simulation keeps this rare.
+- The relayer decides whether to sponsor; the bundler decides whether to include. Wallets should support several bundlers.
+- Withdrawals call the pool directly for now; routing through `TornadoRouter` so the paymaster acts as a registered
+  relayer worker (TORN burn, registry accounting) is the next step.
+- Mainnet USDC/USDT pools are frozen by their issuers; DAI, cDAI and WBTC are the usable ERC-20 pools.
+- The nullifier lock is in-memory; a multi-instance relayer needs a shared store.
 
 ---
 
 # 简体中文
 
-**面向 ERC-4337 原子化提现的轻量 Tornado Cash sponsorship 层。**
+**让现有的 Tornado Cash relayer 直接为 ERC-4337 原子提现提供赞助——不用自己变成 bundler。**
 
-这个项目演示了一种在 **不修改现有 Tornado pool 合约，也不要求 Tornado relayer 变成 bundler** 的前提下，为现有 Tornado relayer 模型增加 ERC-4337 原子操作能力的方法。
+> 状态：可用的概念验证——Kohaku 钱包集成、主网 fork 测试、Sepolia 实网跑通一笔。实验性质，未审计，不要用于生产。
 
-relayer 的职责保持很薄：
+## 做了什么
 
-- 对 Tornado withdrawal 报价；
-- 在链下检查 withdrawal 和 UserOperation；
-- 为 verifying paymaster 签署 sponsorship 授权。
+用户提一张 Tornado note，**同一笔交易**里换币并存进 Aave。gas 从 note 里扣，收款账户不需要有 ETH。
 
-钱包随后可以自行选择标准 ERC-4337 bundler，将已经获得 sponsorship 的 UserOperation 发送出去。
+relayer 的工作几乎不变：照旧报价、检查提现、从池子收手续费。唯一不再做的事是发交易——改为**签一个授权**，
+由用户钱包把操作交给任意 ERC-4337 bundler。
 
-因此可以在一个 **atomic UserOperation** 中完成：
+这是给现有 relayer 的升级路径，不是绕开它们：
 
-```text
-Tornado withdraw → swap → Aave supply
+- 池子、手续费策略、价格预言机（沿用 `tornado-relayer` 的 1inch 预言机）、Tor 配置都是你自己的；
+- Tornado 池合约和电路不动，证明里的 `relayer` 字段填你的 paymaster 地址即可；
+- 不托管资金、不碰用户私钥、不跑 bundler、不维护 mempool。
+
+## 一笔提现的流程
+
+1. 钱包向 relayer 要报价，把报价的 fee 写进 ZK 证明（`relayer = paymaster`）。
+2. 钱包组装 UserOperation：`withdraw` →（swap）→ `Aave.supply`，全部由一个新的 EIP-7702 账户执行。
+3. relayer 检查证明、root、nullifier、fee，模拟整笔操作，然后签名。
+4. 钱包把签好的操作发给 bundler（演示用 Pimlico，任何 bundler 都行）。
+5. 链上：验证 paymaster 签名 → 池子把 fee 付给 paymaster → 执行尾调用 → `postOp` 留下实际 gas + 加成 + 服务费，**差价退给用户**。
+
+尾调用任何一步失败，提现一起回滚，资金不会离开池子。
+
+## Sepolia 实网记录
+
+由 Kohaku CLI 钱包（打了对接 relayer 的补丁）全程驱动，Pimlico 公共 bundler 打包。
+
+| | |
+| --- | --- |
+| Paymaster | [`0xA05e1201…6E94`](https://sepolia.etherscan.io/address/0xA05e12016882b2FE01A080b04F5D2F6FC3AC6E94) |
+| Kohaku 钱包存入 0.1 ETH | [`0x14c3daaa…73ac`](https://sepolia.etherscan.io/tx/0x14c3daaa20829573465c0c5a96b6eb5fbcbae42a114b8dfedf9c93c5496e73ac) |
+| 提现 → wrap → Aave，一笔交易 | [`0x5d61d705…7000`](https://sepolia.etherscan.io/tx/0x5d61d705186b06381a29c23a272c7aba92a15b2cb6012c8548105524b41b7000) |
+| 证明中的 fee / 实际 gas / 退款 | 0.00238 ETH / 0.00093 ETH / 0.00103 ETH |
+| 钱包收到 | 0.09762 aWETH |
+| Paymaster 押金 | 0.05 → 0.050417 ETH |
+
+主网 fork 测试覆盖 ETH 池（swap → aUSDC）和 ERC-20 池（DAI → aDAI，手续费和退款都是 DAI）。
+
+## Relayer 运营者怎么接
+
+```bash
+# 1. 部署一次 paymaster（owner key），并存入 EntryPoint 押金
+cd contracts && PRIVATE_KEY=0x… RELAYER_SIGNER=0x<你的签名地址> DEPOSIT_WEI=100000000000000000 \
+  forge script script/Deploy.s.sol --rpc-url $RPC_URL --broadcast
+
+# 2. 在现有 relayer 旁边跑签名服务
+cd relayer && cp .env.example .env    # PAYMASTER_ADDRESS、RELAYER_PRIVATE_KEY、TORNADO_INSTANCES、SERVICE_FEE_BPS、PRICE_SOURCE
+pnpm start                            # :8787 上的 JSON-RPC（pm_getPaymasterStubData / pm_getPaymasterData / tornado_quote / tornado_status）
 ```
 
-> **状态：** 已完成 working PoC、Kohaku SDK 集成、mainnet fork E2E，以及 Sepolia 实网测试。  
-> **注意：** 尚未审计，不适合直接用于生产环境。
+收益：每笔提现 paymaster 留下 `实际 gas × (1 + 加成) + 服务费`；ETH 手续费自动存回 EntryPoint，ERC-20 手续费留在合约里，由运营者定期提取换成 ETH。
 
----
+## 钱包怎么接
 
-## 为什么做这个
+Kohaku 宿主只需在该链的 paymaster 配置里加一行：
 
-传统 Tornado Cash relayer 的工作非常专一：
-
-```text
-用户 → Tornado relayer → Tornado pool
+```ts
+paymasterConfig[chainId] = { ...existing, paymasterAddress: '<paymaster>', relayer: { url: 'https://your-relayer/' } };
 ```
 
-ERC-4337 今天已经可以实现 withdrawal 后的原子操作，但 sponsorship 和交易 inclusion 没必要由同一个实体负责。
+Kohaku 原有 `mode: 'paymaster'` 的其余部分（7702 sender、证明、尾调用、broadcaster）原样复用；任何 viem / permissionless 栈也可以把 relayer 当 ERC-7677 paymaster 用。打过补丁的 Kohaku CLI：
 
-这个项目把两个角色拆开：
-
-```text
-用户 / Kohaku
-      │
-      ▼
-Tornado thin relayer
-报价 / 检查 / 签名
-      │
-      ▼
-Verifying Paymaster
-
-用户 / Kohaku
-      │
-      │ 已获得 sponsorship 的 UserOperation
-      ▼
-通用 ERC-4337 bundler
-      │
-      ▼
-EntryPoint
-      │
-      ▼
-withdraw → 任意 atomic actions
+```bash
+KOHAKU_TORNADO_RELAYER_URL=http://localhost:8787 KOHAKU_TORNADO_PAYMASTER=0x<paymaster> \
+kohaku unshield --protocol tornado --wallet me --next --amount-formatted 0.1 \
+  --tail-calls <zap>:<wrapEthAndSupply(you)>:max --broadcast
 ```
 
-Tornado-specific 的业务逻辑仍然留在 relayer。
+## 跑测试
 
-Bundling 则继续作为通用 Ethereum AA 基础设施。
-
----
-
-## 这个项目证明了什么
-
-### 不需要修改现有 Tornado pool
-
-withdrawal 仍然直接调用现有 Tornado pool。
-
-zk proof 和原来一样绑定：
-
-```text
-recipient
-relayer
-fee
+```bash
+pnpm install
+(cd contracts && forge install && forge test)                    # paymaster 单测
+pnpm --filter @tornado-4337/relayer test                          # relayer 单测
+MAINNET_RPC_URL=… pnpm --filter @tornado-4337/client e2e          # 主网 fork：ETH + DAI 全流程
+pnpm --filter @tornado-4337/kohaku-integration setup && pnpm --filter @tornado-4337/kohaku-integration e2e   # 真实 Kohaku SDK，Sepolia fork
 ```
 
-在这个设计中：
-
-```text
-relayer = TornadoRelayerPaymaster
-```
-
-所以现有 pool 在执行 withdrawal 时，会直接把原本支付给 relayer 的手续费支付给 paymaster。
-
-不需要修改 Tornado pool 合约，也不需要修改 zk circuit。
-
-### Relayer 不需要成为 bundler
-
-relayer 不负责提交 Ethereum transaction。
-
-它只负责：
-
-```text
-报价
-→ 校验
-→ 模拟
-→ 签署 sponsorship
-→ 把授权返回给用户
-```
-
-之后用户可以把完整 UserOperation 提交给任意兼容的 ERC-4337 bundler。
-
-### Tornado-specific sponsorship 仍由 relayer 决定
-
-现有 relayer 仍然可以独立决定：
-
-- 支持哪些 pools；
-- fee；
-- proof / root / nullifier 检查；
-- gas pricing；
-- service fee；
-- privacy policy；
-- 是否支持 Tor / private transport。
-
-### 支持任意原子化后续操作
-
-由于 withdrawal 与后续调用由同一个 ERC-4337 account 执行，可以实现：
-
-```text
-withdraw ETH
-→ wrap
-→ swap
-→ Aave supply
-```
-
-或者：
-
-```text
-withdraw
-→ swap
-→ transfer
-```
-
-如果后面的 atomic flow 失败，前面的 withdrawal 也会一起 revert。
-
----
-
-## 架构
-
-```text
-用户 / Kohaku
-      ↓
-Tornado thin relayer
-      ↓
-检查 withdrawal / fee / UserOp
-      ↓
-返回 paymaster sponsorship signature
-
-用户 / Kohaku
-      ↓
-自行选择 ERC-4337 bundler
-      ↓
-EntryPoint
-      ↓
-Tornado withdraw
-      ↓
-swap / Aave / arbitrary tail calls
-      ↓
-paymaster 结算 gas / fee / refund
-```
-
----
-
-## Paymaster
-
-`TornadoRelayerPaymaster` 是一个 verifying ERC-4337 paymaster。
-
-validation 阶段只检查 relayer 对 UserOperation 和 fee terms 的签名。
-
-执行 withdrawal 时：
-
-```text
-Tornado pool
-    │
-    ├─ denomination - fee → sender
-    └─ fee → paymaster
-```
-
-执行结束后，`postOp`：
-
-1. 计算实际 gas cost；
-2. 保留 gas cost + margin + service fee；
-3. 把多收的部分退款给用户；
-4. ETH fee 自动重新 deposit 到 EntryPoint。
-
-对于 ERC-20 Tornado pools，手续费使用 pool token 支付，由 relayer 在链下进行 ETH/token 定价。
-
----
-
-## Thin relayer
-
-relayer 提供：
-
-```text
-tornado_quote
-pm_getPaymasterStubData
-pm_getPaymasterData
-tornado_status
-```
-
-relayer 只持有 sponsorship signing key。
-
-它不会：
-
-- 托管用户资金；
-- 获得用户 ephemeral sender private key；
-- 自己提交 bundle；
-- 维护 UserOp mempool；
-- 必须充当 bundler。
-
-bundler 的选择和 UserOperation 广播仍由 wallet/client 控制。
-
----
-
-## Kohaku 集成
-
-Kohaku 本身已经存在基于 trustless PrivacyPaymaster 的 `mode: 'paymaster'` unshield path。
-
-这个项目在同一套 API 下增加了第二种 sponsorship 模式，按链配置选择：
-
-```text
-trustless PrivacyPaymaster        （Kohaku 默认）
-Tornado relayer-signed Paymaster  （本项目）
-```
-
-仍然复用 Kohaku 原本的：
-
-- EIP-7702 ephemeral sender；
-- Tornado proof generation；
-- account execution；
-- broadcaster；
-- tail calls。
-
-host 侧只需要在原有 paymaster/bundler 配置上增加一个 relayer endpoint。
-
----
-
-## Trust 与 censorship
-
-这个设计 **并没有解决 ERC-4337 的 censorship 问题**。
-
-实际上存在两个独立决定：
-
-```text
-Tornado relayer:
-“我愿不愿意 sponsor 这笔 UserOperation？”
-
-Bundler:
-“我愿不愿意 include 这笔 UserOperation？”
-```
-
-relayer 可以拒绝 sponsorship。
-
-bundler 也可以拒绝 Tornado / privacy-related UserOperation。
-
-因此 sponsorship 和 inclusion 没有必要绑定在一起：
-
-```text
-用户
- ↓
-Tornado relayer
- ← sponsorship authorization
-
-用户
- ↓
-自己选择的 ERC-4337 bundler
-```
-
-生产环境客户端应该支持多个 bundler，并尽量支持 Tor 或其他 privacy-preserving transport。
-
----
-
-## 与 EIP-8141 的关系
-
-这个项目实现的是 **今天已经可以使用的 ERC-4337 路径**。
-
-它并不意味着 ERC-4337 应该成为 Tornado Cash 最终的 AA 架构。
-
-真正 Tornado-specific、值得长期保留的是：
-
-```text
-fee quoting
-withdrawal validation
-sponsorship policy
-privacy policy
-```
-
-如果未来 Ethereum 部署 EIP-8141 一类 native AA，这些逻辑仍然可以保留，而：
-
-```text
-UserOperation
-bundler
-EntryPoint
-```
-
-这一层则可以由 native FrameTx 取代。
-
-长期流程可能变成：
-
-```text
-用户
- ↓
-Tornado sponsor
- ← sponsorship
-
-用户
- ↓
-FrameTx
- ↓
-Ethereum normal mempool
-```
-
-因此这个项目刻意没有把 Tornado-specific business logic 放进 bundler 层。
-
----
-
-## 当前限制
-
-- 实验性软件，尚未审计。
-- 当前 live demo 使用第三方 ERC-4337 bundler。
-- bundler censorship 仍然存在。
-- UserOperation revert 时，paymaster 仍然要承担 gas。
-- ERC-20 fee 需要最终转换为 ETH，以补充 EntryPoint deposit。
-- 当前 nullifier sponsorship lock 只保存在内存中，不适合直接用于水平扩展的生产 relayer。
-- Mainnet USDC / USDT Tornado pools 仍然受 token issuer freeze 影响。
+## 目录
+
+| 路径 | |
+| --- | --- |
+| `contracts/` | `TornadoRelayerPaymaster.sol`（verifying paymaster，EntryPoint v0.8）、`SwapAndSupplyZap.sol` |
+| `relayer/` | 签名服务 |
+| `client/` | 参考钱包流程、证明生成、e2e 测试台（anvil fork + alto） |
+| `kohaku-integration/` | `@kohaku-eth/tornado-cash` 与 `kohaku-cli` 的补丁、Kohaku e2e |
+
+## 信任模型与限制
+
+- paymaster 信任 relayer 的链下检查（这也是验证便宜、无需质押的原因）；被赞助的操作若在链上回滚，gas 由 relayer 承担，靠签名前的模拟把这种情况压到最低。
+- relayer 决定赞不赞助，bundler 决定收不收；钱包应支持多个 bundler。
+- 目前提现直接调用池子；改走 `TornadoRouter`、让 paymaster 作为注册 relayer 的 worker（烧 TORN、登记进 registry）是下一步。
+- 主网 USDC/USDT 池已被发行方冻结，可用的 ERC-20 池是 DAI、cDAI、WBTC。
+- nullifier 锁在内存里，多实例 relayer 需要共享存储。
