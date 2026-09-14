@@ -5,25 +5,28 @@ A verifying paymaster pays for gas, collects the Tornado relayer fee during exec
 the excess. Users drive the flow from a Kohaku wallet (or any ERC-7677-capable wallet stack) and
 send through Pimlico's bundler. Withdraw → swap → Aave supply happen in **one atomic userOp**.
 
-```
- Kohaku wallet                     thin relayer                 Pimlico bundler (alto)        Ethereum
- ─────────────                     ────────────                 ───────────────────────       ────────
- tornado_quote ──────────────────► fee to bind in the proof
- prove(recipient=sender,
-       relayer=paymaster, fee)
- pm_getPaymasterStubData ────────► stub paymasterData
- eth_estimateUserOperationGas ───────────────────────────────► simulate (dummy sigs)
- pm_getPaymasterData ────────────► validate callData + fee,
-                                   simulate withdraw & op,
-                                   sign(userOp, fee terms)
- sign userOp (EIP-7702 sender)
- eth_sendUserOperation ──────────────────────────────────────► bundle ─────────────────────► EntryPoint v0.8
-                                                                                              ├ paymaster: verify relayer sig
-                                                                                              ├ sender.executeBatch:
-                                                                                              │   pool.withdraw (fee → paymaster)
-                                                                                              │   zap.swapEthAndSupply (→ Aave, onBehalfOf user)
-                                                                                              └ paymaster.postOp: keep gas+margin+serviceFee,
-                                                                                                refund the rest, re-deposit
+```mermaid
+sequenceDiagram
+    autonumber
+    participant W as Kohaku wallet
+    participant R as thin relayer
+    participant B as Pimlico bundler
+    participant E as EntryPoint v0.8
+
+    W->>R: tornado_quote
+    R-->>W: fee to bind (relayer = paymaster)
+    W->>W: prove(recipient = sender, relayer = paymaster, fee)
+    W->>R: pm_getPaymasterStubData
+    W->>B: eth_estimateUserOperationGas (dummy sigs)
+    W->>R: pm_getPaymasterData
+    R->>R: validate callData + fee, simulate withdraw & op
+    R-->>W: relayer signature (fee terms)
+    W->>W: sign userOp (EIP-7702 sender)
+    W->>B: eth_sendUserOperation
+    B->>E: handleOps (type-4 tx)
+    E->>E: paymaster: verify relayer sig
+    E->>E: sender: pool.withdraw (fee → paymaster) · zap → Aave (onBehalfOf user)
+    E->>E: paymaster.postOp: keep gas + margin + serviceFee, refund rest, re-deposit
 ```
 
 ## Packages
