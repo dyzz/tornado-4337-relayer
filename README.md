@@ -179,3 +179,23 @@ call on a fork takes ~1 minute of state fetching).
   and a registered relayer can keep its economic role. Routing through `TornadoRouter` so the
   paymaster acts as a registered relayer worker (TORN burn) is a follow-up.
 - The EIP-7702 authorization is signed by the ephemeral sender key; the relayer never sees it.
+
+## Live run on Sepolia (2026-09-14)
+
+Deployed with the flow above; wallet created and driven by the patched
+[kohaku-cli](https://github.com/dmarzzz/kohaku-cli) (`kohaku-integration/patches/0002-…`), bundled by
+Pimlico's public Sepolia endpoint.
+
+| | |
+| --- | --- |
+| TornadoRelayerPaymaster | [`0xA05e12016882b2FE01A080b04F5D2F6FC3AC6E94`](https://sepolia.etherscan.io/address/0xA05e12016882b2FE01A080b04F5D2F6FC3AC6E94) |
+| SwapAndSupplyZap | [`0x2B247C8ee4556B35d510C0BdBD75194c11C4Ca33`](https://sepolia.etherscan.io/address/0x2B247C8ee4556B35d510C0BdBD75194c11C4Ca33) |
+| `kohaku shield` 0.1 ETH (wallet `0x8b89…Dd79`) | [`0x14c3daaa…73ac`](https://sepolia.etherscan.io/tx/0x14c3daaa20829573465c0c5a96b6eb5fbcbae42a114b8dfedf9c93c5496e73ac) |
+| `kohaku unshield --next --tail-calls zap:wrapEthAndSupply:max` (type-4 bundle tx) | [`0x5d61d705…7000`](https://sepolia.etherscan.io/tx/0x5d61d705186b06381a29c23a272c7aba92a15b2cb6012c8548105524b41b7000) |
+| userOpHash | `0xf93449c59b5a5e16414b5e6be79d45ea9840f2b4118a3ffdc6b89e75a2a5e46d` |
+| fee bound in the proof / actual gas / refund | 0.002380 ETH / 0.000930 ETH / 0.001033 ETH (to the `--next` 7702 account) |
+| landed on the wallet | 0.097620 aWETH |
+| paymaster deposit | 0.05 → 0.050417 ETH |
+
+Public Sepolia RPC note: tenderly's gateway rate-limits the CLI's log sync; `rpc.sepolia.ethpandaops.io`
+with `KOHAKU_GETLOGS_MAX_BLOCK_SPAN=2000` worked.
