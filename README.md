@@ -45,17 +45,32 @@ Driven end to end by the Kohaku CLI wallet (patched to talk to the relayer), bun
 
 | | |
 | --- | --- |
-| Paymaster | [`0x0205938E…6dD9`](https://sepolia.etherscan.io/address/0x0205938E251010683788e6013Dd0A72eB7296dD9) |
-| Shield 0.1 ETH (Kohaku wallet) | [`0x3ae621fe…9172`](https://sepolia.etherscan.io/tx/0x3ae621fe42bedf3b581ffee6d0d6d25a558f411cf50b30ba932c52ba13089172) |
-| Unshield via `relayWithdraw` → wrap → Aave, one transaction | [`0x42f07d41…1609`](https://sepolia.etherscan.io/tx/0x42f07d41fa7fc7315419c44f6855faa5daf048c200093b240fa7090a04e91609) |
-| Fee bound in the proof / actual gas / refund | 0.002168 ETH / 0.000762 ETH / 0.000975 ETH |
-| Landed in the wallet | 0.097832 aWETH |
-| Paymaster deposit | 0.05 → 0.050401 ETH |
+| Paymaster (registered relayer `relayer.sandbox.eth`, 5000 TORN staked) | [`0x0205938E…6dD9`](https://sepolia.etherscan.io/address/0x0205938E251010683788e6013Dd0A72eB7296dD9) |
+| Shield 0.1 ETH (Kohaku wallet) | [`0xa9af8368…d2d1`](https://sepolia.etherscan.io/tx/0xa9af8368fcc7a690fbf23285e2eb1f694dff06c0e8559548775ea981f655d2d1) |
+| Unshield: `relayWithdraw` → `TornadoRouter` → `RelayerRegistry.burn` → pool → wrap → Aave, one transaction | [`0xc1581fa9…210b`](https://sepolia.etherscan.io/tx/0xc1581fa94cf85e018bc71a3b507415626631cba5ea171ef89f5ba5320563210b) |
+| TORN burned from the relayer stake (`StakeBurned`) | 0.1137 TORN (5000 → 4999.8863) |
+| Fee bound in the proof / actual gas / refund | 0.002564 ETH / 0.000837 ETH / 0.001290 ETH |
+| Landed in the wallet | 0.097436 aWETH |
+| Paymaster deposit | 0.050401 → 0.050809 ETH |
 
 Mainnet-fork tests cover ETH (swap → aUSDC) and ERC-20 pools (DAI → aDAI, fee paid and refunded in DAI), and the
 DAO path against the real `TornadoRouter` / `RelayerRegistry`: the paymaster as a fresh master and as a worker
-of a real registered relayer, TORN burned from the stake on each withdrawal. Sepolia has no router deployed by
-the DAO, so the live run above calls the pool directly.
+of a real registered relayer, TORN burned from the stake on each withdrawal.
+
+### Sepolia DAO sandbox
+
+The DAO's own Sepolia registry has no router, no enabled pools and a zero fee, so the live run goes through a
+sandbox copy of the relayer stack (`contracts/src/dao-sandbox`, deployed by `script/DeploySandboxDao.s.sol`):
+the same ABIs as mainnet, governance = the deployer, and a governance-set TORN price in place of the Uniswap
+TWAP. The paymaster is registered in it as master `relayer.sandbox.eth` with 5000 TORN.
+
+| | |
+| --- | --- |
+| TornadoRouter | [`0xF2DafFd7…a04D`](https://sepolia.etherscan.io/address/0xF2DafFd789ec02211a8f1be1034165cFf759a04D) |
+| RelayerRegistry | [`0x30318086…a58e`](https://sepolia.etherscan.io/address/0x30318086d99E3cbf3D7378Fbd55BcF3EBDC1a58e) |
+| InstanceRegistry / FeeManager | [`0x1BDf1FE9…6424`](https://sepolia.etherscan.io/address/0x1BDf1FE9297ed844FE17DF70537A95a29dA66424) / [`0x7cFEFbDe…49c9`](https://sepolia.etherscan.io/address/0x7cFEFbDe09B5d0883966e153d6B6c2f8d70049c9) |
+| StakingRewards / TORN / ENS | [`0x16AEE731…FBfA`](https://sepolia.etherscan.io/address/0x16AEE73159B43D1a783Ee025802BE43125B0FBfA) / [`0xf732fac9…bB8E`](https://sepolia.etherscan.io/address/0xf732fac951a97939A273b34c7Ca21b51C9AcbB8E) / [`0xa5c36Dc6…c0Ad`](https://sepolia.etherscan.io/address/0xa5c36Dc6Dd5927EA7B1964015Fa6f27292d4c0Ad) |
+| Burn per withdrawal (0.30 %, 379 TORN/ETH) | ETH 0.1: 0.1137 TORN · ETH 1: 1.137 TORN · DAI 100: 0.045 TORN |
 
 ## For relayer operators
 
@@ -109,6 +124,7 @@ pnpm install
 (cd contracts && forge install && forge test)                    # paymaster unit tests
 pnpm --filter @tornado-4337/relayer test                          # relayer unit tests
 MAINNET_RPC_URL=… pnpm --filter @tornado-4337/client e2e          # mainnet fork: ETH + DAI flows, Router / RelayerRegistry burn (master + worker)
+E2E_CHAIN=sepolia pnpm --filter @tornado-4337/client e2e            # same suites on a Sepolia fork, burn against the sandbox stack
 pnpm --filter @tornado-4337/kohaku-integration setup && pnpm --filter @tornado-4337/kohaku-integration e2e   # real Kohaku SDK, Sepolia fork
 ```
 
@@ -116,7 +132,7 @@ pnpm --filter @tornado-4337/kohaku-integration setup && pnpm --filter @tornado-4
 
 | Path | |
 | --- | --- |
-| `contracts/` | `TornadoRelayerPaymaster.sol` (verifying paymaster, EntryPoint v0.8), `SwapAndSupplyZap.sol` |
+| `contracts/` | `TornadoRelayerPaymaster.sol` (verifying paymaster, EntryPoint v0.8), `SwapAndSupplyZap.sol`, `dao-sandbox/` (testnet copy of the DAO relayer stack) |
 | `relayer/` | the signing service |
 | `client/` | reference wallet flow, proof generation, e2e harness (anvil fork + alto) |
 | `kohaku-integration/` | patches for `@kohaku-eth/tornado-cash` and `kohaku-cli`, Kohaku e2e |
@@ -128,7 +144,8 @@ pnpm --filter @tornado-4337/kohaku-integration setup && pnpm --filter @tornado-4
 - The relayer decides whether to sponsor; the bundler decides whether to include. Wallets should support several bundlers.
 - `relayWithdraw` only accepts the note's recipient as caller, so nobody can burn your stake with someone else's
   proof; the registry itself rejects a worker relaying for the wrong master (`only relayer`).
-- Where the DAO has no router (Sepolia) the paymaster calls pools directly and nothing is burned.
+- Where no router is configured the paymaster calls pools directly and nothing is burned; on Sepolia it uses the
+  sandbox stack above, whose registry is a copy run by us, not the DAO.
 - Mainnet USDC/USDT pools are frozen by their issuers; DAI, cDAI and WBTC are the usable ERC-20 pools.
 - The nullifier lock is in-memory; a multi-instance relayer needs a shared store.
 
@@ -170,14 +187,27 @@ relayer 的工作几乎不变：照旧报价、检查提现、从池子收手续
 
 | | |
 | --- | --- |
-| Paymaster | [`0x0205938E…6dD9`](https://sepolia.etherscan.io/address/0x0205938E251010683788e6013Dd0A72eB7296dD9) |
-| Shield 0.1 ETH（Kohaku 钱包） | [`0x3ae621fe…9172`](https://sepolia.etherscan.io/tx/0x3ae621fe42bedf3b581ffee6d0d6d25a558f411cf50b30ba932c52ba13089172) |
-| 经 `relayWithdraw` 提现 → wrap → 存 Aave，一笔交易 | [`0x42f07d41…1609`](https://sepolia.etherscan.io/tx/0x42f07d41fa7fc7315419c44f6855faa5daf048c200093b240fa7090a04e91609) |
-| 证明里绑定的 fee / 实际 gas / 退款 | 0.002168 ETH / 0.000762 ETH / 0.000975 ETH |
-| 到账 | 0.097832 aWETH |
-| Paymaster 押金 | 0.05 → 0.050401 ETH |
+| Paymaster（已注册 relayer `relayer.sandbox.eth`，质押 5000 TORN） | [`0x0205938E…6dD9`](https://sepolia.etherscan.io/address/0x0205938E251010683788e6013Dd0A72eB7296dD9) |
+| Shield 0.1 ETH（Kohaku 钱包） | [`0xa9af8368…d2d1`](https://sepolia.etherscan.io/tx/0xa9af8368fcc7a690fbf23285e2eb1f694dff06c0e8559548775ea981f655d2d1) |
+| 提现：`relayWithdraw` → `TornadoRouter` → `RelayerRegistry.burn` → 池子 → wrap → 存 Aave，一笔交易 | [`0xc1581fa9…210b`](https://sepolia.etherscan.io/tx/0xc1581fa94cf85e018bc71a3b507415626631cba5ea171ef89f5ba5320563210b) |
+| 从 relayer 质押里烧掉的 TORN（`StakeBurned`） | 0.1137 TORN（5000 → 4999.8863） |
+| 证明里绑定的 fee / 实际 gas / 退款 | 0.002564 ETH / 0.000837 ETH / 0.001290 ETH |
+| 到账 | 0.097436 aWETH |
+| Paymaster 押金 | 0.050401 → 0.050809 ETH |
 
-主网 fork 测试覆盖 ETH 池（swap → aUSDC）、ERC-20 池（DAI → aDAI，手续费和退款都是 DAI），以及走真实 `TornadoRouter` / `RelayerRegistry` 的 DAO 路径：paymaster 作为新注册的 master、以及作为一个真实已注册 relayer 的 worker，每笔提现都从质押里烧掉 TORN。Sepolia 上 DAO 没部署 router，所以上面的实网记录是直接调用池子。
+主网 fork 测试覆盖 ETH 池（swap → aUSDC）、ERC-20 池（DAI → aDAI，手续费和退款都是 DAI），以及走真实 `TornadoRouter` / `RelayerRegistry` 的 DAO 路径：paymaster 作为新注册的 master、以及作为一个真实已注册 relayer 的 worker，每笔提现都从质押里烧掉 TORN。
+
+### Sepolia 上的 DAO 沙盒
+
+DAO 自己的 Sepolia registry 没有 router、没有启用的池子、费用为 0，所以实网记录走的是我们部署的一套 relayer 栈副本（`contracts/src/dao-sandbox`，由 `script/DeploySandboxDao.s.sol` 部署）：ABI 与主网一致，governance 是部署者，TORN 价格由 governance 设定（代替 Uniswap TWAP）。paymaster 在里面注册为 master `relayer.sandbox.eth`，质押 5000 TORN。
+
+| | |
+| --- | --- |
+| TornadoRouter | [`0xF2DafFd7…a04D`](https://sepolia.etherscan.io/address/0xF2DafFd789ec02211a8f1be1034165cFf759a04D) |
+| RelayerRegistry | [`0x30318086…a58e`](https://sepolia.etherscan.io/address/0x30318086d99E3cbf3D7378Fbd55BcF3EBDC1a58e) |
+| InstanceRegistry / FeeManager | [`0x1BDf1FE9…6424`](https://sepolia.etherscan.io/address/0x1BDf1FE9297ed844FE17DF70537A95a29dA66424) / [`0x7cFEFbDe…49c9`](https://sepolia.etherscan.io/address/0x7cFEFbDe09B5d0883966e153d6B6c2f8d70049c9) |
+| StakingRewards / TORN / ENS | [`0x16AEE731…FBfA`](https://sepolia.etherscan.io/address/0x16AEE73159B43D1a783Ee025802BE43125B0FBfA) / [`0xf732fac9…bB8E`](https://sepolia.etherscan.io/address/0xf732fac951a97939A273b34c7Ca21b51C9AcbB8E) / [`0xa5c36Dc6…c0Ad`](https://sepolia.etherscan.io/address/0xa5c36Dc6Dd5927EA7B1964015Fa6f27292d4c0Ad) |
+| 每笔提现烧掉（0.30 %，379 TORN/ETH） | ETH 0.1：0.1137 TORN · ETH 1：1.137 TORN · DAI 100：0.045 TORN |
 
 ## Relayer 运营者怎么接
 
@@ -224,6 +254,7 @@ pnpm install
 (cd contracts && forge install && forge test)                    # paymaster 单测
 pnpm --filter @tornado-4337/relayer test                          # relayer 单测
 MAINNET_RPC_URL=… pnpm --filter @tornado-4337/client e2e          # 主网 fork：ETH + DAI 全流程、Router / RelayerRegistry 烧 TORN（master + worker）
+E2E_CHAIN=sepolia pnpm --filter @tornado-4337/client e2e            # 同一套测试跑 Sepolia fork，对着沙盒栈烧
 pnpm --filter @tornado-4337/kohaku-integration setup && pnpm --filter @tornado-4337/kohaku-integration e2e   # 真实 Kohaku SDK，Sepolia fork
 ```
 
@@ -231,7 +262,7 @@ pnpm --filter @tornado-4337/kohaku-integration setup && pnpm --filter @tornado-4
 
 | 路径 | |
 | --- | --- |
-| `contracts/` | `TornadoRelayerPaymaster.sol`（verifying paymaster，EntryPoint v0.8）、`SwapAndSupplyZap.sol` |
+| `contracts/` | `TornadoRelayerPaymaster.sol`（verifying paymaster，EntryPoint v0.8）、`SwapAndSupplyZap.sol`、`dao-sandbox/`（测试网用的 DAO relayer 栈副本） |
 | `relayer/` | 签名服务 |
 | `client/` | 参考钱包流程、证明生成、e2e 测试台（anvil fork + alto） |
 | `kohaku-integration/` | `@kohaku-eth/tornado-cash` 与 `kohaku-cli` 的补丁、Kohaku e2e |
@@ -241,6 +272,6 @@ pnpm --filter @tornado-4337/kohaku-integration setup && pnpm --filter @tornado-4
 - paymaster 信任 relayer 的链下检查（这也是验证便宜、无需质押的原因）；被赞助的操作若在链上回滚，gas 由 relayer 承担，靠签名前的模拟把这种情况压到最低。
 - relayer 决定赞不赞助，bundler 决定收不收；钱包应支持多个 bundler。
 - `relayWithdraw` 只接受 note 的收款人调用，别人拿不到你的证明来烧你的质押；registry 本身也会拒绝 worker 替错误的 master 转发（`only relayer`）。
-- DAO 没部署 router 的链（Sepolia）上 paymaster 直接调用池子，不烧 TORN。
+- 没配置 router 时 paymaster 直接调用池子、不烧 TORN；Sepolia 用的是上面的沙盒栈，其 registry 是我们运行的副本，不是 DAO 的。
 - 主网 USDC/USDT 池已被发行方冻结，可用的 ERC-20 池是 DAI、cDAI、WBTC。
 - nullifier 锁在内存里，多实例 relayer 需要共享存储。

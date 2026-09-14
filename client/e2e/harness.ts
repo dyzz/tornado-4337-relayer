@@ -277,8 +277,38 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
       registry = { mode: 'master', router, relayerRegistry: dao.relayerRegistry, feeManager, master: paymaster, ensName, minStake };
       log(`RelayerRegistry: paymaster registered as master "${ensName}" with ${minStake} TORN`);
     } else {
-      // An existing relayer adds the paymaster as one of its workers.
-      const master = opts.workerOf ?? DEFAULT_WORKER_OF;
+      // An existing relayer adds the paymaster as one of its workers. On mainnet that is a real
+      // registered relayer; elsewhere (the Sepolia sandbox) one is synthesized first.
+      let master = opts.workerOf ?? (chain.id === 1 ? DEFAULT_WORKER_OF : undefined);
+      if (!master) {
+        const existing = privateKeyToAccount(generatePrivateKey()).address;
+        const node = namehash('existing-relayer.eth');
+        await testClient.setStorageAt({
+          address: dao.ensRegistry,
+          index: keccak256(encodeAbiParameters([{ type: 'bytes32' }, { type: 'uint256' }], [node, 0n])),
+          value: pad(existing, { size: 32 }),
+        });
+        await testClient.setStorageAt({
+          address: dao.torn,
+          index: keccak256(encodeAbiParameters([{ type: 'address' }, { type: 'uint256' }], [existing, 0n])),
+          value: pad(toHex(minStake), { size: 32 }),
+        });
+        await impersonated(existing, (w) =>
+          w.writeContract({ address: dao.torn, abi: erc20Abi, functionName: 'approve', args: [dao.relayerRegistry, minStake], chain, account: w.account! }),
+        );
+        await impersonated(existing, (w) =>
+          w.writeContract({
+            address: dao.relayerRegistry,
+            abi: relayerRegistryAbi,
+            functionName: 'register',
+            args: ['existing-relayer.eth', minStake, []],
+            chain,
+            account: w.account!,
+          }),
+        );
+        master = existing;
+        log(`RelayerRegistry: synthesized an existing relayer master ${master} ("existing-relayer.eth")`);
+      }
       const resolved = await publicClient.readContract({
         address: dao.relayerRegistry,
         abi: relayerRegistryAbi,

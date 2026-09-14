@@ -1,9 +1,12 @@
 /**
- * DAO economics on a mainnet fork: withdrawals go through the real TornadoRouter
- * (0xd90e…) so RelayerRegistry.burn (0x58E8…) deducts the pool's TORN fee from the
- * relayer's stake — with the paymaster registered as a *master* (its own ENS name
- * + stake) and as a *worker* of an existing, really registered mainnet relayer.
- * The whole withdraw → swap → Aave userOp stays atomic in both modes.
+ * DAO economics on a fork: withdrawals go through TornadoRouter so RelayerRegistry.burn
+ * deducts the pool's TORN fee from the relayer's stake — with the paymaster registered as a
+ * *master* (its own ENS name + stake) and as a *worker* of an existing relayer. The whole
+ * withdraw → (swap) → Aave userOp stays atomic in both modes.
+ *
+ *   E2E_CHAIN=mainnet (default)  the real DAO stack: router 0xd90e…, registry 0x58E8…,
+ *                                FeeManager with its Uniswap TWAP, a really registered relayer
+ *   E2E_CHAIN=sepolia            the sandbox copy of the stack (contracts/src/dao-sandbox)
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
@@ -30,6 +33,7 @@ import { RelayerRpc } from '../src/relayerClient.js';
 import { startHarness, type Harness } from './harness.js';
 
 const log = (m: string) => console.log(`[e2e-registry] ${m}`);
+const CHAIN = (process.env.E2E_CHAIN as 'mainnet' | 'sepolia') ?? 'mainnet';
 
 function paymasterEvents(receipt: TransactionReceipt, paymaster: Address) {
   return receipt.logs
@@ -74,6 +78,15 @@ async function withdrawIntoAave(h: Harness, prover: TornadoProver, refundTo: Add
 
   const owner = privateKeyToAccount(generatePrivateKey());
   const tokenOut = setup.demoTokenOut;
+  // Mainnet: swap into the demo token and supply it; Sepolia: wrap and supply (Aave's Sepolia
+  // stablecoin reserves sit above their supply caps).
+  const tail = setup.aaveWeth
+    ? encodeFunctionData({ abi: zapAbi, functionName: 'wrapEthAndSupply', args: [refundTo] })
+    : encodeFunctionData({
+        abi: zapAbi,
+        functionName: 'swapEthAndSupply',
+        args: [tokenOut.address, tokenOut.uniswapFee, 0n, refundTo],
+      });
   const result = await sponsoredWithdraw({
     publicClient,
     chain,
@@ -86,17 +99,7 @@ async function withdrawIntoAave(h: Harness, prover: TornadoProver, refundTo: Add
     owner,
     refundTo,
     tailCallsGas: 450_000n,
-    tailCalls: ({ amount }) => [
-      {
-        to: h.zap,
-        value: amount,
-        data: encodeFunctionData({
-          abi: zapAbi,
-          functionName: 'swapEthAndSupply',
-          args: [tokenOut.address, tokenOut.uniswapFee, 0n, refundTo],
-        }),
-      },
-    ],
+    tailCalls: ({ amount }) => [{ to: h.zap, value: amount, data: tail }],
     log,
   });
   expect(result.receipt.success).toBe(true);
@@ -112,7 +115,7 @@ async function aTokenBalance(h: Harness, who: Address) {
     address: h.setup.aavePool,
     abi: aavePoolAbi,
     functionName: 'getReserveData',
-    args: [h.setup.demoTokenOut.address],
+    args: [h.setup.aaveWeth ?? h.setup.demoTokenOut.address],
   });
   return h.publicClient.readContract({ address: reserve.aTokenAddress, abi: erc20Abi, functionName: 'balanceOf', args: [who] });
 }
@@ -122,7 +125,7 @@ describe('master mode: the paymaster is a registered relayer with its own TORN s
   let prover: TornadoProver;
 
   beforeAll(async () => {
-    h = await startHarness({ chainKey: 'mainnet', registry: 'master', log });
+    h = await startHarness({ chainKey: CHAIN, registry: 'master', log });
     const { circuit, provingKey } = await loadArtifacts();
     prover = await createTornadoProver(circuit, provingKey);
   });
@@ -188,7 +191,7 @@ describe('master mode: the paymaster is a registered relayer with its own TORN s
 
     // 3. The tail still ran atomically: aTokens on the final recipient.
     const aBal = await aTokenBalance(h, finalRecipient);
-    log(`a${h.setup.demoTokenOut.symbol}: ${aBal}`);
+    log(`aToken balance: ${aBal}`);
     expect(aBal).toBeGreaterThan(0n);
   });
 
@@ -240,12 +243,12 @@ describe('master mode: the paymaster is a registered relayer with its own TORN s
   });
 });
 
-describe('worker mode: an existing mainnet relayer adds the paymaster as a worker', () => {
+describe('worker mode: an existing relayer adds the paymaster as a worker', () => {
   let h: Harness;
   let prover: TornadoProver;
 
   beforeAll(async () => {
-    h = await startHarness({ chainKey: 'mainnet', registry: 'worker', log });
+    h = await startHarness({ chainKey: CHAIN, registry: 'worker', log });
     const { circuit, provingKey } = await loadArtifacts();
     prover = await createTornadoProver(circuit, provingKey);
   });

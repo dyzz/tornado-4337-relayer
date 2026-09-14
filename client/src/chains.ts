@@ -117,13 +117,16 @@ export const CHAINS: Record<'mainnet' | 'sepolia', ChainSetup> = {
     // rpc.sepolia.ethpandaops.io return complete eth_getLogs results.
     publicRpc: 'https://sepolia.gateway.tenderly.co',
     pimlicoPublicBundler: 'https://public.pimlico.io/v2/11155111/rpc',
-    // The Sepolia registry exists but its `tornadoRouter` was never set: no router, no burn.
+    // The DAO's own Sepolia registry (0xD666…) has no router, no enabled pools and a zero fee, so
+    // this is our sandbox copy of the stack (contracts/src/dao-sandbox, script/DeploySandboxDao.s.sol):
+    // same ABIs, governance = the deployer, TORN price set by governance instead of a Uniswap TWAP.
     dao: {
-      relayerRegistry: '0xD6663593E71e4916eCb6f6606e1A6FbfA1634ffA',
-      instanceRegistry: '0x4e69fD587118dFb64957d18654E3894118E9B1BF',
-      governance: '0xe5324cD7602eeb387418e594B87aCADee08aeCAD',
-      torn: '0x3AE6667167C0f44394106E197904519D808323cA',
-      ensRegistry: '0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e',
+      tornadoRouter: '0xF2DafFd789ec02211a8f1be1034165cFf759a04D',
+      relayerRegistry: '0x30318086d99E3cbf3D7378Fbd55BcF3EBDC1a58e',
+      instanceRegistry: '0x1BDf1FE9297ed844FE17DF70537A95a29dA66424',
+      governance: '0x4DC4F08E87935135FDa56D11E1e303117B26c68B',
+      torn: '0xf732fac951a97939A273b34c7Ca21b51C9AcbB8E',
+      ensRegistry: '0xa5c36Dc6Dd5927EA7B1964015Fa6f27292d4c0Ad',
     },
   },
 };

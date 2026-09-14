@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
-/// @notice Minimal interface of a Tornado Cash ETH instance (ETHTornado).
+/// @notice Minimal interface of a Tornado Cash instance (ETHTornado / ERC20Tornado).
 interface ITornadoInstance {
     function denomination() external view returns (uint256);
+    /// @dev ERC20Tornado only.
+    function token() external view returns (address);
     function levels() external view returns (uint32);
     function verifier() external view returns (address);
     function getLastRoot() external view returns (bytes32);

@@ -26,6 +26,13 @@ contract MockTornado {
         return nullifierHashes[nullifierHash];
     }
 
+    function deposit(bytes32 commitment) external payable {
+        require(msg.value == denomination, "Please send `mixDenomination` ETH along with transaction");
+        emit Deposit(commitment, 0, block.timestamp);
+    }
+
+    event Deposit(bytes32 indexed commitment, uint32 leafIndex, uint256 timestamp);
+
     function withdraw(
         bytes calldata,
         bytes32,
@@ -83,6 +90,15 @@ contract MockTornadoERC20 {
 
     function isSpent(bytes32 nullifierHash) external view returns (bool) {
         return nullifierHashes[nullifierHash];
+    }
+
+    event Deposit(bytes32 indexed commitment, uint32 leafIndex, uint256 timestamp);
+
+    /// @dev ERC20Tornado pulls the denomination from msg.sender (the router when deposited through it).
+    function deposit(bytes32 commitment) external payable {
+        require(msg.value == 0, "ETH value is supposed to be 0 for ERC20 instance");
+        require(token.transferFrom(msg.sender, address(this), denomination), "transferFrom failed");
+        emit Deposit(commitment, 0, block.timestamp);
     }
 
     function withdraw(
