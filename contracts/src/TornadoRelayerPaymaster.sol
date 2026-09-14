@@ -9,23 +9,37 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
+import {ITornadoInstance} from "./interfaces/ITornadoInstance.sol";
+import {ITornadoRouter, IRelayerRegistry} from "./interfaces/ITornadoRouter.sol";
 
 /// @title TornadoRelayerPaymaster
 /// @notice ERC-4337 (EntryPoint v0.8) paymaster for a *thin* Tornado Cash relayer.
 ///
 /// The relayer never submits transactions. Off-chain it inspects a userOp whose
-/// callData performs `ITornadoInstance.withdraw(...)` with `relayer == address(this)`
-/// and a `fee` that covers the sponsored gas, then signs the userOp together with
-/// the fee terms below. On-chain, validation only checks that signature: it touches
-/// no external storage, so the paymaster needs no stake and validation stays cheap.
+/// callData calls `relayWithdraw(...)` on this contract with a `fee` that covers the
+/// sponsored gas, then signs the userOp together with the fee terms below. On-chain,
+/// validation only checks that signature: it touches no external storage, so the
+/// paymaster needs no EntryPoint stake and validation stays cheap.
 ///
-/// During execution the Tornado instance pays `fee` to this contract — in ETH for
-/// ETH instances, in the pool token for ERC-20 instances. In `postOp` the paymaster
-/// keeps `actualGasCost * (1 + gasMarginBps)` (converted with the relayer-signed
-/// `tokenPerEth` rate for tokens) plus `serviceFee`, refunds the remainder to
-/// `refundTo`, and — for ETH — re-deposits what it kept into the EntryPoint so
-/// sponsorship is self-funding. Tokens accumulate in the contract for the operator
-/// to sweep and convert.
+/// `relayWithdraw` forwards the withdrawal through the DAO's `TornadoRouter`, so the
+/// paymaster is the `msg.sender` the `RelayerRegistry` sees: it must be a registered
+/// relayer (a *master* that owns an ENS name and a TORN stake, or a *worker* of an
+/// existing relayer) and the pool's TORN fee is burned from that stake on every
+/// withdrawal, exactly as for a classic relayer.
+///
+///   master mode  proof binds `relayer = address(this)`: the Tornado fee lands here
+///                (ETH or the pool token). `postOp` keeps
+///                `actualGasCost * (1 + gasMarginBps)` (converted with the signed
+///                `tokenPerEth` rate for tokens) plus `serviceFee`, refunds the rest to
+///                `refundTo` and — for ETH — re-deposits what it kept into the
+///                EntryPoint, so sponsorship is self-funding. Tokens accumulate here
+///                for the operator to sweep.
+///   worker mode  proof binds `relayer = <existing master EOA>`: the fee goes to the
+///                master as today, nothing is refunded (`refundTo = 0`, classic fixed
+///                fee) and the operator tops up the EntryPoint deposit from earnings.
+///
+/// With `router == address(0)` (chains where the DAO has not deployed the router)
+/// `relayWithdraw` calls the pool directly.
 ///
 /// paymasterAndData layout (offsets in bytes):
 ///   [0:20]    paymaster address                (EntryPoint convention)
@@ -73,10 +87,14 @@ contract TornadoRelayerPaymaster is BasePaymaster {
     uint256 public gasMarginBps;
     /// @notice Gas units charged for postOp itself (EntryPoint bills them after postOp runs).
     uint256 public postOpGasOverhead;
+    /// @notice DAO `TornadoRouter` withdrawals go through (RelayerRegistry burn). 0 = call pools directly.
+    ITornadoRouter public router;
 
     event VerifyingSignerSet(address indexed signer);
     event GasMarginSet(uint256 gasMarginBps);
     event PostOpGasOverheadSet(uint256 postOpGasOverhead);
+    event RouterSet(address indexed router);
+    event Relayed(address indexed pool, bytes32 indexed nullifierHash, address indexed relayer, uint256 fee, bool viaRouter);
     event Sponsored(
         bytes32 indexed userOpHash,
         address indexed refundTo,
@@ -93,6 +111,8 @@ contract TornadoRelayerPaymaster is BasePaymaster {
     error InvalidPaymasterDataLength(uint256 actual, uint256 expected);
     error ZeroAddress();
     error OnlySelf();
+    error OnlyRecipient();
+    error AdminCallFailed(bytes result);
 
     constructor(IEntryPoint _entryPoint, address _verifyingSigner, uint256 _gasMarginBps, uint256 _postOpGasOverhead)
         BasePaymaster(_entryPoint)
@@ -127,6 +147,33 @@ contract TornadoRelayerPaymaster is BasePaymaster {
         emit PostOpGasOverheadSet(_postOpGasOverhead);
     }
 
+    function setRouter(ITornadoRouter _router) external onlyOwner {
+        router = _router;
+        emit RouterSet(address(_router));
+    }
+
+    /// @notice Register this contract as a Tornado relayer *master*: it must already own
+    /// `ensName` (ENS `setOwner` / `setSubnodeOwner` to this address) and hold `stake` TORN.
+    function registerAsRelayer(IRelayerRegistry registry, string calldata ensName, uint256 stake)
+        external
+        onlyOwner
+    {
+        IERC20(registry.torn()).forceApprove(address(registry), stake);
+        registry.register(ensName, stake, new address[](0));
+    }
+
+    /// @notice Generic owner passthrough for relayer housekeeping that must originate from this
+    /// address: ENS records of the relayer name, `registerWorker`, extra `stakeToRelayer`, ...
+    function adminCall(address target, uint256 value, bytes calldata data)
+        external
+        onlyOwner
+        returns (bytes memory result)
+    {
+        bool ok;
+        (ok, result) = target.call{value: value}(data);
+        if (!ok) revert AdminCallFailed(result);
+    }
+
     /// @notice Move stray ETH held by the contract (fees of ops whose postOp could not deposit).
     function sweep(address payable to, uint256 amount) external onlyOwner {
         (bool ok,) = to.call{value: amount}("");
@@ -136,6 +183,33 @@ contract TornadoRelayerPaymaster is BasePaymaster {
     /// @notice Move collected ERC-20 fees out (to be converted into ETH and re-deposited by the operator).
     function sweepERC20(IERC20 token, address to, uint256 amount) external onlyOwner {
         token.safeTransfer(to, amount);
+    }
+
+    // ---------------------------------------------------------------- relaying
+
+    /// @notice Execute a Tornado withdrawal as the registered relayer. Called by the userOp
+    /// sender (the note's recipient) during the execution phase; the relayer's off-chain
+    /// signature is what makes the paymaster pay for it.
+    /// @dev Only the recipient may trigger it, so a third party cannot burn the relayer's
+    /// stake with someone else's proof. `refund` is always 0 (the sender is a contract account
+    /// that needs no gas top-up).
+    function relayWithdraw(
+        ITornadoInstance pool,
+        bytes calldata proof,
+        bytes32 root,
+        bytes32 nullifierHash,
+        address payable recipient,
+        address payable relayer,
+        uint256 fee
+    ) external {
+        if (msg.sender != recipient) revert OnlyRecipient();
+        bool viaRouter = address(router) != address(0);
+        if (viaRouter) {
+            router.withdraw(pool, proof, root, nullifierHash, recipient, relayer, fee, 0);
+        } else {
+            pool.withdraw(proof, root, nullifierHash, recipient, relayer, fee, 0);
+        }
+        emit Relayed(address(pool), nullifierHash, relayer, fee, viaRouter);
     }
 
     // ---------------------------------------------------------------- hashing
@@ -238,21 +312,22 @@ contract TornadoRelayerPaymaster is BasePaymaster {
 
     function _settleEth(bytes32 userOpHash, Terms memory terms, uint256 keep, uint256 actualGasCost) internal {
         uint256 balance = address(this).balance;
-        if (balance == 0) {
-            emit FeeNotReceived(userOpHash, address(0), terms.fee);
-            return;
-        }
-
         uint256 refund = 0;
-        if (terms.refundTo != address(0) && terms.fee > keep) {
-            refund = terms.fee - keep;
-            if (refund > balance) refund = balance;
-            (bool ok,) = terms.refundTo.call{value: refund, gas: REFUND_GAS}("");
-            if (ok) {
-                balance -= refund;
-            } else {
-                emit RefundFailed(userOpHash, terms.refundTo, address(0), refund);
-                refund = 0;
+        if (terms.refundTo != address(0)) {
+            // A refund was promised, so the fee must have reached this contract (master mode).
+            if (balance == 0) emit FeeNotReceived(userOpHash, address(0), terms.fee);
+            if (terms.fee > keep) {
+                refund = terms.fee - keep;
+                if (refund > balance) refund = balance;
+                if (refund > 0) {
+                    (bool ok,) = terms.refundTo.call{value: refund, gas: REFUND_GAS}("");
+                    if (ok) {
+                        balance -= refund;
+                    } else {
+                        emit RefundFailed(userOpHash, terms.refundTo, address(0), refund);
+                        refund = 0;
+                    }
+                }
             }
         }
 
@@ -268,21 +343,21 @@ contract TornadoRelayerPaymaster is BasePaymaster {
 
     function _settleToken(bytes32 userOpHash, Terms memory terms, uint256 keep, uint256 actualGasCost) internal {
         IERC20 token = IERC20(terms.feeToken);
-        uint256 balance = token.balanceOf(address(this));
-        if (balance == 0) {
-            emit FeeNotReceived(userOpHash, terms.feeToken, terms.fee);
-            return;
-        }
-
         uint256 refund = 0;
-        if (terms.refundTo != address(0) && terms.fee > keep) {
-            refund = terms.fee - keep;
-            if (refund > balance) refund = balance;
-            // External self-call so a misbehaving token cannot revert postOp.
-            try this.refundToken(token, terms.refundTo, refund) {}
-            catch {
-                emit RefundFailed(userOpHash, terms.refundTo, terms.feeToken, refund);
-                refund = 0;
+        if (terms.refundTo != address(0)) {
+            uint256 balance = token.balanceOf(address(this));
+            if (balance == 0) emit FeeNotReceived(userOpHash, terms.feeToken, terms.fee);
+            if (terms.fee > keep) {
+                refund = terms.fee - keep;
+                if (refund > balance) refund = balance;
+                // External self-call so a misbehaving token cannot revert postOp.
+                if (refund > 0) {
+                    try this.refundToken(token, terms.refundTo, refund) {}
+                    catch {
+                        emit RefundFailed(userOpHash, terms.refundTo, terms.feeToken, refund);
+                        refund = 0;
+                    }
+                }
             }
         }
 

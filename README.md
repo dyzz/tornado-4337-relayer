@@ -19,17 +19,23 @@ wallet hands the operation to any ERC-4337 bundler.
 This is meant as an upgrade path for existing relayers, not a way around them:
 
 - your pools, your fee policy, your price oracle (the same 1inch oracle `tornado-relayer` uses), your Tor setup;
-- Tornado pool contracts and the circuit are untouched — the proof simply names your paymaster as `relayer`;
+- the DAO's rules still apply: withdrawals go through `TornadoRouter`, so `RelayerRegistry` burns the pool's TORN
+  fee from your stake on every withdrawal — the paymaster is registered as a **worker** of your existing relayer
+  (keep your stake, fee still lands on your master address) or as a relayer **master** of its own;
+- Tornado pool contracts and the circuit are untouched — the proof simply names your relayer address as `relayer`;
 - no custody, no user keys, no bundler to run, no mempool to babysit.
 
 ## How a withdrawal works
 
-1. The wallet asks the relayer for a quote and puts the quoted fee into the ZK proof (`relayer = paymaster`).
-2. The wallet builds a UserOperation: `withdraw` → (swap) → `Aave.supply`, all from a fresh EIP-7702 account.
-3. The relayer checks the proof, root, nullifier and fee, simulates the whole operation, and signs.
+1. The wallet asks the relayer for a quote and puts the quoted fee and relayer address into the ZK proof.
+2. The wallet builds a UserOperation: `paymaster.relayWithdraw` → (swap) → `Aave.supply`, all from a fresh
+   EIP-7702 account.
+3. The relayer checks the proof, root, nullifier, fee and registry state, simulates the whole operation, and signs.
 4. The wallet sends the signed operation to a bundler (Pimlico in the demo, but any bundler works).
-5. On-chain: the paymaster's signature is verified, the pool pays the fee to the paymaster, the tail calls run,
-   and `postOp` keeps actual gas + margin + service fee and **refunds the rest** to the user.
+5. On-chain: the paymaster's signature is verified; `relayWithdraw` forwards the withdrawal through
+   `TornadoRouter`, which burns the pool's TORN fee from the relayer's stake and calls the pool; the pool pays
+   the fee; the tail calls run; and `postOp` keeps actual gas + margin + service fee and **refunds the rest**
+   to the user (master mode — in worker mode the fee goes to your master address as today, fixed).
 
 If any step of the tail reverts, the withdrawal reverts with it. Nothing leaves the pool.
 
@@ -39,14 +45,17 @@ Driven end to end by the Kohaku CLI wallet (patched to talk to the relayer), bun
 
 | | |
 | --- | --- |
-| Paymaster | [`0xA05e1201…6E94`](https://sepolia.etherscan.io/address/0xA05e12016882b2FE01A080b04F5D2F6FC3AC6E94) |
-| Shield 0.1 ETH (Kohaku wallet) | [`0x14c3daaa…73ac`](https://sepolia.etherscan.io/tx/0x14c3daaa20829573465c0c5a96b6eb5fbcbae42a114b8dfedf9c93c5496e73ac) |
-| Unshield → wrap → Aave, one transaction | [`0x5d61d705…7000`](https://sepolia.etherscan.io/tx/0x5d61d705186b06381a29c23a272c7aba92a15b2cb6012c8548105524b41b7000) |
-| Fee bound in the proof / actual gas / refund | 0.00238 ETH / 0.00093 ETH / 0.00103 ETH |
-| Landed in the wallet | 0.09762 aWETH |
-| Paymaster deposit | 0.05 → 0.050417 ETH |
+| Paymaster | [`0x0205938E…6dD9`](https://sepolia.etherscan.io/address/0x0205938E251010683788e6013Dd0A72eB7296dD9) |
+| Shield 0.1 ETH (Kohaku wallet) | [`0x3ae621fe…9172`](https://sepolia.etherscan.io/tx/0x3ae621fe42bedf3b581ffee6d0d6d25a558f411cf50b30ba932c52ba13089172) |
+| Unshield via `relayWithdraw` → wrap → Aave, one transaction | [`0x42f07d41…1609`](https://sepolia.etherscan.io/tx/0x42f07d41fa7fc7315419c44f6855faa5daf048c200093b240fa7090a04e91609) |
+| Fee bound in the proof / actual gas / refund | 0.002168 ETH / 0.000762 ETH / 0.000975 ETH |
+| Landed in the wallet | 0.097832 aWETH |
+| Paymaster deposit | 0.05 → 0.050401 ETH |
 
-Mainnet-fork tests cover ETH (swap → aUSDC) and ERC-20 pools (DAI → aDAI, fee paid and refunded in DAI).
+Mainnet-fork tests cover ETH (swap → aUSDC) and ERC-20 pools (DAI → aDAI, fee paid and refunded in DAI), and the
+DAO path against the real `TornadoRouter` / `RelayerRegistry`: the paymaster as a fresh master and as a worker
+of a real registered relayer, TORN burned from the stake on each withdrawal. Sepolia has no router deployed by
+the DAO, so the live run above calls the pool directly.
 
 ## For relayer operators
 
@@ -55,12 +64,24 @@ Mainnet-fork tests cover ETH (swap → aUSDC) and ERC-20 pools (DAI → aDAI, fe
 cd contracts && PRIVATE_KEY=0x… RELAYER_SIGNER=0x<your signing address> DEPOSIT_WEI=100000000000000000 \
   forge script script/Deploy.s.sol --rpc-url $RPC_URL --broadcast
 
-# 2. run the signing service next to your existing relayer
-cd relayer && cp .env.example .env    # PAYMASTER_ADDRESS, RELAYER_PRIVATE_KEY, TORNADO_INSTANCES, SERVICE_FEE_BPS, PRICE_SOURCE
+# 2. register the paymaster with the DAO (mainnet: TORNADO_ROUTER=0xd90e2f925DA726b50C4Ed8D0Fb90Ad053324F31b above)
+#    a) worker of your existing relayer — from your master address, no new stake:
+#       RelayerRegistry.registerWorker(<your master>, <paymaster>)      then REWARD_ACCOUNT=<your master> below
+#    b) a new relayer master — ENS name owned by the paymaster + ≥ minStakeAmount TORN sent to it, then:
+#       paymaster.registerAsRelayer(<RelayerRegistry>, "you.eth", <stake>)
+
+# 3. run the signing service next to your existing relayer
+cd relayer && cp .env.example .env    # PAYMASTER_ADDRESS, RELAYER_PRIVATE_KEY, TORNADO_INSTANCES, SERVICE_FEE_BPS, PRICE_SOURCE, REWARD_ACCOUNT
 pnpm start                            # JSON-RPC on :8787 (pm_getPaymasterStubData / pm_getPaymasterData / tornado_quote / tornado_status)
 ```
 
-Economics: the paymaster keeps `actual gas × (1 + margin) + service fee` per withdrawal and re-deposits ETH fees
+The service refuses to start if the paymaster is wired to a router but not registered, or if `REWARD_ACCOUNT`
+does not match the master the registry resolves it to. `tornado_status` reports the mode, the stake left and the
+TORN burned per withdrawal for each pool.
+
+Economics, worker mode: the user pays a fixed fee to your master address as today; the paymaster's EntryPoint
+deposit pays the gas and you top it up from earnings. Master mode: the paymaster keeps
+`actual gas × (1 + margin) + service fee` per withdrawal, refunds the rest to the user and re-deposits ETH fees
 automatically; ERC-20 fees accumulate in the contract until you sweep and convert them.
 
 ## For wallets
@@ -87,7 +108,7 @@ kohaku unshield --protocol tornado --wallet me --next --amount-formatted 0.1 \
 pnpm install
 (cd contracts && forge install && forge test)                    # paymaster unit tests
 pnpm --filter @tornado-4337/relayer test                          # relayer unit tests
-MAINNET_RPC_URL=… pnpm --filter @tornado-4337/client e2e          # mainnet fork: ETH + DAI flows
+MAINNET_RPC_URL=… pnpm --filter @tornado-4337/client e2e          # mainnet fork: ETH + DAI flows, Router / RelayerRegistry burn (master + worker)
 pnpm --filter @tornado-4337/kohaku-integration setup && pnpm --filter @tornado-4337/kohaku-integration e2e   # real Kohaku SDK, Sepolia fork
 ```
 
@@ -105,8 +126,9 @@ pnpm --filter @tornado-4337/kohaku-integration setup && pnpm --filter @tornado-4
 - The paymaster trusts the relayer's off-chain checks (that is what makes validation cheap and stake-free).
   A sponsored operation that reverts on-chain still costs the relayer gas; the pre-signing simulation keeps this rare.
 - The relayer decides whether to sponsor; the bundler decides whether to include. Wallets should support several bundlers.
-- Withdrawals call the pool directly for now; routing through `TornadoRouter` so the paymaster acts as a registered
-  relayer worker (TORN burn, registry accounting) is the next step.
+- `relayWithdraw` only accepts the note's recipient as caller, so nobody can burn your stake with someone else's
+  proof; the registry itself rejects a worker relaying for the wrong master (`only relayer`).
+- Where the DAO has no router (Sepolia) the paymaster calls pools directly and nothing is burned.
 - Mainnet USDC/USDT pools are frozen by their issuers; DAI, cDAI and WBTC are the usable ERC-20 pools.
 - The nullifier lock is in-memory; a multi-instance relayer needs a shared store.
 
@@ -128,16 +150,17 @@ relayer 的工作几乎不变：照旧报价、检查提现、从池子收手续
 这是给现有 relayer 的升级路径，不是绕开它们：
 
 - 池子、手续费策略、价格预言机（沿用 `tornado-relayer` 的 1inch 预言机）、Tor 配置都是你自己的；
-- Tornado 池合约和电路不动，证明里的 `relayer` 字段填你的 paymaster 地址即可；
+- DAO 的规则照旧生效：提现走 `TornadoRouter`，`RelayerRegistry` 每笔从你的质押里烧掉该池的 TORN 费——paymaster 登记为你现有 relayer 的 **worker**（质押不动、手续费照旧到你的 master 地址），或者登记为独立的 relayer **master**；
+- Tornado 池合约和电路不动，证明里的 `relayer` 字段填你的 relayer 地址即可；
 - 不托管资金、不碰用户私钥、不跑 bundler、不维护 mempool。
 
 ## 一笔提现的流程
 
-1. 钱包向 relayer 要报价，把报价的 fee 写进 ZK 证明（`relayer = paymaster`）。
-2. 钱包组装 UserOperation：`withdraw` →（swap）→ `Aave.supply`，全部由一个新的 EIP-7702 账户执行。
-3. relayer 检查证明、root、nullifier、fee，模拟整笔操作，然后签名。
+1. 钱包向 relayer 要报价，把报价的 fee 和 relayer 地址写进 ZK 证明。
+2. 钱包组装 UserOperation：`paymaster.relayWithdraw` →（swap）→ `Aave.supply`，全部由一个新的 EIP-7702 账户执行。
+3. relayer 检查证明、root、nullifier、fee 和 registry 状态，模拟整笔操作，然后签名。
 4. 钱包把签好的操作发给 bundler（演示用 Pimlico，任何 bundler 都行）。
-5. 链上：验证 paymaster 签名 → 池子把 fee 付给 paymaster → 执行尾调用 → `postOp` 留下实际 gas + 加成 + 服务费，**差价退给用户**。
+5. 链上：验证 paymaster 签名 → `relayWithdraw` 把提现转给 `TornadoRouter`，从 relayer 的质押里烧掉该池的 TORN 费再调用池子 → 池子付 fee → 执行尾调用 → `postOp` 留下实际 gas + 加成 + 服务费，**差价退给用户**（master 模式；worker 模式下 fee 照旧固定付到你的 master 地址）。
 
 尾调用任何一步失败，提现一起回滚，资金不会离开池子。
 
@@ -147,14 +170,14 @@ relayer 的工作几乎不变：照旧报价、检查提现、从池子收手续
 
 | | |
 | --- | --- |
-| Paymaster | [`0xA05e1201…6E94`](https://sepolia.etherscan.io/address/0xA05e12016882b2FE01A080b04F5D2F6FC3AC6E94) |
-| Kohaku 钱包存入 0.1 ETH | [`0x14c3daaa…73ac`](https://sepolia.etherscan.io/tx/0x14c3daaa20829573465c0c5a96b6eb5fbcbae42a114b8dfedf9c93c5496e73ac) |
-| 提现 → wrap → Aave，一笔交易 | [`0x5d61d705…7000`](https://sepolia.etherscan.io/tx/0x5d61d705186b06381a29c23a272c7aba92a15b2cb6012c8548105524b41b7000) |
-| 证明中的 fee / 实际 gas / 退款 | 0.00238 ETH / 0.00093 ETH / 0.00103 ETH |
-| 钱包收到 | 0.09762 aWETH |
-| Paymaster 押金 | 0.05 → 0.050417 ETH |
+| Paymaster | [`0x0205938E…6dD9`](https://sepolia.etherscan.io/address/0x0205938E251010683788e6013Dd0A72eB7296dD9) |
+| Shield 0.1 ETH（Kohaku 钱包） | [`0x3ae621fe…9172`](https://sepolia.etherscan.io/tx/0x3ae621fe42bedf3b581ffee6d0d6d25a558f411cf50b30ba932c52ba13089172) |
+| 经 `relayWithdraw` 提现 → wrap → 存 Aave，一笔交易 | [`0x42f07d41…1609`](https://sepolia.etherscan.io/tx/0x42f07d41fa7fc7315419c44f6855faa5daf048c200093b240fa7090a04e91609) |
+| 证明里绑定的 fee / 实际 gas / 退款 | 0.002168 ETH / 0.000762 ETH / 0.000975 ETH |
+| 到账 | 0.097832 aWETH |
+| Paymaster 押金 | 0.05 → 0.050401 ETH |
 
-主网 fork 测试覆盖 ETH 池（swap → aUSDC）和 ERC-20 池（DAI → aDAI，手续费和退款都是 DAI）。
+主网 fork 测试覆盖 ETH 池（swap → aUSDC）、ERC-20 池（DAI → aDAI，手续费和退款都是 DAI），以及走真实 `TornadoRouter` / `RelayerRegistry` 的 DAO 路径：paymaster 作为新注册的 master、以及作为一个真实已注册 relayer 的 worker，每笔提现都从质押里烧掉 TORN。Sepolia 上 DAO 没部署 router，所以上面的实网记录是直接调用池子。
 
 ## Relayer 运营者怎么接
 
@@ -163,12 +186,20 @@ relayer 的工作几乎不变：照旧报价、检查提现、从池子收手续
 cd contracts && PRIVATE_KEY=0x… RELAYER_SIGNER=0x<你的签名地址> DEPOSIT_WEI=100000000000000000 \
   forge script script/Deploy.s.sol --rpc-url $RPC_URL --broadcast
 
-# 2. 在现有 relayer 旁边跑签名服务
-cd relayer && cp .env.example .env    # PAYMASTER_ADDRESS、RELAYER_PRIVATE_KEY、TORNADO_INSTANCES、SERVICE_FEE_BPS、PRICE_SOURCE
+# 2. 把 paymaster 登记进 DAO（主网部署时加 TORNADO_ROUTER=0xd90e2f925DA726b50C4Ed8D0Fb90Ad053324F31b）
+#    a) 作为你现有 relayer 的 worker——用 master 地址调用，不用新质押：
+#       RelayerRegistry.registerWorker(<你的 master>, <paymaster>)      然后下面配 REWARD_ACCOUNT=<你的 master>
+#    b) 作为新的 relayer master——把一个 ENS 名字的 owner 设成 paymaster、给它转 ≥ minStakeAmount 的 TORN，然后：
+#       paymaster.registerAsRelayer(<RelayerRegistry>, "you.eth", <stake>)
+
+# 3. 在现有 relayer 旁边跑签名服务
+cd relayer && cp .env.example .env    # PAYMASTER_ADDRESS、RELAYER_PRIVATE_KEY、TORNADO_INSTANCES、SERVICE_FEE_BPS、PRICE_SOURCE、REWARD_ACCOUNT
 pnpm start                            # :8787 上的 JSON-RPC（pm_getPaymasterStubData / pm_getPaymasterData / tornado_quote / tornado_status）
 ```
 
-收益：每笔提现 paymaster 留下 `实际 gas × (1 + 加成) + 服务费`；ETH 手续费自动存回 EntryPoint，ERC-20 手续费留在合约里，由运营者定期提取换成 ETH。
+paymaster 接了 router 却没登记、或 `REWARD_ACCOUNT` 与 registry 里解析出的 master 不一致时，服务会拒绝启动；`tornado_status` 会报告模式、剩余质押和每个池子每笔要烧的 TORN。
+
+收益：worker 模式下用户照旧付固定手续费到你的 master 地址，paymaster 的 EntryPoint 押金出 gas，你从收入里补；master 模式下每笔提现 paymaster 留下 `实际 gas × (1 + 加成) + 服务费`、多余的退给用户，ETH 手续费自动存回 EntryPoint，ERC-20 手续费留在合约里，由运营者定期提取换成 ETH。
 
 ## 钱包怎么接
 
@@ -192,7 +223,7 @@ kohaku unshield --protocol tornado --wallet me --next --amount-formatted 0.1 \
 pnpm install
 (cd contracts && forge install && forge test)                    # paymaster 单测
 pnpm --filter @tornado-4337/relayer test                          # relayer 单测
-MAINNET_RPC_URL=… pnpm --filter @tornado-4337/client e2e          # 主网 fork：ETH + DAI 全流程
+MAINNET_RPC_URL=… pnpm --filter @tornado-4337/client e2e          # 主网 fork：ETH + DAI 全流程、Router / RelayerRegistry 烧 TORN（master + worker）
 pnpm --filter @tornado-4337/kohaku-integration setup && pnpm --filter @tornado-4337/kohaku-integration e2e   # 真实 Kohaku SDK，Sepolia fork
 ```
 
@@ -209,6 +240,7 @@ pnpm --filter @tornado-4337/kohaku-integration setup && pnpm --filter @tornado-4
 
 - paymaster 信任 relayer 的链下检查（这也是验证便宜、无需质押的原因）；被赞助的操作若在链上回滚，gas 由 relayer 承担，靠签名前的模拟把这种情况压到最低。
 - relayer 决定赞不赞助，bundler 决定收不收；钱包应支持多个 bundler。
-- 目前提现直接调用池子；改走 `TornadoRouter`、让 paymaster 作为注册 relayer 的 worker（烧 TORN、登记进 registry）是下一步。
+- `relayWithdraw` 只接受 note 的收款人调用，别人拿不到你的证明来烧你的质押；registry 本身也会拒绝 worker 替错误的 master 转发（`only relayer`）。
+- DAO 没部署 router 的链（Sepolia）上 paymaster 直接调用池子，不烧 TORN。
 - 主网 USDC/USDT 池已被发行方冻结，可用的 ERC-20 池是 DAI、cDAI、WBTC。
 - nullifier 锁在内存里，多实例 relayer 需要共享存储。

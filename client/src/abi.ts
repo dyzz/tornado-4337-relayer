@@ -24,13 +24,60 @@ export const zapAbi = parseAbi([
 export const paymasterAdminAbi = parseAbi([
   'function deposit() payable',
   'function getDeposit() view returns (uint256)',
+  'function withdrawTo(address to, uint256 amount)',
   'function verifyingSigner() view returns (address)',
   'function gasMarginBps() view returns (uint256)',
   'function postOpGasOverhead() view returns (uint256)',
+  'function router() view returns (address)',
+  'function setRouter(address router)',
+  'function registerAsRelayer(address registry, string ensName, uint256 stake)',
+  'function adminCall(address target, uint256 value, bytes data) returns (bytes)',
+  'function relayWithdraw(address pool, bytes proof, bytes32 root, bytes32 nullifierHash, address recipient, address relayer, uint256 fee)',
+  'function sweep(address to, uint256 amount)',
   'function sweepERC20(address token, address to, uint256 amount)',
   'event Sponsored(bytes32 indexed userOpHash, address indexed refundTo, address indexed feeToken, uint256 fee, uint256 actualGasCost, uint256 refund)',
   'event SponsoredOpReverted(bytes32 indexed userOpHash, uint256 actualGasCost)',
   'event RefundFailed(bytes32 indexed userOpHash, address indexed refundTo, address indexed feeToken, uint256 amount)',
+  'event FeeNotReceived(bytes32 indexed userOpHash, address indexed feeToken, uint256 expectedFee)',
+  'event Relayed(address indexed pool, bytes32 indexed nullifierHash, address indexed relayer, uint256 fee, bool viaRouter)',
+]);
+
+/** Tornado DAO relayer registry (mainnet 0x58E8dCC13BE9780fC42E8723D8EaD4CF46943dF2). */
+export const relayerRegistryAbi = parseAbi([
+  'function workers(address worker) view returns (address)',
+  'function getRelayerBalance(address relayer) view returns (uint256)',
+  'function getRelayerEnsHash(address relayer) view returns (bytes32)',
+  'function isRelayer(address toResolve) view returns (bool)',
+  'function minStakeAmount() view returns (uint256)',
+  'function feeManager() view returns (address)',
+  'function staking() view returns (address)',
+  'function torn() view returns (address)',
+  'function tornadoRouter() view returns (address)',
+  'function register(string ensName, uint256 stake, address[] workersToRegister)',
+  'function registerWorker(address relayer, address worker)',
+  'function stakeToRelayer(address relayer, uint256 stake)',
+  'event StakeBurned(address relayer, uint256 amountBurned)',
+  'event WorkerRegistered(address relayer, address worker)',
+  'event RelayerRegistered(bytes32 relayer, string ensName, address relayerAddress, uint256 stakedAmount)',
+]);
+
+export const tornadoRouterAbi = parseAbi([
+  'function relayerRegistry() view returns (address)',
+  'function instanceRegistry() view returns (address)',
+]);
+
+/** Tornado DAO instance registry: which pools the router serves and their protocol (burn) fee. */
+export const instanceRegistryAbi = parseAbi([
+  'struct Instance { bool isERC20; address token; uint8 state; uint24 uniswapPoolSwappingFee; uint32 protocolFeePercentage; }',
+  'struct Tornado { address addr; Instance instance; }',
+  'function governance() view returns (address)',
+  'function instances(address) view returns (bool isERC20, address token, uint8 state, uint24 uniswapPoolSwappingFee, uint32 protocolFeePercentage)',
+  'function updateInstance(Tornado tornado)',
+]);
+
+export const feeManagerAbi = parseAbi([
+  'function instanceFee(address instance) view returns (uint160)',
+  'function instanceFeeWithUpdate(address instance) returns (uint160)',
 ]);
 
 export const erc20Abi = parseAbi([

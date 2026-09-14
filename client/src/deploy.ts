@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Abi, Address, Hex, PublicClient, WalletClient } from 'viem';
+import { paymasterAdminAbi } from './abi.js';
 import { mimcHasherAbi, mimcHasherBytecode } from './hasher.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -93,15 +94,34 @@ export async function deployErc20Tornado(
 export async function deployPaymaster(
   wallet: Signer,
   publicClient: PublicClient,
-  params: { entryPoint: Address; verifyingSigner: Address; gasMarginBps: bigint; postOpGasOverhead: bigint },
+  params: {
+    entryPoint: Address;
+    verifyingSigner: Address;
+    gasMarginBps: bigint;
+    postOpGasOverhead: bigint;
+    /** DAO TornadoRouter; omit on chains without one (withdrawals then call the pool directly). */
+    router?: Address;
+  },
 ): Promise<Address> {
   const artifact = forgeArtifact('contracts', 'TornadoRelayerPaymaster.sol', 'TornadoRelayerPaymaster');
-  return deploy(wallet, publicClient, artifact, [
+  const paymaster = await deploy(wallet, publicClient, artifact, [
     params.entryPoint,
     params.verifyingSigner,
     params.gasMarginBps,
     params.postOpGasOverhead,
   ]);
+  if (params.router) {
+    const hash = await wallet.writeContract({
+      address: paymaster,
+      abi: paymasterAdminAbi,
+      functionName: 'setRouter',
+      args: [params.router],
+      chain: wallet.chain,
+      account: wallet.account,
+    });
+    await publicClient.waitForTransactionReceipt({ hash });
+  }
+  return paymaster;
 }
 
 export async function deployZap(

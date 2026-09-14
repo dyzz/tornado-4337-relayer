@@ -6,10 +6,13 @@ import {
   createWalletClient,
   encodeAbiParameters,
   http,
+  isAddressEqual,
   keccak256,
+  namehash,
   pad,
   parseEther,
   toHex,
+  zeroAddress,
   type Address,
   type Hex,
   type PublicClient,
@@ -25,7 +28,7 @@ import {
 } from '@tornado-4337/relayer';
 import { CHAINS, type ChainSetup } from '../src/chains.js';
 import { deployErc20Tornado, deployEthTornado, deployMimcHasher, deployPaymaster, deployZap } from '../src/deploy.js';
-import { erc20Abi, paymasterAdminAbi } from '../src/abi.js';
+import { erc20Abi, instanceRegistryAbi, paymasterAdminAbi, relayerRegistryAbi } from '../src/abi.js';
 
 // Well-known anvil dev keys (accounts 0..4).
 export const ANVIL_KEYS: Hex[] = [
@@ -53,6 +56,19 @@ export interface Harness {
   paymaster: Address;
   zap: Address;
   relayer: RelayerService;
+  /** Address the proofs name as relayer: the paymaster, or the master EOA in worker mode. */
+  rewardAccount: Address;
+  /** Set when the harness wired the paymaster to the DAO router and registered it. */
+  registry?: {
+    mode: 'master' | 'worker';
+    router: Address;
+    relayerRegistry: Address;
+    feeManager: Address;
+    /** Registry master the paymaster resolves to (itself in master mode). */
+    master: Address;
+    ensName?: string;
+    minStake: bigint;
+  };
   setBalance(address: Address, wei: bigint): Promise<void>;
   /** A brand-new EOA funded with `wei` (default 10 ETH). */
   newFundedAccount(wei?: bigint): Promise<ReturnType<typeof privateKeyToAccount>>;
@@ -71,11 +87,25 @@ export interface HarnessOptions {
   denomination?: bigint;
   serviceFeeBps?: bigint;
   gasMarginBps?: bigint;
+  /**
+   * Mainnet forks only: point the paymaster at the DAO's TornadoRouter, add the fresh instances to
+   * the InstanceRegistry (impersonated governance) and register the paymaster in the RelayerRegistry:
+   *   master — a new relayer: ENS name + TORN stake given to the paymaster with anvil cheats;
+   *   worker — an existing, really registered relayer (`workerOf`) adds the paymaster as its worker.
+   */
+  registry?: 'master' | 'worker';
+  /** Worker mode: master EOA of the existing relayer (default: solid-relayer.eth's, registered 2026). */
+  workerOf?: Address;
+  /** Protocol fee (burn) set on the fresh instances, in 1e-4 (default 30 = 0.30 %, the DAO's ETH-1 setting). */
+  protocolFeePercentage?: number;
   anvilPort?: number;
   altoPort?: number;
   relayerPort?: number;
   log?: (msg: string) => void;
 }
+
+/** A real mainnet relayer master (solid-relayer.eth, ~6.9k TORN staked at the time of writing). */
+export const DEFAULT_WORKER_OF: Address = '0xb69e1e65142d293035323470d2B3c0c5d4E03F8e';
 
 /**
  * Local full stack: anvil fork of a real chain (real EntryPoint v0.8, Simple7702Account,
@@ -177,12 +207,100 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
     const balance = await publicClient.readContract({ address: token, abi: erc20Abi, functionName: 'balanceOf', args: [to] });
     if (balance < amount) throw new Error(`dealErc20 failed: balance ${balance} < ${amount}`);
   };
+  const router = opts.registry ? setup.dao.tornadoRouter : undefined;
+  if (opts.registry && !router) throw new Error(`registry mode needs a TornadoRouter; ${setup.chain.name} has none`);
   const paymaster = await deployPaymaster(wallet, publicClient, {
     entryPoint: setup.entryPoint,
     verifyingSigner: relayerSigner.address,
     gasMarginBps: opts.gasMarginBps ?? 1_000n,
     postOpGasOverhead: 45_000n,
+    router,
   });
+
+  // --- DAO router / registry wiring -------------------------------------------
+  let rewardAccount: Address = paymaster;
+  let registry: Harness['registry'];
+  if (opts.registry && router) {
+    const { dao } = setup;
+    const impersonated = async (who: Address, fn: (w: ReturnType<typeof createWalletClient>) => Promise<Hex>) => {
+      await testClient.impersonateAccount({ address: who });
+      await setBalance(who, parseEther('10'));
+      const hash = await fn(createWalletClient({ account: who, chain, transport: http(rpcUrl) }));
+      await publicClient.waitForTransactionReceipt({ hash });
+      await testClient.stopImpersonatingAccount({ address: who });
+    };
+    // The router only serves instances the InstanceRegistry knows: add the fresh ones as governance.
+    if (!opts.canonicalInstances) {
+      const protocolFeePercentage = opts.protocolFeePercentage ?? 30;
+      for (const [addr, isERC20, token, swapFee] of [
+        [instance, false, zeroAddress, 0],
+        [erc20Instance, true, setup.demoErc20.address, 3000],
+      ] as const) {
+        await impersonated(dao.governance, (w) =>
+          w.writeContract({
+            address: dao.instanceRegistry,
+            abi: instanceRegistryAbi,
+            functionName: 'updateInstance',
+            args: [{ addr, instance: { isERC20, token, state: 1, uniswapPoolSwappingFee: swapFee, protocolFeePercentage } }],
+            chain,
+            account: w.account!,
+          }),
+        );
+      }
+      log(`InstanceRegistry: added fresh instances with protocolFeePercentage=${protocolFeePercentage} (governance impersonated)`);
+    }
+    const [minStake, feeManager] = await Promise.all([
+      publicClient.readContract({ address: dao.relayerRegistry, abi: relayerRegistryAbi, functionName: 'minStakeAmount' }),
+      publicClient.readContract({ address: dao.relayerRegistry, abi: relayerRegistryAbi, functionName: 'feeManager' }),
+    ]);
+    if (opts.registry === 'master') {
+      // A fresh relayer: give the paymaster an ENS name (ENS registry storage) and the minimum TORN stake.
+      const ensName = 'thin-relayer-e2e.eth';
+      const node = namehash(ensName);
+      await testClient.setStorageAt({
+        address: dao.ensRegistry,
+        index: keccak256(encodeAbiParameters([{ type: 'bytes32' }, { type: 'uint256' }], [node, 0n])),
+        value: pad(paymaster, { size: 32 }),
+      });
+      await testClient.setStorageAt({
+        address: dao.torn,
+        index: keccak256(encodeAbiParameters([{ type: 'address' }, { type: 'uint256' }], [paymaster, 0n])),
+        value: pad(toHex(minStake), { size: 32 }),
+      });
+      const hash = await wallet.writeContract({
+        address: paymaster,
+        abi: paymasterAdminAbi,
+        functionName: 'registerAsRelayer',
+        args: [dao.relayerRegistry, ensName, minStake],
+      });
+      await publicClient.waitForTransactionReceipt({ hash });
+      registry = { mode: 'master', router, relayerRegistry: dao.relayerRegistry, feeManager, master: paymaster, ensName, minStake };
+      log(`RelayerRegistry: paymaster registered as master "${ensName}" with ${minStake} TORN`);
+    } else {
+      // An existing relayer adds the paymaster as one of its workers.
+      const master = opts.workerOf ?? DEFAULT_WORKER_OF;
+      const resolved = await publicClient.readContract({
+        address: dao.relayerRegistry,
+        abi: relayerRegistryAbi,
+        functionName: 'workers',
+        args: [master],
+      });
+      if (!isAddressEqual(resolved, master)) throw new Error(`${master} is not a registered relayer master`);
+      await impersonated(master, (w) =>
+        w.writeContract({
+          address: dao.relayerRegistry,
+          abi: relayerRegistryAbi,
+          functionName: 'registerWorker',
+          args: [master, paymaster],
+          chain,
+          account: w.account!,
+        }),
+      );
+      rewardAccount = master;
+      registry = { mode: 'worker', router, relayerRegistry: dao.relayerRegistry, feeManager, master, minStake };
+      log(`RelayerRegistry: paymaster registered as a worker of ${master} (impersonated)`);
+    }
+  }
   const zap = await deployZap(wallet, publicClient, {
     weth: setup.aaveWeth ?? setup.weth,
     swapRouter: setup.uniswapSwapRouter02,
@@ -238,6 +356,7 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
       entryPoint: setup.entryPoint,
       paymaster,
       signerKey: relayerKey,
+      rewardAccount,
       instances: opts.canonicalInstances
         ? [...Object.values(setup.tornadoEth), erc20Instance]
         : [instance, erc20Instance],
@@ -273,6 +392,8 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
     paymaster,
     zap,
     relayer,
+    rewardAccount,
+    registry,
     setBalance,
     newFundedAccount,
     dealErc20,

@@ -13,7 +13,7 @@ import {
 } from 'viem';
 import { privateKeyToAccount, type PrivateKeyAccount } from 'viem/accounts';
 
-import { erc20MetadataAbi, paymasterAbi, tornadoInstanceAbi } from './abi.js';
+import { erc20MetadataAbi, feeManagerAbi, paymasterAbi, relayerRegistryAbi, tornadoInstanceAbi, tornadoRouterAbi } from './abi.js';
 import {
   BPS,
   DEFAULT_GAS,
@@ -46,6 +46,15 @@ export interface RelayerConfig {
   paymaster: Address;
   /** Private key of the paymaster's `verifyingSigner`. */
   signerKey: Hex;
+  /**
+   * Address the withdrawal proof names as `relayer` (Tornado's fee recipient). Defaults to the
+   * paymaster (master mode: fee lands on the paymaster, excess refunded). Set it to an existing
+   * relayer's master EOA once the paymaster is registered as its worker (worker mode: fee goes
+   * to the master as today, fixed fee, no refund).
+   */
+  rewardAccount?: Address;
+  /** Start even if the paymaster is not registered in the RelayerRegistry the router uses. */
+  allowUnregistered?: boolean;
   /** Tornado instances this relayer sponsors (ETH or ERC-20; detected on boot). */
   instances: Address[];
   /** Token pricing for ERC-20 instances. Required when any instance is an ERC-20 pool. */
@@ -81,7 +90,10 @@ export interface QuoteParams {
 }
 
 export interface Quote {
+  /** Address to bind as `relayer` in the proof (fee recipient). */
   relayer: Address;
+  /** Contract whose `relayWithdraw` the userOp must call. */
+  paymaster: Address;
   entryPoint: Address;
   instance: Address;
   denomination: bigint;
@@ -139,6 +151,23 @@ interface PaymasterParams {
   verifyingSigner: Address;
 }
 
+/** How the paymaster relates to the DAO's TornadoRouter / RelayerRegistry. */
+export interface RegistryInfo {
+  /** `master`: the paymaster owns a stake; `worker`: it works for `master`; `unregistered`: router set, no
+   * registration (withdrawals go through as a "custom relayer", no burn); `no-router`: pools called directly. */
+  mode: 'master' | 'worker' | 'unregistered' | 'no-router';
+  router: Address;
+  relayerRegistry: Address;
+  /** Registry master the paymaster resolves to (itself in master mode). */
+  master: Address;
+  /** TORN stake left for that master (wei). */
+  stake: bigint;
+  minStake: bigint;
+  ensHash: Hex;
+  /** TORN burned per withdrawal, per instance (from FeeManager.instanceFee; 0 = no protocol fee). */
+  burnPerWithdraw: Record<Address, bigint>;
+}
+
 interface SponsoredNote {
   validUntil: number;
   sender: Address;
@@ -164,14 +193,23 @@ export class RelayerService {
   readonly signer: PrivateKeyAccount;
   private readonly sponsored = new Map<Hex, SponsoredNote>();
 
+  readonly rewardAccount: Address;
+
   private constructor(
     readonly config: RelayerConfig,
     readonly client: PublicClient,
     readonly paymasterParams: PaymasterParams,
     readonly instances: Map<Address, InstanceInfo>,
+    readonly registry: RegistryInfo,
     private readonly log: Logger,
   ) {
     this.signer = privateKeyToAccount(config.signerKey);
+    this.rewardAccount = getAddress(config.rewardAccount ?? config.paymaster);
+  }
+
+  /** Worker mode: the fee is paid to the master EOA, so nothing can be refunded by the paymaster. */
+  get refunds(): boolean {
+    return isAddressEqual(this.rewardAccount, this.config.paymaster);
   }
 
   static async create(config: RelayerConfig, log: Logger = consoleLogger): Promise<RelayerService> {
@@ -181,11 +219,12 @@ export class RelayerService {
       throw new Error(`RPC chain id ${chainId} does not match configured ${config.chainId}`);
     }
 
-    const [entryPoint, verifyingSigner, gasMarginBps, postOpGasOverhead] = await Promise.all([
+    const [entryPoint, verifyingSigner, gasMarginBps, postOpGasOverhead, router] = await Promise.all([
       client.readContract({ address: config.paymaster, abi: paymasterAbi, functionName: 'entryPoint' }),
       client.readContract({ address: config.paymaster, abi: paymasterAbi, functionName: 'verifyingSigner' }),
       client.readContract({ address: config.paymaster, abi: paymasterAbi, functionName: 'gasMarginBps' }),
       client.readContract({ address: config.paymaster, abi: paymasterAbi, functionName: 'postOpGasOverhead' }),
+      client.readContract({ address: config.paymaster, abi: paymasterAbi, functionName: 'router' }),
     ]);
     if (!isAddressEqual(entryPoint, config.entryPoint)) {
       throw new Error(`paymaster is bound to EntryPoint ${entryPoint}, config says ${config.entryPoint}`);
@@ -218,16 +257,41 @@ export class RelayerService {
       instances.set(address, { address, denomination, token, decimals, symbol });
     }
 
+    const registry = await probeRegistry(client, config.paymaster, getAddress(router), [...instances.keys()]);
+    const rewardAccount = getAddress(config.rewardAccount ?? config.paymaster);
+    if (registry.mode === 'no-router') {
+      log.warn('paymaster has no TornadoRouter: withdrawals bypass the RelayerRegistry (no TORN burn)');
+      if (!isAddressEqual(rewardAccount, config.paymaster)) {
+        throw new Error('REWARD_ACCOUNT other than the paymaster needs the paymaster to be a registry worker (router required)');
+      }
+    } else if (registry.mode === 'unregistered') {
+      const msg =
+        `paymaster ${config.paymaster} is not registered in RelayerRegistry ${registry.relayerRegistry}: ` +
+        'register it as a master (ENS name + TORN stake, see registerAsRelayer) or as a worker of your relayer';
+      if (!config.allowUnregistered) throw new Error(msg);
+      log.warn(msg);
+    } else if (!isAddressEqual(registry.master, rewardAccount)) {
+      throw new Error(
+        `the registry resolves the paymaster to master ${registry.master} but REWARD_ACCOUNT is ${rewardAccount}: ` +
+          'the proof must name the master or Router.withdraw reverts with "only relayer"',
+      );
+    }
+
     const service = new RelayerService(
       { ...config, instances: [...instances.keys()] },
       client,
       { gasMarginBps, postOpGasOverhead, verifyingSigner },
       instances,
+      registry,
       log,
     );
     log.info('relayer ready', {
       chainId: chainId.toString(),
       paymaster: config.paymaster,
+      rewardAccount,
+      registryMode: registry.mode,
+      master: registry.master,
+      stakeTorn: registry.stake.toString(),
       signer: signer.address,
       instances: [...instances.values()].map((i) => `${i.address}:${i.denomination}${i.symbol}`),
       gasMarginBps: gasMarginBps.toString(),
@@ -255,7 +319,21 @@ export class RelayerService {
       entryPoint: this.config.entryPoint,
       paymaster: this.config.paymaster,
       /** Tornado convention: the address that must appear as `relayer` in the proof. */
-      rewardAccount: this.config.paymaster,
+      rewardAccount: this.rewardAccount,
+      /** Whether postOp refunds `fee - gas - serviceFee` (master mode) or the fee is fixed (worker mode). */
+      refunds: this.refunds,
+      registry: {
+        mode: this.registry.mode,
+        router: this.registry.router,
+        relayerRegistry: this.registry.relayerRegistry,
+        master: this.registry.master,
+        stake: toHex(this.registry.stake),
+        minStake: toHex(this.registry.minStake),
+        ensHash: this.registry.ensHash,
+        burnPerWithdraw: Object.fromEntries(
+          Object.entries(this.registry.burnPerWithdraw).map(([k, v]) => [k, toHex(v)]),
+        ),
+      },
       signer: this.signer.address,
       instances: [...this.instances.values()].map((i) => ({
         address: i.address,
@@ -349,7 +427,8 @@ export class RelayerService {
       );
     }
     return {
-      relayer: this.config.paymaster,
+      relayer: this.rewardAccount,
+      paymaster: this.config.paymaster,
       entryPoint: this.config.entryPoint,
       instance: info.address,
       denomination: info.denomination,
@@ -374,12 +453,12 @@ export class RelayerService {
   stubData(op: RpcUserOperation, context: SponsorContext = {}): StubDataResult {
     let fee = 0n;
     let feeToken: Address = zeroAddress;
-    let refundTo: Address = context.refundTo ?? op.sender;
+    let refundTo: Address = this.refunds ? (context.refundTo ?? op.sender) : zeroAddress;
     try {
-      const w = findSponsoringWithdraw(decodeAccountCalls(op.callData), this.config.paymaster, this.config.instances);
+      const w = findSponsoringWithdraw(decodeAccountCalls(op.callData), this.rules(op.sender));
       fee = w.fee;
       feeToken = this.instance(w.instance).token;
-      refundTo = context.refundTo ?? w.recipient;
+      if (this.refunds) refundTo = context.refundTo ?? w.recipient;
     } catch {
       // Estimation may run before the withdraw call is final; a zero fee still exercises postOp.
     }
@@ -412,9 +491,9 @@ export class RelayerService {
       throw new ValidationError('context.refundTo is not an address');
     }
 
-    // 1. The callData must perform exactly one withdraw that pays this paymaster.
+    // 1. The callData must perform exactly one relayWithdraw on the paymaster that pays rewardAccount.
     const calls = decodeAccountCalls(op.callData);
-    const w = findSponsoringWithdraw(calls, this.config.paymaster, this.config.instances);
+    const w = findSponsoringWithdraw(calls, this.rules(op.sender));
     const info = this.instance(w.instance);
     if (w.fee > info.denomination) throw new ValidationError('fee exceeds denomination');
 
@@ -460,7 +539,8 @@ export class RelayerService {
       validAfter: 0,
       fee: w.fee,
       serviceFee,
-      refundTo: context.refundTo ?? w.recipient,
+      // Worker mode: the fee is paid to the master EOA, the paymaster has nothing to refund.
+      refundTo: this.refunds ? (context.refundTo ?? w.recipient) : zeroAddress,
       feeToken: info.token,
       tokenPerEth,
     };
@@ -499,6 +579,16 @@ export class RelayerService {
 
   // ------------------------------------------------------------------ internals
 
+  private rules(sender: Address) {
+    return {
+      paymaster: this.config.paymaster,
+      rewardAccount: this.rewardAccount,
+      allowedInstances: this.config.instances,
+      sender,
+    };
+  }
+
+  /** Proof + registry check: simulate `relayWithdraw` from the recipient (Router -> burn -> pool.withdraw). */
   private async assertWithdrawSimulates(w: ReturnType<typeof findSponsoringWithdraw>) {
     const [spent, known] = await Promise.all([
       this.client.readContract({
@@ -518,14 +608,14 @@ export class RelayerService {
     if (!known) throw new ValidationError('merkle root is not known to the instance (stale tree?)', -32005);
     try {
       await this.client.simulateContract({
-        address: w.instance,
-        abi: tornadoInstanceAbi,
-        functionName: 'withdraw',
-        args: [w.proof, w.root, w.nullifierHash, w.recipient, w.relayer, w.fee, w.refund],
-        account: this.signer.address,
+        address: this.config.paymaster,
+        abi: paymasterAbi,
+        functionName: 'relayWithdraw',
+        args: [w.instance, w.proof, w.root, w.nullifierHash, w.recipient, w.relayer, w.fee],
+        account: w.recipient,
       });
     } catch (err) {
-      throw new ValidationError(`withdraw simulation failed: ${shortError(err)}`, -32006);
+      throw new ValidationError(`relayWithdraw simulation failed: ${shortError(err)}`, -32006);
     }
   }
 
@@ -573,6 +663,49 @@ export class RelayerService {
     const now = Math.floor(Date.now() / 1000);
     for (const [k, v] of this.sponsored) if (v.validUntil < now) this.sponsored.delete(k);
   }
+}
+
+/** Read how the paymaster is registered with the DAO's Router / RelayerRegistry. */
+export async function probeRegistry(
+  client: PublicClient,
+  paymaster: Address,
+  router: Address,
+  instances: Address[],
+): Promise<RegistryInfo> {
+  const none: RegistryInfo = {
+    mode: 'no-router',
+    router,
+    relayerRegistry: zeroAddress,
+    master: zeroAddress,
+    stake: 0n,
+    minStake: 0n,
+    ensHash: `0x${'00'.repeat(32)}`,
+    burnPerWithdraw: {},
+  };
+  if (router === zeroAddress) return none;
+  const relayerRegistry = getAddress(
+    await client.readContract({ address: router, abi: tornadoRouterAbi, functionName: 'relayerRegistry' }),
+  );
+  const [master, stake, minStake, ensHash, feeManager] = await Promise.all([
+    client.readContract({ address: relayerRegistry, abi: relayerRegistryAbi, functionName: 'workers', args: [paymaster] }),
+    client.readContract({ address: relayerRegistry, abi: relayerRegistryAbi, functionName: 'getRelayerBalance', args: [paymaster] }),
+    client.readContract({ address: relayerRegistry, abi: relayerRegistryAbi, functionName: 'minStakeAmount' }),
+    client.readContract({ address: relayerRegistry, abi: relayerRegistryAbi, functionName: 'getRelayerEnsHash', args: [paymaster] }),
+    client.readContract({ address: relayerRegistry, abi: relayerRegistryAbi, functionName: 'feeManager' }).catch(() => zeroAddress),
+  ]);
+  const burnPerWithdraw: Record<Address, bigint> = {};
+  if (feeManager !== zeroAddress) {
+    for (const instance of instances) {
+      burnPerWithdraw[instance] = BigInt(
+        await client
+          .readContract({ address: feeManager, abi: feeManagerAbi, functionName: 'instanceFee', args: [instance] })
+          .catch(() => 0n),
+      );
+    }
+  }
+  const mode: RegistryInfo['mode'] =
+    master === zeroAddress ? 'unregistered' : isAddressEqual(master, paymaster) ? 'master' : 'worker';
+  return { ...none, mode, relayerRegistry, master: getAddress(master), stake, minStake, ensHash, burnPerWithdraw };
 }
 
 function stripUndefined<T extends object>(obj: T): Partial<T> {

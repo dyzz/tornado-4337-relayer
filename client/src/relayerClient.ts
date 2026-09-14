@@ -1,7 +1,10 @@
 import { hexToBigInt, toHex, type Address, type Hex } from 'viem';
 
 export interface RelayerQuote {
+  /** Address to bind as `relayer` in the proof (the paymaster, or the master EOA in worker mode). */
   relayer: Address;
+  /** TornadoRelayerPaymaster whose `relayWithdraw` the userOp calls. */
+  paymaster: Address;
   entryPoint: Address;
   instance: Address;
   denomination: bigint;
@@ -33,6 +36,17 @@ export interface RelayerStatus {
   entryPoint: Address;
   paymaster: Address;
   rewardAccount: Address;
+  refunds: boolean;
+  registry: {
+    mode: 'master' | 'worker' | 'unregistered' | 'no-router';
+    router: Address;
+    relayerRegistry: Address;
+    master: Address;
+    stake: Hex;
+    minStake: Hex;
+    ensHash: Hex;
+    burnPerWithdraw: Record<Address, Hex>;
+  };
   signer: Address;
   instances: { address: Address; denomination: Hex; token: Address; symbol: string; decimals: number }[];
   ethPrices: Record<string, string>;
@@ -84,6 +98,7 @@ export class RelayerRpc {
     const gas = raw.gas as Record<string, Hex>;
     return {
       relayer: raw.relayer as Address,
+      paymaster: raw.paymaster as Address,
       entryPoint: raw.entryPoint as Address,
       instance: raw.instance as Address,
       denomination: hexToBigInt(raw.denomination as Hex),

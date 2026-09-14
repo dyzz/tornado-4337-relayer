@@ -1,5 +1,5 @@
 import { decodeFunctionData, getAddress, isAddressEqual, type Address, type Hex } from 'viem';
-import { baseAccountAbi, tornadoInstanceAbi } from './abi.js';
+import { baseAccountAbi, paymasterAbi, tornadoInstanceAbi } from './abi.js';
 
 export interface DecodedCall {
   target: Address;
@@ -17,6 +17,8 @@ export interface TornadoWithdrawCall {
   relayer: Address;
   fee: bigint;
   refund: bigint;
+  /** `paymaster`: `TornadoRelayerPaymaster.relayWithdraw` (Router / registry path); `direct`: `pool.withdraw`. */
+  via: 'paymaster' | 'direct';
 }
 
 export class ValidationError extends Error {
@@ -44,10 +46,36 @@ export function decodeAccountCalls(callData: Hex): DecodedCall[] {
   return decoded.args[0].map((c) => ({ target: c.target, value: c.value, data: c.data }));
 }
 
-/** Decode every Tornado withdraw among the account's calls (any instance). */
-export function decodeTornadoWithdraws(calls: DecodedCall[]): TornadoWithdrawCall[] {
+/**
+ * Decode every Tornado withdraw among the account's calls: direct `pool.withdraw`
+ * calls (any target) and `relayWithdraw` calls to `paymaster`.
+ */
+export function decodeTornadoWithdraws(calls: DecodedCall[], paymaster?: Address): TornadoWithdrawCall[] {
   const matches: TornadoWithdrawCall[] = [];
   calls.forEach((call, index) => {
+    if (paymaster && isAddressEqual(call.target, paymaster)) {
+      let decoded;
+      try {
+        decoded = decodeFunctionData({ abi: paymasterAbi, data: call.data });
+      } catch {
+        return;
+      }
+      if (decoded.functionName !== 'relayWithdraw') return;
+      const [pool, proof, root, nullifierHash, recipient, relayer, fee] = decoded.args;
+      matches.push({
+        index,
+        instance: getAddress(pool),
+        proof,
+        root,
+        nullifierHash,
+        recipient: getAddress(recipient),
+        relayer: getAddress(relayer),
+        fee,
+        refund: 0n,
+        via: 'paymaster',
+      });
+      return;
+    }
     let decoded;
     try {
       decoded = decodeFunctionData({ abi: tornadoInstanceAbi, data: call.data });
@@ -66,34 +94,56 @@ export function decodeTornadoWithdraws(calls: DecodedCall[]): TornadoWithdrawCal
       relayer: getAddress(relayer),
       fee,
       refund,
+      via: 'direct',
     });
   });
   return matches;
 }
 
+export interface SponsorRules {
+  /** TornadoRelayerPaymaster address: the sponsoring call must be `relayWithdraw` on it. */
+  paymaster: Address;
+  /** Address the proof must name as `relayer` (the paymaster in master mode, the master EOA in worker mode). */
+  rewardAccount: Address;
+  allowedInstances: Address[];
+  /** userOp.sender: `relayWithdraw` only accepts the note's recipient as caller. */
+  sender: Address;
+}
+
 /**
- * Find the withdraw that pays this paymaster. A batch may carry further
- * withdraws (Kohaku consolidates several notes into one userOp, the extra ones
- * with relayer = 0 and fee = 0); exactly one must name the paymaster as relayer.
+ * Find the withdraw that pays for this userOp. It must be a `relayWithdraw` on the
+ * paymaster (so the DAO's Router / RelayerRegistry sees the paymaster as the relayer
+ * and burns its stake) naming `rewardAccount` as relayer and the sender as recipient.
+ * A batch may carry further *direct* withdraws (Kohaku consolidates several notes into
+ * one userOp; those name relayer = 0, fee = 0), but nothing else may touch the paymaster.
  */
-export function findSponsoringWithdraw(
-  calls: DecodedCall[],
-  paymaster: Address,
-  allowedInstances: Address[],
-): TornadoWithdrawCall {
-  const withdraws = decodeTornadoWithdraws(calls);
+export function findSponsoringWithdraw(calls: DecodedCall[], rules: SponsorRules): TornadoWithdrawCall {
+  const withdraws = decodeTornadoWithdraws(calls, rules.paymaster);
   if (withdraws.length === 0) throw new ValidationError('callData contains no Tornado withdraw');
-  const paying = withdraws.filter((w) => isAddressEqual(w.relayer, paymaster));
-  if (paying.length === 0) {
-    throw new ValidationError(`no withdraw names the paymaster ${paymaster} as relayer`);
+
+  const paymasterCalls = calls.filter((c) => isAddressEqual(c.target, rules.paymaster));
+  const relayed = withdraws.filter((w) => w.via === 'paymaster');
+  if (paymasterCalls.length !== relayed.length) {
+    throw new ValidationError('only relayWithdraw may be called on the paymaster');
   }
-  if (paying.length > 1) throw new ValidationError('more than one withdraw pays the paymaster');
-  const w = paying[0]!;
-  if (!allowedInstances.some((a) => isAddressEqual(a, w.instance))) {
+  if (relayed.length === 0) {
+    throw new ValidationError(`no relayWithdraw call on the paymaster ${rules.paymaster}`);
+  }
+  if (relayed.length > 1) throw new ValidationError('more than one relayWithdraw on the paymaster');
+
+  const paying = withdraws.filter((w) => isAddressEqual(w.relayer, rules.rewardAccount));
+  if (paying.length > 1) throw new ValidationError(`more than one withdraw names ${rules.rewardAccount} as relayer`);
+  const w = relayed[0]!;
+  if (!isAddressEqual(w.relayer, rules.rewardAccount)) {
+    throw new ValidationError(`relayWithdraw must name ${rules.rewardAccount} as relayer, got ${w.relayer}`);
+  }
+  if (!isAddressEqual(w.recipient, rules.sender)) {
+    throw new ValidationError(`relayWithdraw recipient must be the userOp sender ${rules.sender}, got ${w.recipient}`);
+  }
+  if (!rules.allowedInstances.some((a) => isAddressEqual(a, w.instance))) {
     throw new ValidationError(`instance ${w.instance} is not served by this relayer`);
   }
   const call = calls[w.index]!;
-  if (call.value !== 0n) throw new ValidationError('withdraw call must not carry value on an ETH instance');
-  if (w.refund !== 0n) throw new ValidationError('refund must be 0 on an ETH instance');
+  if (call.value !== 0n) throw new ValidationError('relayWithdraw call must not carry value');
   return w;
 }

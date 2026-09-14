@@ -27,6 +27,16 @@ export interface ChainSetup {
   demoSwapTarget?: { address: Address; symbol: string; uniswapFee: number };
   publicRpc: string;
   pimlicoPublicBundler: string;
+  /** Tornado DAO contracts. `tornadoRouter` is undefined where the DAO never deployed one (Sepolia). */
+  dao: {
+    tornadoRouter?: Address;
+    relayerRegistry: Address;
+    instanceRegistry: Address;
+    /** Governance address allowed to add instances / set protocol fees (impersonated on forks). */
+    governance: Address;
+    torn: Address;
+    ensRegistry: Address;
+  };
 }
 
 export const ENTRY_POINT_V08: Address = '0x4337084D9E255Ff0702461CF8895CE9E3b5Ff108';
@@ -66,6 +76,14 @@ export const CHAINS: Record<'mainnet' | 'sepolia', ChainSetup> = {
     demoTokenOut: { address: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', symbol: 'USDC', uniswapFee: 500 },
     publicRpc: 'https://ethereum-rpc.publicnode.com',
     pimlicoPublicBundler: 'https://public.pimlico.io/v2/1/rpc',
+    dao: {
+      tornadoRouter: '0xd90e2f925DA726b50C4Ed8D0Fb90Ad053324F31b',
+      relayerRegistry: '0x58E8dCC13BE9780fC42E8723D8EaD4CF46943dF2',
+      instanceRegistry: '0xB20c66C4DE72433F3cE747b58B86830c459CA911',
+      governance: '0x5efda50f22d34F262c29268506C5Fa42cB56A1Ce',
+      torn: '0x77777FeDdddFfC19Ff86DB637967013e6C6A116C',
+      ensRegistry: '0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e',
+    },
   },
   sepolia: {
     chain: sepolia,
@@ -99,5 +117,13 @@ export const CHAINS: Record<'mainnet' | 'sepolia', ChainSetup> = {
     // rpc.sepolia.ethpandaops.io return complete eth_getLogs results.
     publicRpc: 'https://sepolia.gateway.tenderly.co',
     pimlicoPublicBundler: 'https://public.pimlico.io/v2/11155111/rpc',
+    // The Sepolia registry exists but its `tornadoRouter` was never set: no router, no burn.
+    dao: {
+      relayerRegistry: '0xD6663593E71e4916eCb6f6606e1A6FbfA1634ffA',
+      instanceRegistry: '0x4e69fD587118dFb64957d18654E3894118E9B1BF',
+      governance: '0xe5324cD7602eeb387418e594B87aCADee08aeCAD',
+      torn: '0x3AE6667167C0f44394106E197904519D808323cA',
+      ensRegistry: '0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e',
+    },
   },
 };

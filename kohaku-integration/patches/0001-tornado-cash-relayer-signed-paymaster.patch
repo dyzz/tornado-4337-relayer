@@ -34,11 +34,11 @@ index 50cad1c..fc2029e 100644
 +export type { IRelayerPaymasterConfig, IPaymasterConfig } from './plugin/interfaces/protocol-params.interface';
 diff --git a/packages/tornado-cash/src/paymaster/relayer-paymaster-client.ts b/packages/tornado-cash/src/paymaster/relayer-paymaster-client.ts
 new file mode 100644
-index 0000000..2377721
+index 0000000..dc549a4
 --- /dev/null
 +++ b/packages/tornado-cash/src/paymaster/relayer-paymaster-client.ts
-@@ -0,0 +1,144 @@
-+import { hexToBigInt, toHex, type Address, type Hex } from 'viem';
+@@ -0,0 +1,158 @@
++import { hexToBigInt, parseAbi, toHex, type Address, type Hex } from 'viem';
 +
 +import { SerializedUserOperation, UserOpGasLimits } from '../interfaces/user-ops.interface';
 +
@@ -51,8 +51,20 @@ index 0000000..2377721
 + * userOp's callData (executed by the 7702 sender), not during paymaster
 + * validation, so any account can be sponsored and the paymaster needs no stake.
 + */
++/**
++ * `TornadoRelayerPaymaster.relayWithdraw`: the sponsoring withdraw is executed by the paymaster
++ * (as the DAO-registered relayer, through TornadoRouter -> RelayerRegistry.burn) on behalf of the
++ * recipient, which must be the calling account.
++ */
++export const relayerPaymasterAbi = parseAbi([
++  'function relayWithdraw(address pool, bytes proof, bytes32 root, bytes32 nullifierHash, address recipient, address relayer, uint256 fee)',
++]);
++
 +export interface RelayerQuote {
++  /** Address the proof must name as `relayer` (the paymaster, or an existing relayer's master EOA). */
 +  relayer: Address;
++  /** Paymaster whose `relayWithdraw` the userOp calls for the sponsoring note. */
++  paymaster: Address;
 +  entryPoint: Address;
 +  instance: Address;
 +  denomination: bigint;
@@ -117,6 +129,7 @@ index 0000000..2377721
 +  }): Promise<RelayerQuote> {
 +    interface RawQuote {
 +      relayer: Address;
++      paymaster: Address;
 +      entryPoint: Address;
 +      instance: Address;
 +      denomination: Hex;
@@ -142,6 +155,7 @@ index 0000000..2377721
 +
 +    return {
 +      relayer: raw.relayer,
++      paymaster: raw.paymaster,
 +      entryPoint: raw.entryPoint,
 +      instance: raw.instance,
 +      denomination: hexToBigInt(raw.denomination),
@@ -266,10 +280,10 @@ index c6f9806..8eb0fc1 100644
  
 diff --git a/packages/tornado-cash/src/state/thunks/relayerPaymasterWithdrawThunk.ts b/packages/tornado-cash/src/state/thunks/relayerPaymasterWithdrawThunk.ts
 new file mode 100644
-index 0000000..df640af
+index 0000000..c5902fc
 --- /dev/null
 +++ b/packages/tornado-cash/src/state/thunks/relayerPaymasterWithdrawThunk.ts
-@@ -0,0 +1,295 @@
+@@ -0,0 +1,311 @@
 +/* eslint-disable max-lines */
 +import { createAsyncThunk, unwrapResult } from "@reduxjs/toolkit";
 +
@@ -279,7 +293,7 @@ index 0000000..df640af
 +import { encodeFunctionData, erc20Abi, type Hex } from "viem";
 +
 +import { reasonableGasUnitsForBatch } from "../../paymaster/fee";
-+import { RelayerPaymasterClient } from "../../paymaster/relayer-paymaster-client";
++import { RelayerPaymasterClient, relayerPaymasterAbi } from "../../paymaster/relayer-paymaster-client";
 +import { buildSignedTornadoUserOp, createPaymasterBundlerClient, estimateUserOperationGas } from "../../paymaster/utils";
 +import { poolAbi } from "../../data/abis/pool.abi";
 +import { addressToHex } from "../../utils";
@@ -302,12 +316,15 @@ index 0000000..df640af
 + * Relayer-signed paymaster withdrawals (thin Tornado relayer over ERC-4337).
 + *
 + * Differences from `paymasterWithdrawThunk` (trustless PrivacyPaymaster):
-+ *  - the sponsoring `pool.withdraw` is part of the userOp callData, executed by
-+ *    the 7702 sender together with the direct withdraws and the tail calls;
-+ *  - the proof binds `relayer = paymaster` and `fee = relayer quote` (in the
-+ *    pool asset: wei for ETH pools, token units for ERC-20 pools, priced by the
-+ *    relayer); the paymaster refunds `fee - actual gas - service fee` to
-+ *    `refundTo` in postOp, in the same asset;
++ *  - the sponsoring withdraw is part of the userOp callData: the 7702 sender calls
++ *    `paymaster.relayWithdraw(...)`, which forwards it through the DAO's
++ *    TornadoRouter (RelayerRegistry burn, as for any registered relayer), then
++ *    runs the direct withdraws and the tail calls;
++ *  - the proof binds `relayer = quote.relayer` (the paymaster, or the master EOA
++ *    of an existing relayer the paymaster works for) and `fee = relayer quote`
++ *    (in the pool asset: wei for ETH pools, token units for ERC-20 pools, priced
++ *    by the relayer); in master mode the paymaster refunds
++ *    `fee - actual gas - service fee` to `refundTo` in postOp, in the same asset;
 + *  - `paymasterData` is a relayer signature obtained through ERC-7677
 + *    (`pm_getPaymasterStubData` for estimation, `pm_getPaymasterData` to send).
 + *
@@ -427,6 +444,19 @@ index 0000000..df640af
 +    return createTx(addressToHex(poolAddress), data, 0n);
 +  };
 +
++  // The sponsoring note: `paymaster.relayWithdraw` (Router / RelayerRegistry path). The
++  // paymaster only accepts the recipient as caller, which the sender is.
++  const relayWithdrawCall = (paymaster: `0x${string}`, poolAddress: Address, proof: TornadoProveOutput): TxData => {
++    const [root, nullifierHash, proofRecipient, relayerArg, feeArg] = proof.args;
++    const data = encodeFunctionData({
++      abi: relayerPaymasterAbi,
++      functionName: 'relayWithdraw',
++      args: [addressToHex(poolAddress), proof.proof, root, nullifierHash, proofRecipient, relayerArg, BigInt(feeArg)],
++    });
++
++    return createTx(paymaster, data, 0n);
++  };
++
 +  // deposits[1..]: proved with recipient = sender, relayer = 0, fee = 0 — the
 +  // sponsoring note already pays for the whole userOp.
 +  const ZERO_ADDRESS = 0n as Address;
@@ -456,8 +486,8 @@ index 0000000..df640af
 +
 +  // callData order: the sponsoring withdraw (pays the paymaster), the direct
 +  // withdraws, then the caller's tailCalls or the synthesized forward.
-+  const composeCalls = async (sponsoringProof: TornadoProveOutput, fee: bigint): Promise<TxData[]> => [
-+    withdrawCall(sponsoringDeposit.pool, sponsoringProof),
++  const composeCalls = async (paymaster: `0x${string}`, sponsoringProof: TornadoProveOutput, fee: bigint): Promise<TxData[]> => [
++    relayWithdrawCall(paymaster, sponsoringDeposit.pool, sponsoringProof),
 +    ...directWithdrawCalls,
 +    ...(needsConsolidation
 +      ? (tailCalls
@@ -507,13 +537,13 @@ index 0000000..df640af
 +  let fee = quote.fee;
 +  let gas: UserOpGasLimits = quote.gas;
 +  let sponsoringProof = await prove(sponsoringDeposit, sponsoringRecipient, relayerAddress, fee);
-+  let calls = await composeCalls(sponsoringProof, fee);
++  let calls = await composeCalls(quote.paymaster, sponsoringProof, fee);
 +
 +  // 2. Bundler estimation with the relayer's stub paymasterData (nothing signed yet).
 +  const stubFields = (op: Awaited<ReturnType<typeof buildSignedTornadoUserOp>>) =>
 +    relayerClient.getPaymasterStubData(op, entryPointAddress, chainId, sponsorContext);
 +  const provisional = await unsignedOp(calls, gas, quote.maxFeePerGas, quote.maxPriorityFeePerGas, {
-+    paymaster: quote.relayer,
++    paymaster: quote.paymaster,
 +    paymasterData: '0x',
 +  });
 +  const stub = await stubFields(provisional);
@@ -541,7 +571,7 @@ index 0000000..df640af
 +    if (requote.fee !== fee) {
 +      fee = requote.fee;
 +      sponsoringProof = await prove(sponsoringDeposit, sponsoringRecipient, relayerAddress, fee);
-+      calls = await composeCalls(sponsoringProof, fee);
++      calls = await composeCalls(quote.paymaster, sponsoringProof, fee);
 +    }
 +    quote = requote;
 +  } catch (error) {

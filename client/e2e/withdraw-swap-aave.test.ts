@@ -166,6 +166,7 @@ describe('withdraw -> swap -> Aave supply, atomically over ERC-4337 with the thi
     const owner = privateKeyToAccount(generatePrivateKey());
     const fee = 1n; // absurdly low
     const fakeProof = ('0x' + '11'.repeat(256)) as Hex;
+    // The sponsoring call: paymaster.relayWithdraw(pool, ..., recipient = sender, relayer = paymaster, fee).
     const callData = encodeFunctionData({
       abi: [
         {
@@ -182,12 +183,12 @@ describe('withdraw -> swap -> Aave supply, atomically over ERC-4337 with the thi
       ],
       functionName: 'execute',
       args: [
-        h.instance,
+        h.paymaster,
         0n,
         encodeFunctionData({
-          abi: tornadoAbi,
-          functionName: 'withdraw',
-          args: [fakeProof, `0x${'00'.repeat(32)}`, `0x${'01'.repeat(32)}`, owner.address, h.paymaster, fee, 0n],
+          abi: paymasterAdminAbi,
+          functionName: 'relayWithdraw',
+          args: [h.instance, fakeProof, `0x${'00'.repeat(32)}`, `0x${'01'.repeat(32)}`, owner.address, h.paymaster, fee],
         }),
       ],
     });

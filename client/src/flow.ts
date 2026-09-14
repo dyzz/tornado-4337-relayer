@@ -14,7 +14,7 @@ import {
   type UserOperationReceipt,
 } from 'viem/account-abstraction';
 
-import { tornadoAbi } from './abi.js';
+import { paymasterAdminAbi, tornadoAbi } from './abi.js';
 import { merklePath } from './merkle.js';
 import type { Note } from './note.js';
 import type { TornadoProveOutput, TornadoProver } from './prover.js';
@@ -75,8 +75,9 @@ const max = (a: bigint, b: bigint) => (a > b ? a : b);
  * Withdraw a Tornado note through the thin relayer + paymaster over ERC-4337 and
  * run arbitrary tail calls in the same atomic userOp.
  *
- *   1. tornado_quote           -> fee the proof must bind (relayer = paymaster)
- *   2. prove                    -> groth16 proof for (sender, paymaster, fee)
+ *   1. tornado_quote           -> fee the proof must bind and the relayer address to name
+ *                                  (the paymaster, or an existing relayer's master in worker mode)
+ *   2. prove                    -> groth16 proof for (sender, relayer, fee)
  *   3. eth_estimateUserOperationGas (stub paymasterData, no signature yet)
  *   4. re-quote at the estimated gas; re-prove only if the fee changed
  *   5. sendUserOperation        -> viem asks the relayer for pm_getPaymasterData
@@ -129,15 +130,17 @@ export async function sponsoredWithdraw(p: SponsoredWithdrawParams): Promise<Spo
       refund: 0n,
     });
 
-  const buildCalls = (proof: TornadoProveOutput, fee: bigint, asset: Address) => {
-    const [root, nullifierHash, recipient, relayerArg, feeArg, refundArg] = proof.args;
+  // The sponsoring withdraw goes through `paymaster.relayWithdraw`, which forwards it to the
+  // DAO's TornadoRouter (RelayerRegistry burn) — or straight to the pool on chains without one.
+  const buildCalls = (proof: TornadoProveOutput, fee: bigint, asset: Address, paymaster: Address) => {
+    const [root, nullifierHash, recipient, relayerArg, feeArg] = proof.args;
     const withdraw: TailCall = {
-      to: p.instance,
+      to: paymaster,
       value: 0n,
       data: encodeFunctionData({
-        abi: tornadoAbi,
-        functionName: 'withdraw',
-        args: [proof.proof, root, nullifierHash, recipient, relayerArg, BigInt(feeArg), BigInt(refundArg)],
+        abi: paymasterAdminAbi,
+        functionName: 'relayWithdraw',
+        args: [p.instance, proof.proof, root, nullifierHash, recipient, relayerArg, BigInt(feeArg)],
       }),
     };
     return [withdraw, ...p.tailCalls({ sender: account.address, amount: denomination - fee, asset })];
@@ -149,7 +152,7 @@ export async function sponsoredWithdraw(p: SponsoredWithdrawParams): Promise<Spo
   log(
     `quote: fee=${quote.fee} ${quote.symbol} (service ${quote.serviceFee}) at ${quote.maxFeePerGas} wei/gas` +
       (quote.tokenPerEth ? `, rate ${quote.tokenPerEth} ${quote.symbol}-units/ETH` : '') +
-      `, relayer=${quote.relayer}`,
+      `, relayer=${quote.relayer} via paymaster ${quote.paymaster}`,
   );
   let proof = await prove(quote.relayer, quote.fee);
   log(`proof ready, sender=${account.address}`);
@@ -157,7 +160,7 @@ export async function sponsoredWithdraw(p: SponsoredWithdrawParams): Promise<Spo
   // 3-4. Let the bundler size the op. Only the stub role is wired so nothing is signed yet.
   if (!p.skipEstimation) {
     const est = await bundler.estimateUserOperationGas({
-      calls: buildCalls(proof, quote.fee, asset),
+      calls: buildCalls(proof, quote.fee, asset, quote.paymaster),
       maxFeePerGas: quote.maxFeePerGas,
       maxPriorityFeePerGas: quote.maxPriorityFeePerGas,
       paymaster: { getPaymasterData: (args) => paymasterClient.getPaymasterStubData(args) },
@@ -189,7 +192,7 @@ export async function sponsoredWithdraw(p: SponsoredWithdrawParams): Promise<Spo
 
   // 6. Send. viem: pm_getPaymasterStubData -> pm_getPaymasterData (relayer signs) -> sender signs -> bundler.
   const userOpHash = await bundler.sendUserOperation({
-    calls: buildCalls(proof, quote.fee, asset),
+    calls: buildCalls(proof, quote.fee, asset, quote.paymaster),
     ...quote.gas,
     maxFeePerGas: quote.maxFeePerGas,
     maxPriorityFeePerGas: quote.maxPriorityFeePerGas,

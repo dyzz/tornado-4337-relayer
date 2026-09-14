@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { encodeFunctionData, parseEther, zeroAddress, type Address, type Hex } from 'viem';
 
-import { baseAccountAbi, tornadoInstanceAbi } from '../src/abi.js';
+import { baseAccountAbi, paymasterAbi, tornadoInstanceAbi } from '../src/abi.js';
 import { DEFAULT_GAS, minimumFee, serviceFeeFor } from '../src/fee.js';
 import { FixedPriceSource, parseDecimal, weiPerTokenFrom } from '../src/price.js';
 import { encodePaymasterData, DUMMY_SIGNATURE, packInitCode, readGas, totalGas } from '../src/userop.js';
@@ -11,7 +11,9 @@ const INSTANCE: Address = '0x12D66f87A04A9E220743712cE6d9bB1B5616B8Fc';
 const PAYMASTER: Address = '0x000000000000000000000000000000000000dEaD';
 const SENDER: Address = '0x1111111111111111111111111111111111111111';
 const DAI: Address = '0x6B175474E89094C44Da98b954EedeAC495271d0F';
+const MASTER: Address = '0x2222222222222222222222222222222222222222';
 
+/** Direct `pool.withdraw` (the non-sponsoring notes of a consolidation batch). */
 function withdrawData(relayer: Address, fee: bigint, nullifierHash: Hex = `0x${'01'.repeat(32)}`): Hex {
   return encodeFunctionData({
     abi: tornadoInstanceAbi,
@@ -20,14 +22,36 @@ function withdrawData(relayer: Address, fee: bigint, nullifierHash: Hex = `0x${'
   });
 }
 
+/** `paymaster.relayWithdraw` (the sponsoring note, routed through TornadoRouter on-chain). */
+function relayData(
+  relayer: Address,
+  fee: bigint,
+  { instance = INSTANCE, recipient = SENDER, nullifierHash = `0x${'01'.repeat(32)}` as Hex } = {},
+): Hex {
+  return encodeFunctionData({
+    abi: paymasterAbi,
+    functionName: 'relayWithdraw',
+    args: [instance, `0x${'aa'.repeat(256)}`, `0x${'00'.repeat(32)}`, nullifierHash, recipient, relayer, fee],
+  });
+}
+
+const rules = (rewardAccount: Address = PAYMASTER) => ({
+  paymaster: PAYMASTER,
+  rewardAccount,
+  allowedInstances: [INSTANCE],
+  sender: SENDER,
+});
+const single = (target: Address, value: bigint, data: Hex) =>
+  decodeAccountCalls(encodeFunctionData({ abi: baseAccountAbi, functionName: 'execute', args: [target, value, data] }));
+
 describe('validate', () => {
-  it('finds the sponsoring withdraw in an executeBatch with extra withdraws and tail calls', () => {
+  it('finds the sponsoring relayWithdraw in an executeBatch with extra direct withdraws and tail calls', () => {
     const callData = encodeFunctionData({
       abi: baseAccountAbi,
       functionName: 'executeBatch',
       args: [
         [
-          { target: INSTANCE, value: 0n, data: withdrawData(PAYMASTER, 123n) },
+          { target: PAYMASTER, value: 0n, data: relayData(PAYMASTER, 123n) },
           { target: INSTANCE, value: 0n, data: withdrawData(zeroAddress, 0n, `0x${'02'.repeat(32)}`) },
           { target: SENDER, value: 1n, data: '0x' },
         ],
@@ -35,43 +59,72 @@ describe('validate', () => {
     });
     const calls = decodeAccountCalls(callData);
     expect(calls).toHaveLength(3);
-    const w = findSponsoringWithdraw(calls, PAYMASTER, [INSTANCE]);
+    const w = findSponsoringWithdraw(calls, rules());
     expect(w.index).toBe(0);
+    expect(w.via).toBe('paymaster');
+    expect(w.instance).toBe(INSTANCE);
     expect(w.fee).toBe(123n);
     expect(w.relayer).toBe(PAYMASTER);
+    expect(w.refund).toBe(0n);
   });
 
-  it('accepts a single execute(...) call', () => {
-    const callData = encodeFunctionData({
-      abi: baseAccountAbi,
-      functionName: 'execute',
-      args: [INSTANCE, 0n, withdrawData(PAYMASTER, 5n)],
-    });
-    const w = findSponsoringWithdraw(decodeAccountCalls(callData), PAYMASTER, [INSTANCE]);
-    expect(w.fee).toBe(5n);
+  it('accepts a single execute(...) call and worker mode (relayer = master EOA)', () => {
+    expect(findSponsoringWithdraw(single(PAYMASTER, 0n, relayData(PAYMASTER, 5n)), rules()).fee).toBe(5n);
+    expect(findSponsoringWithdraw(single(PAYMASTER, 0n, relayData(MASTER, 7n)), rules(MASTER)).relayer).toBe(MASTER);
+    // Master mode must not accept a proof that pays some other address.
+    expect(() => findSponsoringWithdraw(single(PAYMASTER, 0n, relayData(MASTER, 7n)), rules())).toThrow(/must name/);
   });
 
-  it('rejects when no withdraw pays the paymaster, unknown instances, and value-carrying withdraws', () => {
-    const noPay = encodeFunctionData({
-      abi: baseAccountAbi,
-      functionName: 'execute',
-      args: [INSTANCE, 0n, withdrawData(SENDER, 5n)],
-    });
-    expect(() => findSponsoringWithdraw(decodeAccountCalls(noPay), PAYMASTER, [INSTANCE])).toThrow(ValidationError);
+  it('rejects direct pool withdraws as the sponsoring call (they bypass the Router / TORN burn)', () => {
+    expect(() => findSponsoringWithdraw(single(INSTANCE, 0n, withdrawData(PAYMASTER, 5n)), rules())).toThrow(
+      /no relayWithdraw/,
+    );
+  });
 
-    const unknown = encodeFunctionData({
-      abi: baseAccountAbi,
-      functionName: 'execute',
-      args: [SENDER, 0n, withdrawData(PAYMASTER, 5n)],
-    });
-    expect(() => findSponsoringWithdraw(decodeAccountCalls(unknown), PAYMASTER, [INSTANCE])).toThrow(/not served/);
+  it('rejects wrong recipient, unknown instances, value, other paymaster calls and duplicate payers', () => {
+    expect(() =>
+      findSponsoringWithdraw(single(PAYMASTER, 0n, relayData(PAYMASTER, 5n, { recipient: MASTER })), rules()),
+    ).toThrow(/recipient must be the userOp sender/);
+    expect(() =>
+      findSponsoringWithdraw(single(PAYMASTER, 0n, relayData(PAYMASTER, 5n, { instance: SENDER })), rules()),
+    ).toThrow(/not served/);
+    expect(() => findSponsoringWithdraw(single(PAYMASTER, 1n, relayData(PAYMASTER, 5n)), rules())).toThrow(/value/);
+    expect(() => findSponsoringWithdraw(single(INSTANCE, 0n, withdrawData(SENDER, 5n)), rules())).toThrow(ValidationError);
 
-    const withValue = encodeFunctionData({
-      abi: baseAccountAbi,
-      functionName: 'execute',
-      args: [INSTANCE, 1n, withdrawData(PAYMASTER, 5n)],
+    const sweepData = encodeFunctionData({
+      abi: [{ type: 'function', name: 'sweep', inputs: [{ type: 'address' }, { type: 'uint256' }], outputs: [], stateMutability: 'nonpayable' }],
+      functionName: 'sweep',
+      args: [SENDER, 1n],
     });
-    expect(() => findSponsoringWithdraw(decodeAccountCalls(withValue), PAYMASTER, [INSTANCE])).toThrow(/value/);
+    const batch = (calls: { target: Address; value: bigint; data: Hex }[]) =>
+      decodeAccountCalls(encodeFunctionData({ abi: baseAccountAbi, functionName: 'executeBatch', args: [calls] }));
+    expect(() =>
+      findSponsoringWithdraw(
+        batch([
+          { target: PAYMASTER, value: 0n, data: relayData(PAYMASTER, 5n) },
+          { target: PAYMASTER, value: 0n, data: sweepData },
+        ]),
+        rules(),
+      ),
+    ).toThrow(/only relayWithdraw/);
+    expect(() =>
+      findSponsoringWithdraw(
+        batch([
+          { target: PAYMASTER, value: 0n, data: relayData(PAYMASTER, 5n) },
+          { target: INSTANCE, value: 0n, data: withdrawData(PAYMASTER, 5n, `0x${'03'.repeat(32)}`) },
+        ]),
+        rules(),
+      ),
+    ).toThrow(/more than one withdraw names/);
+    expect(() =>
+      findSponsoringWithdraw(
+        batch([
+          { target: PAYMASTER, value: 0n, data: relayData(PAYMASTER, 5n) },
+          { target: PAYMASTER, value: 0n, data: relayData(PAYMASTER, 5n, { nullifierHash: `0x${'04'.repeat(32)}` }) },
+        ]),
+        rules(),
+      ),
+    ).toThrow(/more than one relayWithdraw/);
 
     expect(() => decodeAccountCalls('0xdeadbeef')).toThrow(ValidationError);
   });

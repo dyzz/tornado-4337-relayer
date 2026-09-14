@@ -14,6 +14,8 @@ import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/Messa
 import {TornadoRelayerPaymaster} from "../src/TornadoRelayerPaymaster.sol";
 import {ITornadoInstance} from "../src/interfaces/ITornadoInstance.sol";
 import {MockTornado, MockTornadoERC20, MockERC20} from "./mocks/MockTornado.sol";
+import {MockRelayerRegistry, MockTornadoRouter} from "./mocks/MockRegistry.sol";
+import {IRelayerRegistry, ITornadoRouter} from "../src/interfaces/ITornadoRouter.sol";
 
 contract RejectsEth {
     receive() external payable {
@@ -27,6 +29,8 @@ contract TornadoRelayerPaymasterTest is Test {
     uint256 constant TOKEN_PER_ETH = 3000e18; // 3000 DAI per ETH
     uint256 constant GAS_MARGIN_BPS = 1_000; // 10%
     uint256 constant POST_OP_OVERHEAD = 40_000;
+    uint256 constant MIN_STAKE = 5_000e18; // mainnet minStakeAmount
+    uint256 constant BURN_PER_WITHDRAW = 1.1375e18; // ~ mainnet ETH-1 instanceFee at the time of writing
 
     EntryPoint entryPoint;
     SimpleAccountFactory factory;
@@ -35,6 +39,9 @@ contract TornadoRelayerPaymasterTest is Test {
     MockERC20 dai;
     MockTornadoERC20 tornadoDai;
     TornadoRelayerPaymaster paymaster;
+    MockERC20 torn;
+    MockRelayerRegistry registry;
+    MockTornadoRouter router;
 
     uint256 relayerKey = 0xA11CE;
     address relayerSigner = vm.addr(relayerKey);
@@ -59,6 +66,18 @@ contract TornadoRelayerPaymasterTest is Test {
 
         paymaster = new TornadoRelayerPaymaster(entryPoint, relayerSigner, GAS_MARGIN_BPS, POST_OP_OVERHEAD);
         paymaster.deposit{value: 5 ether}();
+
+        torn = new MockERC20("Tornado", "TORN", 18);
+        registry = new MockRelayerRegistry(torn, MIN_STAKE, BURN_PER_WITHDRAW);
+        router = new MockTornadoRouter(registry);
+        registry.setTornadoRouter(address(router));
+    }
+
+    /// Register the paymaster as a relayer master (owner owns the ENS name, holds the stake).
+    function _registerPaymasterAsMaster() internal {
+        paymaster.setRouter(ITornadoRouter(address(router)));
+        torn.mint(address(paymaster), MIN_STAKE);
+        paymaster.registerAsRelayer(IRelayerRegistry(address(registry)), "thin-relayer.eth", MIN_STAKE);
     }
 
     // ------------------------------------------------------------ helpers
@@ -68,12 +87,29 @@ contract TornadoRelayerPaymasterTest is Test {
         view
         returns (BaseAccount.Call memory)
     {
+        return _relayCall(instance, nullifierHash, address(paymaster), fee);
+    }
+
+    /// The sponsoring call: `paymaster.relayWithdraw(pool, ..., recipient = account, relayer, fee)`.
+    function _relayCall(address instance, bytes32 nullifierHash, address relayer, uint256 fee)
+        internal
+        view
+        returns (BaseAccount.Call memory)
+    {
         return BaseAccount.Call({
-            target: instance,
+            target: address(paymaster),
             value: 0,
             data: abi.encodeCall(
-                ITornadoInstance.withdraw,
-                (hex"", bytes32(0), nullifierHash, payable(address(account)), payable(address(paymaster)), fee, 0)
+                TornadoRelayerPaymaster.relayWithdraw,
+                (
+                    ITornadoInstance(instance),
+                    hex"",
+                    bytes32(0),
+                    nullifierHash,
+                    payable(address(account)),
+                    payable(relayer),
+                    fee
+                )
             )
         });
     }
@@ -379,6 +415,154 @@ contract TornadoRelayerPaymasterTest is Test {
 
         vm.expectRevert(TornadoRelayerPaymaster.OnlySelf.selector);
         paymaster.refundToken(dai, finalRecipient, 1);
+    }
+
+    // ------------------------------------------------------------ router / registry
+
+    /// Master mode: the paymaster is a registered relayer; every sponsored withdrawal burns TORN
+    /// from its stake via Router -> RelayerRegistry.burn, the fee still lands on the paymaster.
+    function test_router_masterMode_burnsPaymasterStake() public {
+        _registerPaymasterAsMaster();
+        assertEq(registry.workers(address(paymaster)), address(paymaster));
+        assertEq(registry.getRelayerBalance(address(paymaster)), MIN_STAKE);
+
+        uint256 fee = 0.02 ether;
+        PackedUserOperation memory op = _ethOp(fee, 0.001 ether, address(account));
+        uint256 depositBefore = paymaster.getDeposit();
+        vm.recordLogs();
+        _handle(op);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+
+        assertEq(registry.getRelayerBalance(address(paymaster)), MIN_STAKE - BURN_PER_WITHDRAW, "stake burned");
+        assertEq(registry.totalBurned(), BURN_PER_WITHDRAW);
+        assertEq(finalRecipient.balance, DENOMINATION - fee);
+        (,, uint256 refund) = _findSponsored(logs);
+        assertGt(refund, 0, "master mode still refunds");
+        assertGt(paymaster.getDeposit(), depositBefore, "fee re-deposited");
+        assertTrue(_sawEvent(logs, TornadoRelayerPaymaster.Relayed.selector));
+    }
+
+    /// Worker mode: an existing relayer registers the paymaster as a worker. The proof names the
+    /// master, so the fee goes to the master (classic economics, no refund); the burn hits the
+    /// master's stake; the paymaster's deposit only pays the gas.
+    function test_router_workerMode_feeToMaster_burnsMasterStake() public {
+        address master = makeAddr("existingRelayer");
+        torn.mint(master, MIN_STAKE);
+        vm.startPrank(master);
+        torn.approve(address(registry), MIN_STAKE);
+        registry.register("existing-relayer.eth", MIN_STAKE, new address[](0));
+        registry.registerWorker(master, address(paymaster));
+        vm.stopPrank();
+        paymaster.setRouter(ITornadoRouter(address(router)));
+        assertEq(registry.workers(address(paymaster)), master);
+
+        uint256 fee = 0.02 ether;
+        BaseAccount.Call[] memory calls = new BaseAccount.Call[](2);
+        calls[0] = _relayCall(address(tornado), keccak256("worker"), master, fee);
+        calls[1] = BaseAccount.Call({target: finalRecipient, value: DENOMINATION - fee, data: ""});
+        PackedUserOperation memory op = _baseOp(abi.encodeCall(BaseAccount.executeBatch, (calls)));
+        _attachPaymaster(op, _terms(fee, 0, address(0), address(0), 0), relayerKey); // refundTo = 0
+        _signAccount(op);
+
+        uint256 depositBefore = paymaster.getDeposit();
+        vm.recordLogs();
+        _handle(op);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+
+        assertEq(master.balance, fee, "fee paid to the master EOA");
+        assertEq(finalRecipient.balance, DENOMINATION - fee);
+        assertEq(registry.getRelayerBalance(master), MIN_STAKE - BURN_PER_WITHDRAW, "master stake burned");
+        assertEq(registry.getRelayerBalance(address(paymaster)), MIN_STAKE - BURN_PER_WITHDRAW, "worker resolves to master");
+        assertEq(address(paymaster).balance, 0);
+        assertLt(paymaster.getDeposit(), depositBefore, "deposit paid the gas");
+        (,, uint256 refund) = _findSponsored(logs);
+        assertEq(refund, 0);
+        assertFalse(_sawEvent(logs, TornadoRelayerPaymaster.FeeNotReceived.selector), "no refund promised, no warning");
+    }
+
+    /// Registry rule: a registered worker may only relay for its own master.
+    function test_router_workerMode_wrongRelayerReverts() public {
+        address master = makeAddr("existingRelayer");
+        torn.mint(master, MIN_STAKE);
+        vm.startPrank(master);
+        torn.approve(address(registry), MIN_STAKE);
+        registry.register("existing-relayer.eth", MIN_STAKE, new address[](0));
+        registry.registerWorker(master, address(paymaster));
+        vm.stopPrank();
+        paymaster.setRouter(ITornadoRouter(address(router)));
+
+        vm.prank(address(account));
+        vm.expectRevert("only relayer");
+        paymaster.relayWithdraw(
+            ITornadoInstance(address(tornado)), hex"", bytes32(0), keccak256("z"), payable(address(account)),
+            payable(address(paymaster)), 0.01 ether
+        );
+    }
+
+    /// Only the note's recipient may trigger the relay (no one else can burn the relayer's stake).
+    function test_relayWithdraw_onlyRecipient() public {
+        _registerPaymasterAsMaster();
+        vm.prank(makeAddr("stranger"));
+        vm.expectRevert(TornadoRelayerPaymaster.OnlyRecipient.selector);
+        paymaster.relayWithdraw(
+            ITornadoInstance(address(tornado)), hex"", bytes32(0), keccak256("q"), payable(address(account)),
+            payable(address(paymaster)), 0.01 ether
+        );
+    }
+
+    /// Without a router (testnets) the paymaster calls the pool directly and no registry is involved.
+    function test_relayWithdraw_directWhenNoRouter() public {
+        assertEq(address(paymaster.router()), address(0));
+        PackedUserOperation memory op = _ethOp(0.02 ether, 0, address(account));
+        vm.recordLogs();
+        _handle(op);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        assertEq(finalRecipient.balance, DENOMINATION - 0.02 ether);
+        assertEq(registry.totalBurned(), 0);
+        bool sawDirect;
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].emitter == address(paymaster) && logs[i].topics[0] == TornadoRelayerPaymaster.Relayed.selector) {
+                (, bool viaRouter) = abi.decode(logs[i].data, (uint256, bool));
+                sawDirect = !viaRouter;
+            }
+        }
+        assertTrue(sawDirect, "Relayed(viaRouter=false) expected");
+    }
+
+    function test_registerAsRelayer_andAdminCall_onlyOwner() public {
+        torn.mint(address(paymaster), MIN_STAKE * 2);
+        vm.prank(makeAddr("stranger"));
+        vm.expectRevert();
+        paymaster.registerAsRelayer(IRelayerRegistry(address(registry)), "thin-relayer.eth", MIN_STAKE);
+
+        paymaster.registerAsRelayer(IRelayerRegistry(address(registry)), "thin-relayer.eth", MIN_STAKE);
+        assertEq(registry.getRelayerBalance(address(paymaster)), MIN_STAKE);
+        assertEq(torn.balanceOf(address(registry)), MIN_STAKE);
+
+        // Housekeeping through adminCall: add the operator's hot wallet as a worker, top up the stake.
+        address hotWallet = makeAddr("hotWallet");
+        paymaster.adminCall(
+            address(registry), 0, abi.encodeCall(MockRelayerRegistry.registerWorker, (address(paymaster), hotWallet))
+        );
+        assertEq(registry.workers(hotWallet), address(paymaster));
+        paymaster.adminCall(address(torn), 0, abi.encodeCall(IERC20.approve, (address(registry), MIN_STAKE)));
+        paymaster.adminCall(
+            address(registry), 0, abi.encodeCall(MockRelayerRegistry.stakeToRelayer, (address(paymaster), MIN_STAKE))
+        );
+        assertEq(registry.getRelayerBalance(address(paymaster)), MIN_STAKE * 2);
+
+        vm.prank(makeAddr("stranger"));
+        vm.expectRevert();
+        paymaster.adminCall(address(torn), 0, abi.encodeCall(IERC20.approve, (address(registry), 1)));
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                TornadoRelayerPaymaster.AdminCallFailed.selector, abi.encodeWithSignature("Error(string)", "!registered")
+            )
+        );
+        paymaster.adminCall(
+            address(registry), 0, abi.encodeCall(MockRelayerRegistry.stakeToRelayer, (hotWallet, 1))
+        );
     }
 
     // ------------------------------------------------------------ log helpers

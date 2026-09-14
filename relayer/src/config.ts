@@ -55,6 +55,8 @@ export function configFromEnv(): RelayerConfig {
     entryPoint: addr('ENTRY_POINT', ENTRY_POINT_V08),
     paymaster: addr('PAYMASTER_ADDRESS'),
     signerKey: signerKey as Hex,
+    rewardAccount: process.env.REWARD_ACCOUNT ? addr('REWARD_ACCOUNT') : undefined,
+    allowUnregistered: env('ALLOW_UNREGISTERED', 'false') === 'true',
     instances: env('TORNADO_INSTANCES')
       .split(',')
       .map((s) => s.trim())
