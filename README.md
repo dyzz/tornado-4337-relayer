@@ -202,3 +202,10 @@ Pimlico's public Sepolia endpoint.
 
 Public Sepolia RPC note: tenderly's gateway rate-limits the CLI's log sync; `rpc.sepolia.ethpandaops.io`
 with `KOHAKU_GETLOGS_MAX_BLOCK_SPAN=2000` worked.
+
+### Screenshots
+
+| | |
+| --- | --- |
+| ![tx](docs/screenshots/1-sepolia-tx-overview.png) | ![logs](docs/screenshots/2-sepolia-tx-logs.png) |
+| ![wallet](docs/screenshots/3-wallet-aweth.png) | ![balances](docs/screenshots/4-kohaku-balances.png) |
