@@ -44,8 +44,11 @@ export interface SponsoredWithdrawParams {
   owner: PrivateKeyAccount;
   /** Receives fee - actual gas - serviceFee after execution (postOp refund). */
   refundTo: Address;
-  /** Calls executed by the sender right after the withdraw, with `amount = denomination - fee`. */
-  tailCalls: (ctx: { sender: Address; amount: bigint }) => TailCall[];
+  /**
+   * Calls executed by the sender right after the withdraw. `amount = denomination - fee` in
+   * the pool asset; `asset` is zeroAddress for ETH pools, else the ERC-20 the sender now holds.
+   */
+  tailCalls: (ctx: { sender: Address; amount: bigint; asset: Address }) => TailCall[];
   /** callGasLimit budget for the tail calls used for the initial quote. */
   tailCallsGas?: bigint;
   /** Simple7702Account implementation (defaults to the canonical v0.8 deployment). */
@@ -126,7 +129,7 @@ export async function sponsoredWithdraw(p: SponsoredWithdrawParams): Promise<Spo
       refund: 0n,
     });
 
-  const buildCalls = (proof: TornadoProveOutput, fee: bigint) => {
+  const buildCalls = (proof: TornadoProveOutput, fee: bigint, asset: Address) => {
     const [root, nullifierHash, recipient, relayerArg, feeArg, refundArg] = proof.args;
     const withdraw: TailCall = {
       to: p.instance,
@@ -137,19 +140,24 @@ export async function sponsoredWithdraw(p: SponsoredWithdrawParams): Promise<Spo
         args: [proof.proof, root, nullifierHash, recipient, relayerArg, BigInt(feeArg), BigInt(refundArg)],
       }),
     };
-    return [withdraw, ...p.tailCalls({ sender: account.address, amount: denomination - fee })];
+    return [withdraw, ...p.tailCalls({ sender: account.address, amount: denomination - fee, asset })];
   };
 
   // 1-2. Quote at conservative ceilings and prove against that fee.
   let quote = await relayer.quote({ instance: p.instance, tailCallsGas: p.tailCallsGas });
-  log(`quote: fee=${quote.fee} wei (service ${quote.serviceFee}) at ${quote.maxFeePerGas} wei/gas, relayer=${quote.relayer}`);
+  const asset = quote.feeToken;
+  log(
+    `quote: fee=${quote.fee} ${quote.symbol} (service ${quote.serviceFee}) at ${quote.maxFeePerGas} wei/gas` +
+      (quote.tokenPerEth ? `, rate ${quote.tokenPerEth} ${quote.symbol}-units/ETH` : '') +
+      `, relayer=${quote.relayer}`,
+  );
   let proof = await prove(quote.relayer, quote.fee);
   log(`proof ready, sender=${account.address}`);
 
   // 3-4. Let the bundler size the op. Only the stub role is wired so nothing is signed yet.
   if (!p.skipEstimation) {
     const est = await bundler.estimateUserOperationGas({
-      calls: buildCalls(proof, quote.fee),
+      calls: buildCalls(proof, quote.fee, asset),
       maxFeePerGas: quote.maxFeePerGas,
       maxPriorityFeePerGas: quote.maxPriorityFeePerGas,
       paymaster: { getPaymasterData: (args) => paymasterClient.getPaymasterStubData(args) },
@@ -181,7 +189,7 @@ export async function sponsoredWithdraw(p: SponsoredWithdrawParams): Promise<Spo
 
   // 6. Send. viem: pm_getPaymasterStubData -> pm_getPaymasterData (relayer signs) -> sender signs -> bundler.
   const userOpHash = await bundler.sendUserOperation({
-    calls: buildCalls(proof, quote.fee),
+    calls: buildCalls(proof, quote.fee, asset),
     ...quote.gas,
     maxFeePerGas: quote.maxFeePerGas,
     maxPriorityFeePerGas: quote.maxPriorityFeePerGas,

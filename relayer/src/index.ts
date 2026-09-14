@@ -1,6 +1,8 @@
 export { RelayerService } from './service.js';
+export * from './price.js';
 export type {
   RelayerConfig,
+  InstanceInfo,
   Quote,
   QuoteParams,
   SponsorContext,

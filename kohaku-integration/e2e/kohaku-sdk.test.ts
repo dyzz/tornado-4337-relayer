@@ -240,4 +240,60 @@ describe('Kohaku SDK -> thin relayer paymaster (Sepolia fork)', () => {
       expect(sponsored).toBeDefined();
     }
   });
+
+  it('ERC-20 pool: shields 100 DAI with the SDK, unshields via the relayer paymaster with the fee and refund in DAI', async () => {
+    const { publicClient, setup } = h;
+    const dai = setup.demoErc20;
+    const daiAsset = { __type: 'erc20' as const, contract: getAddress(dai.address) };
+    const AMOUNT = dai.denomination;
+
+    // --- shield ------------------------------------------------------------------
+    const bob = await h.newFundedAccount(parseEther('1'));
+    await h.dealErc20(bob.address, AMOUNT);
+    const bobWallet = createWalletClient({ account: bob, chain: setup.chain, transport: http(h.rpcUrl) });
+    const before = (await protocol.balance([daiAsset]))[0]!.amount;
+    const { txns } = await protocol.prepareShield({ asset: daiAsset, amount: AMOUNT });
+    for (const tx of txns) {
+      const hash = await bobWallet.sendTransaction({ to: tx.to as Address, data: tx.data as Hex, value: tx.value, gas: 2_000_000n });
+      expect((await publicClient.waitForTransactionReceipt({ hash })).status).toBe('success');
+    }
+    await h.mine(1);
+    expect((await protocol.balance([daiAsset]))[0]!.amount).toBe(before + AMOUNT);
+    log(`shielded ${AMOUNT} DAI-units`);
+
+    // --- unshield with a tail call, gas paid in DAI ---------------------------------
+    // Aave Sepolia's DAI reserve sits above its supply cap (2e9 DAI), so the tail here is a plain
+    // transfer of the whole withdrawn amount to the final recipient; DAI -> aDAI is covered by the
+    // mainnet-fork e2e in client/.
+    const finalRecipient = privateKeyToAccount(generatePrivateKey()).address;
+    const op = await protocol.prepareUnshield({ asset: daiAsset, amount: AMOUNT }, finalRecipient, {
+      mode: 'paymaster',
+      tailCallsGasEstimate: 120_000n,
+      tailCalls: async (_sender, ctx) => [
+        {
+          to: ctx!.asset!,
+          value: 0n,
+          data: encodeFunctionData({ abi: erc20Abi, functionName: 'transfer', args: [finalRecipient, ctx!.amount!] }),
+        },
+      ],
+    });
+    const w = op.withdrawals[0]! as IGenericPaymasterWithdrawalPayload;
+    const fee = BigInt(w.proof.args[4]);
+    expect(w.proof.args[3].toLowerCase()).toBe(h.paymaster.toLowerCase());
+    log(`prepared DAI userOp sender=${w.userOperation.sender} fee=${fee} DAI-units`);
+
+    const results = await broadcaster.broadcast(op);
+    expect(results).toHaveLength(1);
+    await h.mine(1);
+
+    // --- assertions --------------------------------------------------------------
+    expect((await protocol.balance([daiAsset]))[0]!.amount).toBe(before);
+    // Final recipient: the withdrawn amount (tail transfer) plus the postOp refund, both in DAI.
+    const received = await publicClient.readContract({ address: dai.address, abi: erc20Abi, functionName: 'balanceOf', args: [finalRecipient] });
+    const refund = received - (AMOUNT - fee);
+    log(`final recipient holds ${received} DAI-units = ${AMOUNT - fee} withdrawn + ${refund} refund`);
+    expect(refund).toBeGreaterThan(0n);
+    expect(await publicClient.readContract({ address: dai.address, abi: erc20Abi, functionName: 'balanceOf', args: [w.userOperation.sender] })).toBe(0n);
+    expect(await publicClient.readContract({ address: dai.address, abi: erc20Abi, functionName: 'balanceOf', args: [h.paymaster] })).toBe(fee - refund);
+  });
 });

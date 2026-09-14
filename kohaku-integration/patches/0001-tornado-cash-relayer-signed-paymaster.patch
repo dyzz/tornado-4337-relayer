@@ -1,14 +1,16 @@
 diff --git a/packages/plugins/src/base.ts b/packages/plugins/src/base.ts
-index d443534..142080a 100644
+index d443534..4faab2b 100644
 --- a/packages/plugins/src/base.ts
 +++ b/packages/plugins/src/base.ts
-@@ -16,8 +16,13 @@ export type AssetAmounts<
+@@ -16,8 +16,15 @@ export type AssetAmounts<
      read: TxAssetAmountRead;
  }
  
 +export interface UnshieldTailCallsContext {
 +    /** Amount of the unshielded asset the `address` holds when the tail calls run (denomination minus fees). */
 +    amount?: bigint;
++    /** The ERC-20 the `address` holds; undefined for the native asset. */
++    asset?: Address;
 +}
 +
  export interface UnshieldOptions {
@@ -32,10 +34,10 @@ index 50cad1c..fc2029e 100644
 +export type { IRelayerPaymasterConfig, IPaymasterConfig } from './plugin/interfaces/protocol-params.interface';
 diff --git a/packages/tornado-cash/src/paymaster/relayer-paymaster-client.ts b/packages/tornado-cash/src/paymaster/relayer-paymaster-client.ts
 new file mode 100644
-index 0000000..fa2b88d
+index 0000000..2377721
 --- /dev/null
 +++ b/packages/tornado-cash/src/paymaster/relayer-paymaster-client.ts
-@@ -0,0 +1,130 @@
+@@ -0,0 +1,144 @@
 +import { hexToBigInt, toHex, type Address, type Hex } from 'viem';
 +
 +import { SerializedUserOperation, UserOpGasLimits } from '../interfaces/user-ops.interface';
@@ -54,6 +56,12 @@ index 0000000..fa2b88d
 +  entryPoint: Address;
 +  instance: Address;
 +  denomination: bigint;
++  /** address(0) for ETH pools; `fee`, `serviceFee` and `denomination` are in this token's units. */
++  feeToken: Address;
++  decimals: number;
++  symbol: string;
++  /** feeToken base units per 1e18 wei (0 for ETH). */
++  tokenPerEth: bigint;
 +  serviceFee: bigint;
 +  gas: UserOpGasLimits;
 +  maxFeePerGas: bigint;
@@ -112,6 +120,10 @@ index 0000000..fa2b88d
 +      entryPoint: Address;
 +      instance: Address;
 +      denomination: Hex;
++      feeToken: Address;
++      decimals: number;
++      symbol: string;
++      tokenPerEth: Hex;
 +      serviceFee: Hex;
 +      gas: Record<keyof UserOpGasLimits, Hex>;
 +      maxFeePerGas: Hex;
@@ -133,6 +145,10 @@ index 0000000..fa2b88d
 +      entryPoint: raw.entryPoint,
 +      instance: raw.instance,
 +      denomination: hexToBigInt(raw.denomination),
++      feeToken: raw.feeToken,
++      decimals: raw.decimals,
++      symbol: raw.symbol,
++      tokenPerEth: hexToBigInt(raw.tokenPerEth),
 +      serviceFee: hexToBigInt(raw.serviceFee),
 +      gas: {
 +        callGasLimit: hexToBigInt(raw.gas.callGasLimit),
@@ -167,7 +183,7 @@ index 0000000..fa2b88d
 +  }
 +}
 diff --git a/packages/tornado-cash/src/plugin/interfaces/protocol-params.interface.ts b/packages/tornado-cash/src/plugin/interfaces/protocol-params.interface.ts
-index 6d6009c..c945d20 100644
+index 6d6009c..5647c52 100644
 --- a/packages/tornado-cash/src/plugin/interfaces/protocol-params.interface.ts
 +++ b/packages/tornado-cash/src/plugin/interfaces/protocol-params.interface.ts
 @@ -19,11 +19,24 @@ import type { DelegationConfig } from '../../account/delegation.interface';
@@ -200,12 +216,12 @@ index 6d6009c..c945d20 100644
    mode: 'paymaster';
    delegation?: DelegationConfig;
 -  tailCalls?: (address: AccountId) => Promise<TxData[]>;
-+  tailCalls?: (address: AccountId, context?: { amount?: bigint }) => Promise<TxData[]>;
++  tailCalls?: (address: AccountId, context?: { amount?: bigint; asset?: `0x${string}` }) => Promise<TxData[]>;
    /**
     * Optional baseline for the execution-phase gas of user `tailCalls` (not
     * including per-note direct withdraws). Used when bundler estimation fails;
 diff --git a/packages/tornado-cash/src/state/thunks/paymasterWithdrawThunk.ts b/packages/tornado-cash/src/state/thunks/paymasterWithdrawThunk.ts
-index c6f9806..04f4d2e 100644
+index c6f9806..8eb0fc1 100644
 --- a/packages/tornado-cash/src/state/thunks/paymasterWithdrawThunk.ts
 +++ b/packages/tornado-cash/src/state/thunks/paymasterWithdrawThunk.ts
 @@ -24,6 +24,7 @@ import { WithdrawalProofsThunkParams, withdrawalsProofThunk } from "./withdrawal
@@ -221,7 +237,7 @@ index c6f9806..04f4d2e 100644
    };
    secretManager: ISecretManager;
 -  tailCalls?: (address: AccountId) => Promise<TxData[]>;
-+  tailCalls?: (address: AccountId, context?: { amount?: bigint }) => Promise<TxData[]>;
++  tailCalls?: (address: AccountId, context?: { amount?: bigint; asset?: `0x${string}` }) => Promise<TxData[]>;
    tailCallsGasEstimate?: bigint;
  }
  
@@ -250,10 +266,10 @@ index c6f9806..04f4d2e 100644
  
 diff --git a/packages/tornado-cash/src/state/thunks/relayerPaymasterWithdrawThunk.ts b/packages/tornado-cash/src/state/thunks/relayerPaymasterWithdrawThunk.ts
 new file mode 100644
-index 0000000..8f7f9cb
+index 0000000..df640af
 --- /dev/null
 +++ b/packages/tornado-cash/src/state/thunks/relayerPaymasterWithdrawThunk.ts
-@@ -0,0 +1,292 @@
+@@ -0,0 +1,295 @@
 +/* eslint-disable max-lines */
 +import { createAsyncThunk, unwrapResult } from "@reduxjs/toolkit";
 +
@@ -288,8 +304,10 @@ index 0000000..8f7f9cb
 + * Differences from `paymasterWithdrawThunk` (trustless PrivacyPaymaster):
 + *  - the sponsoring `pool.withdraw` is part of the userOp callData, executed by
 + *    the 7702 sender together with the direct withdraws and the tail calls;
-+ *  - the proof binds `relayer = paymaster` and `fee = relayer quote`; the
-+ *    paymaster refunds `fee - actual gas - service fee` to `refundTo` in postOp;
++ *  - the proof binds `relayer = paymaster` and `fee = relayer quote` (in the
++ *    pool asset: wei for ETH pools, token units for ERC-20 pools, priced by the
++ *    relayer); the paymaster refunds `fee - actual gas - service fee` to
++ *    `refundTo` in postOp, in the same asset;
 + *  - `paymasterData` is a relayer signature obtained through ERC-7677
 + *    (`pm_getPaymasterStubData` for estimation, `pm_getPaymasterData` to send).
 + *
@@ -323,9 +341,6 @@ index 0000000..8f7f9cb
 +  const poolInfo = pools.get(deposits[0]!.pool);
 +
 +  if (!poolInfo) throw new Error(`No pool found for asset ${assetAddress}`);
-+  if (poolInfo.isERC20) {
-+    throw new Error('Relayer-signed paymaster withdrawals currently support native ETH pools only.');
-+  }
 +
 +  const chainConfig = paymasterConfig[chainId];
 +
@@ -446,8 +461,12 @@ index 0000000..8f7f9cb
 +    ...directWithdrawCalls,
 +    ...(needsConsolidation
 +      ? (tailCalls
-+          // The sender holds every withdrawn note minus the sponsoring fee when the tail runs.
-+          ? await tailCalls(signer.address as AccountId, { amount: totalDenomination - fee })
++          // The sender holds every withdrawn note minus the sponsoring fee when the tail runs
++          // (ETH for native pools, the pool token for ERC-20 pools; the fee is in the same asset).
++          ? await tailCalls(signer.address as AccountId, {
++              amount: totalDenomination - fee,
++              asset: poolInfo.isERC20 ? addressToHex(poolInfo.asset) : undefined,
++            })
 +          : forwardCalls(fee))
 +      : []),
 +  ];

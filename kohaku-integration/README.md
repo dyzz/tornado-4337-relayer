@@ -14,7 +14,7 @@ Against `ethereum/kohaku` @ `patches/KOHAKU_COMMIT`. It applies cleanly with `gi
 | `packages/tornado-cash/src/paymaster/relayer-paymaster-client.ts` | New. ERC-7677 client (`pm_getPaymasterStubData`, `pm_getPaymasterData`) plus `tornado_quote`. |
 | `packages/tornado-cash/src/state/thunks/relayerPaymasterWithdrawThunk.ts` | New. Quote → prove (relayer = paymaster, fee = quote) → bundler estimate → re-quote/re-prove → relayer signature → sender signature. The sponsoring `pool.withdraw` goes into callData together with the direct withdraws of extra notes and the tail calls. Reuses `buildSignedTornadoUserOp`, `withdrawalsProofThunk`, the delegator/ephemeral-signer rules and `PaymasterBroadcaster` unchanged. |
 | `packages/tornado-cash/src/state/thunks/paymasterWithdrawThunk.ts` | Dispatches the new thunk when `paymasterConfig[chainId].relayer` is set; otherwise unchanged. |
-| `packages/plugins/src/base.ts` | `tailCalls(address, context?: { amount })` — the tail now learns how much the sender holds (denomination − fee), so "supply everything" tail calls are possible. Backwards compatible. |
+| `packages/plugins/src/base.ts` | `tailCalls(address, context?: { amount, asset })` — the tail now learns how much the sender holds (denomination − fee) and of which asset (ERC-20 address, undefined for ETH), so "supply everything" tail calls are possible. Backwards compatible. |
 | `packages/tornado-cash/src/index.ts` | Exports. |
 
 Host usage is one config line:
@@ -44,7 +44,8 @@ await broadcaster.broadcast(op);
 - `scripts/setup.sh` — clone Kohaku at the pinned commit into `vendor/`, apply the patch, build.
 - `scripts/export-patch.sh` — regenerate the patch after editing `vendor/kohaku`.
 - `e2e/kohaku-sdk.test.ts` — Sepolia fork: shield with the SDK, unshield in paymaster mode with a
-  wrap-and-supply-to-Aave tail call, sponsored by this repo's relayer + paymaster, bundled by alto.
+  wrap-and-supply-to-Aave tail call, sponsored by this repo's relayer + paymaster, bundled by alto;
+  plus the same for the DAI-100 pool with the fee paid and refunded in DAI.
 - `example/withdraw-with-relayer.ts` — a minimal live host (Pimlico public bundler).
 
 ```bash

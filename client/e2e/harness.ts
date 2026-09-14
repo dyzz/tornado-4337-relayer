@@ -4,18 +4,28 @@ import {
   createPublicClient,
   createTestClient,
   createWalletClient,
+  encodeAbiParameters,
   http,
+  keccak256,
+  pad,
   parseEther,
+  toHex,
   type Address,
   type Hex,
   type PublicClient,
 } from 'viem';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 
-import { createRelayerApp, RelayerService } from '@tornado-4337/relayer';
+import {
+  createRelayerApp,
+  FixedPriceSource,
+  OneInchPriceSource,
+  RelayerService,
+  type PriceSource,
+} from '@tornado-4337/relayer';
 import { CHAINS, type ChainSetup } from '../src/chains.js';
-import { deployEthTornado, deployMimcHasher, deployPaymaster, deployZap } from '../src/deploy.js';
-import { paymasterAdminAbi } from '../src/abi.js';
+import { deployErc20Tornado, deployEthTornado, deployMimcHasher, deployPaymaster, deployZap } from '../src/deploy.js';
+import { erc20Abi, paymasterAdminAbi } from '../src/abi.js';
 
 // Well-known anvil dev keys (accounts 0..4).
 export const ANVIL_KEYS: Hex[] = [
@@ -37,12 +47,17 @@ export interface Harness {
   instance: Address;
   denomination: bigint;
   instanceDeployBlock: bigint;
+  /** ERC-20 pool for `setup.demoErc20` (fresh on forks, canonical in canonicalInstances mode). */
+  erc20Instance: Address;
+  erc20Denomination: bigint;
   paymaster: Address;
   zap: Address;
   relayer: RelayerService;
   setBalance(address: Address, wei: bigint): Promise<void>;
   /** A brand-new EOA funded with `wei` (default 10 ETH). */
   newFundedAccount(wei?: bigint): Promise<ReturnType<typeof privateKeyToAccount>>;
+  /** Give `to` some of the demo ERC-20 (storage write on mainnet-style tokens, whale transfer otherwise). */
+  dealErc20(to: Address, amount: bigint): Promise<void>;
   mine(blocks?: number): Promise<void>;
   stop(): Promise<void>;
 }
@@ -118,12 +133,15 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
   // --- contracts ------------------------------------------------------------
   let instance: Address;
   let denomination: bigint;
+  let erc20Instance: Address;
+  const erc20Denomination = setup.demoErc20.denomination;
   let instanceDeployBlock = 0n;
   let hasher: Address | undefined;
   if (opts.canonicalInstances) {
     // Use the chain's real Tornado pools (needed when a wallet SDK discovers pools from the registry).
     instance = setup.tornadoEth['0.1']!;
     denomination = parseEther('0.1');
+    erc20Instance = setup.tornadoErc20['dai-100']!;
   } else {
     hasher = setup.tornadoHasher ?? (await deployMimcHasher(wallet, publicClient));
     denomination = opts.denomination ?? parseEther('0.1');
@@ -132,8 +150,33 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
       hasher,
       denomination,
     });
+    erc20Instance = await deployErc20Tornado(wallet, publicClient, {
+      verifier: setup.tornadoVerifier,
+      hasher,
+      denomination: erc20Denomination,
+      token: setup.demoErc20.address,
+    });
     instanceDeployBlock = await publicClient.getBlockNumber();
   }
+
+  const dealErc20 = async (to: Address, amount: bigint) => {
+    const { address: token, balanceSlot, whale } = setup.demoErc20;
+    if (balanceSlot !== undefined) {
+      const slot = keccak256(encodeAbiParameters([{ type: 'address' }, { type: 'uint256' }], [to, BigInt(balanceSlot)]));
+      await testClient.setStorageAt({ address: token, index: slot, value: pad(toHex(amount), { size: 32 }) });
+    } else if (whale) {
+      await testClient.impersonateAccount({ address: whale });
+      await setBalance(whale, parseEther('1'));
+      const whaleWallet = createWalletClient({ account: whale, chain, transport: http(rpcUrl) });
+      const hash = await whaleWallet.writeContract({ address: token, abi: erc20Abi, functionName: 'transfer', args: [to, amount] });
+      await publicClient.waitForTransactionReceipt({ hash });
+      await testClient.stopImpersonatingAccount({ address: whale });
+    } else {
+      throw new Error('no way to deal the demo ERC-20 on this chain');
+    }
+    const balance = await publicClient.readContract({ address: token, abi: erc20Abi, functionName: 'balanceOf', args: [to] });
+    if (balance < amount) throw new Error(`dealErc20 failed: balance ${balance} < ${amount}`);
+  };
   const paymaster = await deployPaymaster(wallet, publicClient, {
     entryPoint: setup.entryPoint,
     verifyingSigner: relayerSigner.address,
@@ -152,7 +195,7 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
     value: parseEther('2'),
   });
   await publicClient.waitForTransactionReceipt({ hash: depositHash });
-  log(`deployed tornado=${instance} paymaster=${paymaster} zap=${zap} hasher=${hasher}`);
+  log(`deployed tornado=${instance} tornado-${setup.demoErc20.symbol}=${erc20Instance} paymaster=${paymaster} zap=${zap} hasher=${hasher}`);
 
   // --- alto -----------------------------------------------------------------
   const altoPort = opts.altoPort ?? 4337 + Math.floor(Math.random() * 500);
@@ -174,6 +217,19 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
   log(`alto bundler on ${bundlerUrl}`);
 
   // --- relayer (in-process) ---------------------------------------------------
+  // Mainnet forks price tokens with the real 1inch oracle (as tornado-relayer does);
+  // Sepolia has no oracle, so the demo token gets a fixed 3000/ETH rate.
+  // The oracle aggregates dozens of DEX pools, so its first call on a fork pulls a lot of state
+  // through the upstream RPC: give it a long timeout (the result is cached afterwards).
+  const priceSource: PriceSource =
+    chain.id === 1
+      ? new OneInchPriceSource(createPublicClient({ chain, transport: http(rpcUrl, { timeout: 600_000 }) }))
+      : new FixedPriceSource({ [setup.demoErc20.address]: '3000' });
+  if (chain.id === 1) {
+    const t0 = Date.now();
+    const rate = await priceSource.tokenPerEth(setup.demoErc20.address, setup.demoErc20.decimals);
+    log(`1inch oracle: ${rate} ${setup.demoErc20.symbol}-units per ETH (${((Date.now() - t0) / 1000).toFixed(0)}s)`);
+  }
   const relayer = await RelayerService.create(
     {
       chainId: BigInt(chain.id),
@@ -182,7 +238,10 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
       entryPoint: setup.entryPoint,
       paymaster,
       signerKey: relayerKey,
-      instances: opts.canonicalInstances ? Object.values(setup.tornadoEth) : [instance],
+      instances: opts.canonicalInstances
+        ? [...Object.values(setup.tornadoEth), erc20Instance]
+        : [instance, erc20Instance],
+      priceSource,
       serviceFeeBps: opts.serviceFeeBps ?? 30n,
       signatureTtlSec: 300,
       simulateWithBundler: true,
@@ -209,11 +268,14 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
     instance,
     denomination,
     instanceDeployBlock,
+    erc20Instance,
+    erc20Denomination,
     paymaster,
     zap,
     relayer,
     setBalance,
     newFundedAccount,
+    dealErc20,
     mine,
     async stop() {
       await new Promise<void>((r) => server.close(() => r()));

@@ -10,3 +10,5 @@ contracts/broadcast/
 .DS_Store
 client/artifacts/
 kohaku-integration/vendor/
+contracts-tornado/out/
+contracts-tornado/cache/

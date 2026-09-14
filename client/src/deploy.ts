@@ -74,6 +74,22 @@ export async function deployEthTornado(
   ]);
 }
 
+/** Deploy a fresh ERC20Tornado (tornado-core) for `token`, bound to an existing Groth16 verifier. */
+export async function deployErc20Tornado(
+  wallet: Signer,
+  publicClient: PublicClient,
+  params: { verifier: Address; hasher: Address; denomination: bigint; token: Address; levels?: number },
+): Promise<Address> {
+  const artifact = forgeArtifact('contracts-tornado', 'ERC20Tornado.sol', 'ERC20Tornado');
+  return deploy(wallet, publicClient, artifact, [
+    params.verifier,
+    params.hasher,
+    params.denomination,
+    params.levels ?? 20,
+    params.token,
+  ]);
+}
+
 export async function deployPaymaster(
   wallet: Signer,
   publicClient: PublicClient,

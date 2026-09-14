@@ -28,14 +28,14 @@ interface IWETH is IERC20 {
 
 /// @title SwapAndSupplyZap
 /// @notice Stateless helper for the "tail calls" of a sponsored Tornado withdrawal:
-///         swap the withdrawn ETH on Uniswap V3 and supply the proceeds to Aave V3 on
+///         swap the withdrawn asset on Uniswap V3 and supply the proceeds to Aave V3 on
 ///         behalf of the user, all inside the same userOp as the withdraw.
 ///
-///         The ephemeral 4337 sender calls this with `value = denomination - fee`. Because
-///         the swap output is only known at execution time, doing swap -> approve -> supply
-///         in one contract call is what lets the user's tail calls stay amount-agnostic.
-///         aTokens are minted straight to `onBehalfOf`; the zap never holds funds between
-///         transactions.
+///         The ephemeral 4337 sender calls this with the withdrawn amount (ETH as
+///         `value`, tokens via an approval). Because the swap output is only known at
+///         execution time, doing swap -> approve -> supply in one contract call is what
+///         lets the user's tail calls stay amount-agnostic. aTokens are minted straight
+///         to `onBehalfOf`; the zap never holds funds between transactions.
 contract SwapAndSupplyZap {
     using SafeERC20 for IERC20;
 
@@ -44,9 +44,9 @@ contract SwapAndSupplyZap {
     IAavePool public immutable AAVE_POOL;
 
     event SwappedAndSupplied(
-        address indexed onBehalfOf, address indexed tokenOut, uint256 amountIn, uint256 amountOut
+        address indexed onBehalfOf, address indexed tokenIn, address indexed tokenOut, uint256 amountIn, uint256 amountOut
     );
-    event Supplied(address indexed onBehalfOf, uint256 amount);
+    event Supplied(address indexed onBehalfOf, address indexed token, uint256 amount);
 
     error ZeroValue();
 
@@ -81,18 +81,57 @@ contract SwapAndSupplyZap {
             })
         );
 
-        IERC20(tokenOut).forceApprove(address(AAVE_POOL), amountOut);
-        AAVE_POOL.supply(tokenOut, amountOut, onBehalfOf, 0);
+        _supply(tokenOut, amountOut, onBehalfOf);
+        emit SwappedAndSupplied(onBehalfOf, address(WETH), tokenOut, msg.value, amountOut);
+    }
 
-        emit SwappedAndSupplied(onBehalfOf, tokenOut, msg.value, amountOut);
+    /// @notice Pull `amountIn` of `tokenIn` (caller must have approved this contract), swap it into
+    ///         `tokenOut` and supply the proceeds to Aave for `onBehalfOf`.
+    function swapTokenAndSupply(
+        address tokenIn,
+        uint256 amountIn,
+        address tokenOut,
+        uint24 poolFee,
+        uint256 minOut,
+        address onBehalfOf
+    ) external returns (uint256 amountOut) {
+        if (amountIn == 0) revert ZeroValue();
+        IERC20(tokenIn).safeTransferFrom(msg.sender, address(this), amountIn);
+        IERC20(tokenIn).forceApprove(address(SWAP_ROUTER), amountIn);
+
+        amountOut = SWAP_ROUTER.exactInputSingle(
+            ISwapRouter02.ExactInputSingleParams({
+                tokenIn: tokenIn,
+                tokenOut: tokenOut,
+                fee: poolFee,
+                recipient: address(this),
+                amountIn: amountIn,
+                amountOutMinimum: minOut,
+                sqrtPriceLimitX96: 0
+            })
+        );
+
+        _supply(tokenOut, amountOut, onBehalfOf);
+        emit SwappedAndSupplied(onBehalfOf, tokenIn, tokenOut, amountIn, amountOut);
     }
 
     /// @notice Wrap all `msg.value` and supply WETH to Aave for `onBehalfOf` (no swap).
     function wrapEthAndSupply(address onBehalfOf) external payable {
         if (msg.value == 0) revert ZeroValue();
         WETH.deposit{value: msg.value}();
-        IERC20(address(WETH)).forceApprove(address(AAVE_POOL), msg.value);
-        AAVE_POOL.supply(address(WETH), msg.value, onBehalfOf, 0);
-        emit Supplied(onBehalfOf, msg.value);
+        _supply(address(WETH), msg.value, onBehalfOf);
+    }
+
+    /// @notice Pull `amount` of `token` (caller must have approved this contract) and supply it to Aave.
+    function supplyToken(address token, uint256 amount, address onBehalfOf) external {
+        if (amount == 0) revert ZeroValue();
+        IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
+        _supply(token, amount, onBehalfOf);
+    }
+
+    function _supply(address token, uint256 amount, address onBehalfOf) internal {
+        IERC20(token).forceApprove(address(AAVE_POOL), amount);
+        AAVE_POOL.supply(token, amount, onBehalfOf, 0);
+        emit Supplied(onBehalfOf, token, amount);
     }
 }

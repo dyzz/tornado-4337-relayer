@@ -48,14 +48,22 @@ send through Pimlico's bundler. Withdraw → swap → Aave supply happen in **on
 - `postOp` keeps `actualGasCost × (1 + gasMarginBps) + serviceFee`, refunds the remainder to
   `refundTo`, and re-deposits what it kept into the EntryPoint. If execution reverted, nothing was
   received and the paymaster eats the gas (the relayer's pre-signing simulation keeps this rare).
-- `paymasterAndData` layout: `paymaster(20) | verifGas(16) | postOpGas(16) | validUntil(6) | validAfter(6) | fee(32) | serviceFee(32) | refundTo(20) | sig(65)`.
+- **ERC-20 pools** (DAI, WBTC on mainnet; DAI on Sepolia): the instance pays the fee in its token.
+  The relayer prices gas with the same 1inch `OffchainOracle` the classic tornado-relayer uses and
+  signs `feeToken` + `tokenPerEth` into `paymasterData`; `postOp` converts the actual gas cost at that
+  signed rate, refunds the excess **in the token**, and keeps the rest in the contract for the
+  operator to `sweepERC20` and turn back into EntryPoint deposit. No on-chain oracle is needed
+  because the relayer is trusted anyway. `refund` (the ETH top-up classic relayers send) stays 0:
+  the 7702 sender spends the tokens inside the same userOp.
+- `paymasterAndData` layout: `paymaster(20) | verifGas(16) | postOpGas(16) | validUntil(6) | validAfter(6) | fee(32) | serviceFee(32) | refundTo(20) | feeToken(20) | tokenPerEth(32) | sig(65)`.
 
 **Relayer** (`relayer/src/service.ts`)
 
 1. `tornado_quote({ instance, tailCallsGas?, gas?, maxFeePerGas? })` → conservative gas ceilings,
    bundler gas price (`pimlico_getUserOperationGasPrice`), and the minimum `fee`
-   `= prefund × (1 + margin) + denomination × serviceFeeBps`. Over-quoting is free for the user
-   because the excess is refunded on-chain.
+   `= prefund × (1 + margin) [× tokenPerEth] + denomination × serviceFeeBps`, in the pool's asset.
+   Over-quoting is free for the user because the excess is refunded on-chain. Instances are
+   auto-detected as ETH or ERC-20 on boot (`token()`); `PRICE_SOURCE=oneinch|fixed|none`.
 2. `pm_getPaymasterData` decodes `execute`/`executeBatch`, finds the one withdraw whose `relayer` is
    the paymaster, checks `fee ≥ minimum` for the op's actual gas limits, rejects double sponsorship
    of a nullifier, `eth_call`s the withdraw (proof, root, nullifier), optionally runs
@@ -122,19 +130,24 @@ Point a Kohaku host at it by adding `relayer: { url }` to the chain's `paymaster
 (see `kohaku-integration/example/withdraw-with-relayer.ts`). Any viem/permissionless wallet can use
 the relayer as an ERC-7677 paymaster client: `createPaymasterClient({ transport: http(RELAYER_URL) })`.
 
-## Economics (from the e2e runs, 0.1 ETH note, ~1.1 gwei)
+## Economics (from the e2e runs, ~1.1 gwei)
 
-| | mainnet fork (swap + Aave) | Sepolia fork via Kohaku SDK (wrap + Aave) |
-| --- | --- | --- |
-| fee bound in the proof | 0.001604 ETH | 0.001428 ETH |
-| actual gas cost | 0.000900 ETH | — |
-| refund to user | 0.000260 ETH | 0.000217 ETH |
-| paymaster net (10 % margin + 0.3 % service fee) | +0.000386 ETH | — |
-| landed on the user | 247.09 aUSDC | 0.098572 aWETH |
+| | 0.1 ETH note, mainnet fork (swap + Aave) | 100 DAI note, mainnet fork (Aave) | 0.1 ETH note, Sepolia fork via Kohaku SDK |
+| --- | --- | --- | --- |
+| fee bound in the proof | 0.001604 ETH | 3.09 DAI (1inch: 2504 DAI/ETH) | 0.001428 ETH |
+| actual gas cost | 0.000907 ETH | 0.000755 ETH | — |
+| refund to user | 0.000253 ETH | 0.57 DAI | 0.000217 ETH |
+| paymaster keeps | +0.000385 ETH net | 2.52 DAI (≈ 0.0010 ETH) for 0.0008 ETH of gas | — |
+| landed on the user | 246.96 aUSDC | 96.91 aDAI | 0.098572 aWETH |
+
+Run `pnpm --filter @tornado-4337/client e2e` for both mainnet-fork cases (the 1inch oracle's first
+call on a fork takes ~1 minute of state fetching).
 
 ## Notes and limits
 
-- ETH instances only for now (fee in ETH). ERC-20 instances need a fee-token path in `postOp`.
+- ERC-20 fees accumulate in the paymaster; the operator has to sweep and convert them to keep the
+  EntryPoint deposit funded (a keeper, not `postOp`, should do the swap). Mainnet USDC/USDT pools are
+  frozen by their issuers, so DAI, cDAI and WBTC are the practical ERC-20 pools.
 - The relayer is stateless except for an in-memory nullifier lock (one live sponsorship per note).
 - Unlike the trustless PrivacyPaymaster shipped with Kohaku, the paymaster here trusts the
   relayer's off-chain checks. In exchange the account is unrestricted, validation needs no stake,

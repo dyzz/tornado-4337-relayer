@@ -239,7 +239,15 @@ describe('withdraw -> swap -> Aave supply, atomically over ERC-4337 with the thi
       paymasterVerificationGasLimit: '0xea60' as Hex,
       paymasterPostOpGasLimit: '0x15f90' as Hex,
     };
-    const terms = { validUntil: 1_900_000_000, validAfter: 12, fee: 123456789n, serviceFee: 999n, refundTo: h.deployer.address };
+    const terms = {
+      validUntil: 1_900_000_000,
+      validAfter: 12,
+      fee: 123456789n,
+      serviceFee: 999n,
+      refundTo: h.deployer.address,
+      feeToken: h.setup.demoErc20.address,
+      tokenPerEth: 3000n * 10n ** 18n,
+    };
     const local = paymasterHash({ op, chainId: BigInt(h.setup.chain.id), paymaster: h.paymaster, terms });
 
     const paymasterAndData = ('0x' +
@@ -247,6 +255,7 @@ describe('withdraw -> swap -> Aave supply, atomically over ERC-4337 with the thi
       (0xea60).toString(16).padStart(32, '0') +
       (0x15f90).toString(16).padStart(32, '0') +
       encodePaymasterData(terms, DUMMY_SIGNATURE).slice(2)) as Hex;
+    expect((paymasterAndData.length - 2) / 2).toBe(265);
     const packed = {
       sender: op.sender,
       nonce: 5n,
@@ -281,17 +290,25 @@ describe('withdraw -> swap -> Aave supply, atomically over ERC-4337 with the thi
                 { name: 'signature', type: 'bytes' },
               ],
             },
-            { name: 'validUntil', type: 'uint48' },
-            { name: 'validAfter', type: 'uint48' },
-            { name: 'fee', type: 'uint256' },
-            { name: 'serviceFee', type: 'uint256' },
-            { name: 'refundTo', type: 'address' },
+            {
+              name: 'terms',
+              type: 'tuple',
+              components: [
+                { name: 'validUntil', type: 'uint48' },
+                { name: 'validAfter', type: 'uint48' },
+                { name: 'fee', type: 'uint256' },
+                { name: 'serviceFee', type: 'uint256' },
+                { name: 'refundTo', type: 'address' },
+                { name: 'feeToken', type: 'address' },
+                { name: 'tokenPerEth', type: 'uint256' },
+              ],
+            },
           ],
           outputs: [{ type: 'bytes32' }],
         },
       ] as const,
       functionName: 'getHash',
-      args: [packed, terms.validUntil, terms.validAfter, terms.fee, terms.serviceFee, terms.refundTo],
+      args: [packed, terms],
     });
     expect(onchain).toBe(local);
   });

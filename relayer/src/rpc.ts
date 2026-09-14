@@ -37,7 +37,7 @@ export function createRelayerApp(service: RelayerService) {
   app.use('*', cors());
 
   app.get('/health', (c) => c.json({ ok: true }));
-  app.get('/status', (c) => c.json(service.status()));
+  app.get('/status', async (c) => c.json(await service.status()));
 
   app.post('/', async (c) => {
     let body: unknown;
@@ -76,7 +76,7 @@ async function handle(service: RelayerService, req: JsonRpcRequest) {
 async function dispatch(service: RelayerService, method: string, params: unknown[]): Promise<unknown> {
   switch (method) {
     case 'tornado_status':
-      return service.status();
+      return await service.status();
 
     case 'tornado_quote': {
       const p = (params[0] ?? {}) as Record<string, unknown>;
@@ -101,6 +101,7 @@ async function dispatch(service: RelayerService, method: string, params: unknown
       return {
         ...quote,
         denomination: toHex(quote.denomination),
+        tokenPerEth: toHex(quote.tokenPerEth),
         serviceFeeBps: toHex(quote.serviceFeeBps),
         serviceFee: toHex(quote.serviceFee),
         gasMarginBps: toHex(quote.gasMarginBps),

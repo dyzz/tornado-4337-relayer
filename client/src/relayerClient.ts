@@ -5,6 +5,12 @@ export interface RelayerQuote {
   entryPoint: Address;
   instance: Address;
   denomination: bigint;
+  /** zeroAddress for ETH instances; `fee`, `serviceFee`, `denomination` are in this token's units. */
+  feeToken: Address;
+  decimals: number;
+  symbol: string;
+  /** feeToken base units per 1e18 wei (0 for ETH). */
+  tokenPerEth: bigint;
   serviceFee: bigint;
   serviceFeeBps: bigint;
   gasMarginBps: bigint;
@@ -28,8 +34,10 @@ export interface RelayerStatus {
   paymaster: Address;
   rewardAccount: Address;
   signer: Address;
-  instances: { address: Address; denomination: Hex }[];
+  instances: { address: Address; denomination: Hex; token: Address; symbol: string; decimals: number }[];
+  ethPrices: Record<string, string>;
   serviceFeeBps: Hex;
+  tornadoServiceFee: number;
   gasMarginBps: Hex;
   signatureTtlSec: number;
   sponsor: { name: string };
@@ -79,6 +87,10 @@ export class RelayerRpc {
       entryPoint: raw.entryPoint as Address,
       instance: raw.instance as Address,
       denomination: hexToBigInt(raw.denomination as Hex),
+      feeToken: raw.feeToken as Address,
+      decimals: raw.decimals as number,
+      symbol: raw.symbol as string,
+      tokenPerEth: hexToBigInt(raw.tokenPerEth as Hex),
       serviceFee: hexToBigInt(raw.serviceFee as Hex),
       serviceFeeBps: hexToBigInt(raw.serviceFeeBps as Hex),
       gasMarginBps: hexToBigInt(raw.gasMarginBps as Hex),

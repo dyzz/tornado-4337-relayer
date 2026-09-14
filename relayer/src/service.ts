@@ -6,14 +6,24 @@ import {
   isAddress,
   isAddressEqual,
   toHex,
+  zeroAddress,
   type Address,
   type Hex,
   type PublicClient,
 } from 'viem';
 import { privateKeyToAccount, type PrivateKeyAccount } from 'viem/accounts';
 
-import { paymasterAbi, tornadoInstanceAbi } from './abi.js';
-import { BPS, DEFAULT_GAS, DEFAULT_TAIL_CALLS_GAS, minimumFee, serviceFeeFor, withTailCalls } from './fee.js';
+import { erc20MetadataAbi, paymasterAbi, tornadoInstanceAbi } from './abi.js';
+import {
+  BPS,
+  DEFAULT_GAS,
+  DEFAULT_TAIL_CALLS_GAS,
+  ERC20_WITHDRAW_EXTRA_GAS,
+  minimumFee,
+  serviceFeeFor,
+  withTailCalls,
+} from './fee.js';
+import { weiPerTokenFrom, type PriceSource } from './price.js';
 import {
   DUMMY_SIGNATURE,
   encodePaymasterData,
@@ -36,8 +46,10 @@ export interface RelayerConfig {
   paymaster: Address;
   /** Private key of the paymaster's `verifyingSigner`. */
   signerKey: Hex;
-  /** Tornado ETH instances this relayer sponsors. */
+  /** Tornado instances this relayer sponsors (ETH or ERC-20; detected on boot). */
   instances: Address[];
+  /** Token pricing for ERC-20 instances. Required when any instance is an ERC-20 pool. */
+  priceSource?: PriceSource;
   /** Service fee in basis points of the note denomination. */
   serviceFeeBps: bigint;
   /** How long a signature stays valid. Keep short: the fee is quoted at signing time. */
@@ -47,6 +59,15 @@ export interface RelayerConfig {
   /** Multiplier (bps) applied to the bundler's fast gas price when quoting. */
   gasPriceMarginBps: bigint;
   sponsorName: string;
+}
+
+export interface InstanceInfo {
+  address: Address;
+  denomination: bigint;
+  /** zeroAddress for ETH instances. */
+  token: Address;
+  decimals: number;
+  symbol: string;
 }
 
 export interface QuoteParams {
@@ -64,6 +85,12 @@ export interface Quote {
   entryPoint: Address;
   instance: Address;
   denomination: bigint;
+  /** zeroAddress for ETH instances. `fee`, `serviceFee` and `denomination` are in this token's units. */
+  feeToken: Address;
+  decimals: number;
+  symbol: string;
+  /** feeToken base units per 1e18 wei (0 for ETH). */
+  tokenPerEth: bigint;
   serviceFeeBps: bigint;
   serviceFee: bigint;
   gasMarginBps: bigint;
@@ -94,7 +121,16 @@ export interface PaymasterDataResult {
   paymaster: Address;
   paymasterData: Hex;
   sponsor: { name: string };
-  terms: { validUntil: number; validAfter: number; fee: Hex; serviceFee: Hex; refundTo: Address; minFee: Hex };
+  terms: {
+    validUntil: number;
+    validAfter: number;
+    fee: Hex;
+    serviceFee: Hex;
+    refundTo: Address;
+    feeToken: Address;
+    tokenPerEth: Hex;
+    minFee: Hex;
+  };
 }
 
 interface PaymasterParams {
@@ -132,7 +168,7 @@ export class RelayerService {
     readonly config: RelayerConfig,
     readonly client: PublicClient,
     readonly paymasterParams: PaymasterParams,
-    readonly denominations: Map<Address, bigint>,
+    readonly instances: Map<Address, InstanceInfo>,
     private readonly log: Logger,
   ) {
     this.signer = privateKeyToAccount(config.signerKey);
@@ -159,28 +195,41 @@ export class RelayerService {
       throw new Error(`paymaster.verifyingSigner is ${verifyingSigner} but our key is ${signer.address}`);
     }
 
-    const denominations = new Map<Address, bigint>();
-    for (const instance of config.instances) {
-      const denomination = await client.readContract({
-        address: instance,
-        abi: tornadoInstanceAbi,
-        functionName: 'denomination',
-      });
-      denominations.set(getAddress(instance), denomination);
+    const instances = new Map<Address, InstanceInfo>();
+    for (const raw of config.instances) {
+      const address = getAddress(raw);
+      const denomination = await client.readContract({ address, abi: tornadoInstanceAbi, functionName: 'denomination' });
+      // ERC20Tornado exposes token(); ETHTornado does not.
+      const token = await client
+        .readContract({ address, abi: tornadoInstanceAbi, functionName: 'token' })
+        .then((t) => getAddress(t))
+        .catch(() => zeroAddress);
+      let decimals = 18;
+      let symbol = 'ETH';
+      if (token !== zeroAddress) {
+        if (!config.priceSource) throw new Error(`instance ${address} is an ERC-20 pool but no priceSource is configured`);
+        [decimals, symbol] = await Promise.all([
+          client.readContract({ address: token, abi: erc20MetadataAbi, functionName: 'decimals' }),
+          client.readContract({ address: token, abi: erc20MetadataAbi, functionName: 'symbol' }).catch(() => 'TOKEN'),
+        ]);
+        // Fail fast if the token cannot be priced.
+        await config.priceSource.tokenPerEth(token, decimals);
+      }
+      instances.set(address, { address, denomination, token, decimals, symbol });
     }
 
     const service = new RelayerService(
-      { ...config, instances: config.instances.map((a) => getAddress(a)) },
+      { ...config, instances: [...instances.keys()] },
       client,
       { gasMarginBps, postOpGasOverhead, verifyingSigner },
-      denominations,
+      instances,
       log,
     );
     log.info('relayer ready', {
       chainId: chainId.toString(),
       paymaster: config.paymaster,
       signer: signer.address,
-      instances: [...denominations.entries()].map(([a, d]) => `${a}:${d}`),
+      instances: [...instances.values()].map((i) => `${i.address}:${i.denomination}${i.symbol}`),
       gasMarginBps: gasMarginBps.toString(),
       serviceFeeBps: config.serviceFeeBps.toString(),
     });
@@ -189,20 +238,37 @@ export class RelayerService {
 
   // ------------------------------------------------------------------ status
 
-  status() {
+  async status() {
+    const ethPrices: Record<string, string> = {};
+    for (const i of this.instances.values()) {
+      if (i.token === zeroAddress) continue;
+      try {
+        const rate = await this.config.priceSource!.tokenPerEth(i.token, i.decimals);
+        ethPrices[i.symbol.toLowerCase()] = weiPerTokenFrom(rate, i.decimals).toString();
+      } catch (err) {
+        this.log.warn('price unavailable', { token: i.token, err: String(err) });
+      }
+    }
     return {
-      version: '0.1.0',
+      version: '0.2.0',
       chainId: toHex(this.config.chainId),
       entryPoint: this.config.entryPoint,
       paymaster: this.config.paymaster,
       /** Tornado convention: the address that must appear as `relayer` in the proof. */
       rewardAccount: this.config.paymaster,
       signer: this.signer.address,
-      instances: [...this.denominations.entries()].map(([address, denomination]) => ({
-        address,
-        denomination: toHex(denomination),
+      instances: [...this.instances.values()].map((i) => ({
+        address: i.address,
+        denomination: toHex(i.denomination),
+        token: i.token,
+        symbol: i.symbol,
+        decimals: i.decimals,
       })),
+      /** Tornado convention: wei per whole token, keyed by lowercase symbol. */
+      ethPrices,
       serviceFeeBps: toHex(this.config.serviceFeeBps),
+      /** Tornado convention: percentage. */
+      tornadoServiceFee: Number(this.config.serviceFeeBps) / 100,
       gasMarginBps: toHex(this.paymasterParams.gasMarginBps),
       signatureTtlSec: this.config.signatureTtlSec,
       sponsor: { name: this.config.sponsorName },
@@ -238,31 +304,59 @@ export class RelayerService {
     };
   }
 
+  // ------------------------------------------------------------------ pricing
+
+  private instance(address: Address): InstanceInfo {
+    const info = this.instances.get(getAddress(address));
+    if (!info) throw new ValidationError(`instance ${address} is not served by this relayer`);
+    return info;
+  }
+
+  /** 0 for ETH instances, else the current feeToken-per-ETH rate. */
+  private async rateFor(info: InstanceInfo): Promise<bigint> {
+    if (info.token === zeroAddress) return 0n;
+    try {
+      return await this.config.priceSource!.tokenPerEth(info.token, info.decimals);
+    } catch (err) {
+      throw new ValidationError(`cannot price ${info.symbol}: ${shortError(err)}`, -32008);
+    }
+  }
+
   // ------------------------------------------------------------------ quote
 
   async quote(params: QuoteParams): Promise<Quote> {
-    const instance = getAddress(params.instance);
-    const denomination = this.denominations.get(instance);
-    if (denomination === undefined) throw new ValidationError(`instance ${instance} is not served by this relayer`);
+    const info = this.instance(params.instance);
+    const isToken = info.token !== zeroAddress;
 
     const gas: UserOpGas = {
-      ...withTailCalls(DEFAULT_GAS, params.tailCallsGas ?? DEFAULT_TAIL_CALLS_GAS),
+      ...withTailCalls(DEFAULT_GAS, (params.tailCallsGas ?? DEFAULT_TAIL_CALLS_GAS) + (isToken ? ERC20_WITHDRAW_EXTRA_GAS : 0n)),
       ...stripUndefined(params.gas ?? {}),
     };
     const fees = await this.gasFees();
     const maxFeePerGas = params.maxFeePerGas ?? fees.maxFeePerGas;
-    const serviceFee = serviceFeeFor(denomination, this.config.serviceFeeBps);
-    const fee = minimumFee({ gas, maxFeePerGas, gasMarginBps: this.paymasterParams.gasMarginBps, serviceFee });
-    if (fee >= denomination) {
+    const tokenPerEth = await this.rateFor(info);
+    const serviceFee = serviceFeeFor(info.denomination, this.config.serviceFeeBps);
+    const fee = minimumFee({
+      gas,
+      maxFeePerGas,
+      gasMarginBps: this.paymasterParams.gasMarginBps,
+      serviceFee,
+      tokenPerEth,
+    });
+    if (fee >= info.denomination) {
       throw new ValidationError(
-        `quoted fee ${fee} wei is not below the ${denomination} wei denomination at ${maxFeePerGas} wei/gas`,
+        `quoted fee ${fee} is not below the ${info.denomination} ${info.symbol} denomination at ${maxFeePerGas} wei/gas`,
       );
     }
     return {
       relayer: this.config.paymaster,
       entryPoint: this.config.entryPoint,
-      instance,
-      denomination,
+      instance: info.address,
+      denomination: info.denomination,
+      feeToken: info.token,
+      decimals: info.decimals,
+      symbol: info.symbol,
+      tokenPerEth,
       serviceFeeBps: this.config.serviceFeeBps,
       serviceFee,
       gasMarginBps: this.paymasterParams.gasMarginBps,
@@ -279,10 +373,12 @@ export class RelayerService {
   /** pm_getPaymasterStubData: shape-correct paymaster fields for gas estimation. */
   stubData(op: RpcUserOperation, context: SponsorContext = {}): StubDataResult {
     let fee = 0n;
+    let feeToken: Address = zeroAddress;
     let refundTo: Address = context.refundTo ?? op.sender;
     try {
       const w = findSponsoringWithdraw(decodeAccountCalls(op.callData), this.config.paymaster, this.config.instances);
       fee = w.fee;
+      feeToken = this.instance(w.instance).token;
       refundTo = context.refundTo ?? w.recipient;
     } catch {
       // Estimation may run before the withdraw call is final; a zero fee still exercises postOp.
@@ -294,6 +390,8 @@ export class RelayerService {
       fee,
       serviceFee: 0n,
       refundTo,
+      feeToken,
+      tokenPerEth: 0n,
     };
     return {
       paymaster: this.config.paymaster,
@@ -317,19 +415,26 @@ export class RelayerService {
     // 1. The callData must perform exactly one withdraw that pays this paymaster.
     const calls = decodeAccountCalls(op.callData);
     const w = findSponsoringWithdraw(calls, this.config.paymaster, this.config.instances);
-    const denomination = this.denominations.get(w.instance)!;
-    if (w.fee > denomination) throw new ValidationError('fee exceeds denomination');
+    const info = this.instance(w.instance);
+    if (w.fee > info.denomination) throw new ValidationError('fee exceeds denomination');
 
     // 2. The fee must cover the worst case the paymaster can be charged for this exact op.
     const gas = readGas(op);
     const maxFeePerGas = q(op.maxFeePerGas, 'maxFeePerGas');
     const maxPriorityFeePerGas = q(op.maxPriorityFeePerGas, 'maxPriorityFeePerGas');
     if (maxPriorityFeePerGas > maxFeePerGas) throw new ValidationError('maxPriorityFeePerGas exceeds maxFeePerGas');
-    const serviceFee = serviceFeeFor(denomination, this.config.serviceFeeBps);
-    const minFee = minimumFee({ gas, maxFeePerGas, gasMarginBps: this.paymasterParams.gasMarginBps, serviceFee });
+    const tokenPerEth = await this.rateFor(info);
+    const serviceFee = serviceFeeFor(info.denomination, this.config.serviceFeeBps);
+    const minFee = minimumFee({
+      gas,
+      maxFeePerGas,
+      gasMarginBps: this.paymasterParams.gasMarginBps,
+      serviceFee,
+      tokenPerEth,
+    });
     if (w.fee < minFee) {
       throw new ValidationError(
-        `fee ${w.fee} is below the minimum ${minFee} for these gas limits at ${maxFeePerGas} wei/gas`,
+        `fee ${w.fee} is below the minimum ${minFee} ${info.symbol} for these gas limits at ${maxFeePerGas} wei/gas`,
         -32002,
       );
     }
@@ -356,6 +461,8 @@ export class RelayerService {
       fee: w.fee,
       serviceFee,
       refundTo: context.refundTo ?? w.recipient,
+      feeToken: info.token,
+      tokenPerEth,
     };
     const hash = paymasterHash({ op, chainId: this.config.chainId, paymaster: this.config.paymaster, terms });
     const signature = await this.signer.signMessage({ message: { raw: hash } });
@@ -363,10 +470,12 @@ export class RelayerService {
     this.sponsored.set(w.nullifierHash, { validUntil: terms.validUntil, sender: op.sender, nonce });
     this.log.info('sponsored', {
       instance: w.instance,
+      symbol: info.symbol,
       nullifierHash: w.nullifierHash,
       sender: op.sender,
       fee: w.fee.toString(),
       minFee: minFee.toString(),
+      tokenPerEth: tokenPerEth.toString(),
       refundTo: terms.refundTo,
       validUntil: terms.validUntil,
     });
@@ -381,6 +490,8 @@ export class RelayerService {
         fee: toHex(terms.fee),
         serviceFee: toHex(terms.serviceFee),
         refundTo: terms.refundTo,
+        feeToken: terms.feeToken,
+        tokenPerEth: toHex(terms.tokenPerEth),
         minFee: toHex(minFee),
       },
     };

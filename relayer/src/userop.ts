@@ -7,6 +7,7 @@ import {
   keccak256,
   pad,
   toHex,
+  zeroAddress,
   type Address,
   type Hex,
 } from 'viem';
@@ -52,17 +53,24 @@ export interface UserOpGas {
   paymasterPostOpGasLimit: bigint;
 }
 
+/** The fee terms the relayer signs (mirrors TornadoRelayerPaymaster.Terms). */
 export interface FeeTerms {
   validUntil: number;
   validAfter: number;
+  /** In `feeToken` units (wei for ETH instances). */
   fee: bigint;
   serviceFee: bigint;
   refundTo: Address;
+  /** address(0) for ETH instances. */
+  feeToken: Address;
+  /** feeToken base units per 1e18 wei; 0 for ETH. */
+  tokenPerEth: bigint;
 }
 
 export const PAYMASTER_DATA_OFFSET = 52;
-export const PAYMASTER_AND_DATA_LENGTH = 213;
+export const PAYMASTER_AND_DATA_LENGTH = 265;
 export const SIGNATURE_LENGTH = 65;
+export const RATE_SCALE = 10n ** 18n;
 
 /** A syntactically valid but unauthorised signature (r = s = 1, v = 27) for stubs. */
 export const DUMMY_SIGNATURE: Hex = concatHex([
@@ -109,14 +117,23 @@ export function totalGas(gas: UserOpGas): bigint {
 }
 
 /**
- * The 161-byte suffix of paymasterAndData understood by TornadoRelayerPaymaster:
- * validUntil(6) | validAfter(6) | fee(32) | serviceFee(32) | refundTo(20) | signature(65).
+ * The 213-byte suffix of paymasterAndData understood by TornadoRelayerPaymaster:
+ * validUntil(6) | validAfter(6) | fee(32) | serviceFee(32) | refundTo(20) | feeToken(20) | tokenPerEth(32) | signature(65).
  */
 export function encodePaymasterData(terms: FeeTerms, signature: Hex): Hex {
   if ((signature.length - 2) / 2 !== SIGNATURE_LENGTH) throw new Error('signature must be 65 bytes');
   return encodePacked(
-    ['uint48', 'uint48', 'uint256', 'uint256', 'address', 'bytes'],
-    [terms.validUntil, terms.validAfter, terms.fee, terms.serviceFee, terms.refundTo, signature],
+    ['uint48', 'uint48', 'uint256', 'uint256', 'address', 'address', 'uint256', 'bytes'],
+    [
+      terms.validUntil,
+      terms.validAfter,
+      terms.fee,
+      terms.serviceFee,
+      terms.refundTo,
+      terms.feeToken ?? zeroAddress,
+      terms.tokenPerEth ?? 0n,
+      signature,
+    ],
   );
 }
 
@@ -172,8 +189,21 @@ export function paymasterHash(params: {
         { type: 'uint256' },
         { type: 'uint256' },
         { type: 'address' },
+        { type: 'address' },
+        { type: 'uint256' },
       ],
-      [fieldsHash, chainId, paymaster, terms.validUntil, terms.validAfter, terms.fee, terms.serviceFee, terms.refundTo],
+      [
+        fieldsHash,
+        chainId,
+        paymaster,
+        terms.validUntil,
+        terms.validAfter,
+        terms.fee,
+        terms.serviceFee,
+        terms.refundTo,
+        terms.feeToken ?? zeroAddress,
+        terms.tokenPerEth ?? 0n,
+      ],
     ),
   );
 }
