@@ -45,7 +45,7 @@ await broadcaster.broadcast(op);
 - `scripts/export-patch.sh` — regenerate the patch after editing `vendor/kohaku`.
 - `e2e/kohaku-sdk.test.ts` — Sepolia fork: shield with the SDK, unshield in paymaster mode with a
   wrap-and-supply-to-Aave tail call, sponsored by this repo's relayer + paymaster, bundled by alto;
-  plus the same for the DAI-100 pool with the fee paid and refunded in DAI.
+  plus the DAI-100 pool: fee paid and refunded in DAI, tail = Uniswap DAI→LINK + Aave supply.
 - `example/withdraw-with-relayer.ts` — a minimal live host (Pimlico public bundler).
 
 ```bash

@@ -110,21 +110,43 @@ half of the Tornado `Deposit` logs (the default fork RPC is tenderly's gateway, 
 the SDK through a gap-checked `externalSyncProvider`), and the well-known anvil keys are EIP-7702-delegated
 on Sepolia, which breaks the bundler's beneficiary accounting (the harness uses fresh keys).
 
-## Deploy for real
+## Run it for real on Sepolia
+
+You need three keys and about 0.4 Sepolia ETH in total (deploy ≈ 0.01, EntryPoint deposit 0.05–0.1,
+one 0.1 ETH note plus gas). `pnpm --filter @tornado-4337/client sepolia keygen` prints fresh keys.
+Faucets: Google Cloud Web3 faucet, Alchemy / Infura / QuickNode faucets (need an account and usually a
+small mainnet balance), the Chainlink faucet (also gives LINK), or the pk910 PoW faucet. Sepolia DAI for
+the DAI-100 pool comes from Aave's faucet at app.aave.com (it mints the same mock DAI the pool uses).
 
 ```bash
-cd contracts
-PRIVATE_KEY=0x… RELAYER_SIGNER=0x… DEPOSIT_WEI=500000000000000000 \
-DEPLOY_ZAP=true WETH=0xC02a… SWAP_ROUTER=0x68b3… AAVE_POOL=0x8787… \
-forge script script/Deploy.s.sol --rpc-url $RPC_URL --broadcast
-```
+# 1. contracts (owner key). Zap on Sepolia: WETH = Aave's mock WETH 0xC558…, router 0x3bFA…, pool 0x6Ae4…
+cd contracts && PRIVATE_KEY=0x<owner> RELAYER_SIGNER=0x<relayer address> DEPOSIT_WEI=50000000000000000 \
+  DEPLOY_ZAP=true WETH=0xC558DBdd856501FCd9aaF1E62eae57A9F0629a3c \
+  SWAP_ROUTER=0x3bFA4769FB09eefC5a80d6E87c3B9C650f7Ae48E AAVE_POOL=0x6Ae43d3271ff6888e7Fc43Fd7321a503ff738951 \
+  forge script script/Deploy.s.sol --rpc-url https://sepolia.gateway.tenderly.co --broadcast
 
-Then run the relayer (`relayer/.env.example`):
-
-```bash
-cd relayer && cp .env.example .env   # PAYMASTER_ADDRESS, RELAYER_PRIVATE_KEY, RPC_URL, BUNDLER_URL …
+# 2. relayer (relayer key). Sepolia has no 1inch oracle: fixed DAI price.
+cd relayer && cat > .env <<EOF
+CHAIN_ID=11155111
+RPC_URL=https://sepolia.gateway.tenderly.co
+BUNDLER_URL=https://public.pimlico.io/v2/11155111/rpc
+PAYMASTER_ADDRESS=0x<paymaster>
+RELAYER_PRIVATE_KEY=0x<relayer>
+TORNADO_INSTANCES=0x8C4A04d872a6C1BE37964A21ba3a138525dFF50b,0x8cc930096B4Df705A007c4A039BDFA1320Ed2508,0x6921fd1a97441dd603a997ED6DDF388658daf754
+PRICE_SOURCE=fixed
+FIXED_TOKENS_PER_ETH=0xFF34B3d4Aee8ddCd6F9AFFFB6Fe49bD371b8a357:3000
+EOF
 pnpm start
+
+# 3. user (user key): shield first — a withdrawal needs a note in the pool — then unshield.
+cd client
+PRIVATE_KEY=0x<user> pnpm sepolia deposit                       # prints the note, waits ~1 block
+PRIVATE_KEY=0x<user> ZAP=0x<zap> pnpm sepolia withdraw tornado-eth-0.1-11155111-0x…   # via relayer + Pimlico -> Aave WETH
 ```
+
+The first `withdraw` syncs the pool's deposit leaves from block 5.59M (a few minutes; cached under
+`client/artifacts/`). Pimlico's public endpoint is rate-limited but fine for a handful of ops. The same
+CLI runs on mainnet with `CHAIN=mainnet` (`PRICE_SOURCE=oneinch` for the relayer).
 
 Point a Kohaku host at it by adding `relayer: { url }` to the chain's `paymasterConfig`
 (see `kohaku-integration/example/withdraw-with-relayer.ts`). Any viem/permissionless wallet can use
@@ -132,13 +154,16 @@ the relayer as an ERC-7677 paymaster client: `createPaymasterClient({ transport:
 
 ## Economics (from the e2e runs, ~1.1 gwei)
 
-| | 0.1 ETH note, mainnet fork (swap + Aave) | 100 DAI note, mainnet fork (Aave) | 0.1 ETH note, Sepolia fork via Kohaku SDK |
-| --- | --- | --- | --- |
-| fee bound in the proof | 0.001604 ETH | 3.09 DAI (1inch: 2504 DAI/ETH) | 0.001428 ETH |
-| actual gas cost | 0.000907 ETH | 0.000755 ETH | — |
-| refund to user | 0.000253 ETH | 0.57 DAI | 0.000217 ETH |
-| paymaster keeps | +0.000385 ETH net | 2.52 DAI (≈ 0.0010 ETH) for 0.0008 ETH of gas | — |
-| landed on the user | 246.96 aUSDC | 96.91 aDAI | 0.098572 aWETH |
+| | 0.1 ETH note, mainnet fork (swap + Aave) | 100 DAI note, mainnet fork (Aave) | 0.1 ETH note, Sepolia fork via Kohaku SDK | 100 DAI note, Sepolia fork via Kohaku SDK (Uniswap → Aave LINK) |
+| --- | --- | --- | --- | --- |
+| fee bound in the proof | 0.001604 ETH | 3.09 DAI (1inch: 2504 DAI/ETH) | 0.001445 ETH | 4.56 DAI (fixed 3000 DAI/ETH) |
+| actual gas cost | 0.000907 ETH | 0.000755 ETH | — | — |
+| refund to user | 0.000253 ETH | 0.57 DAI | 0.000228 ETH | 0.74 DAI |
+| paymaster keeps | +0.000385 ETH net | 2.52 DAI (≈ 0.0010 ETH) for 0.0008 ETH of gas | — | — |
+| landed on the user | 246.96 aUSDC | 96.91 aDAI | 0.098555 aWETH | 49.64 aLINK |
+
+Aave Sepolia's DAI / USDC / USDT reserves are above their supply caps, so the Sepolia DAI demo swaps into
+LINK (no cap, DAI/LINK 0.3 % pool with ~30k DAI of depth) before supplying.
 
 Run `pnpm --filter @tornado-4337/client e2e` for both mainnet-fork cases (the 1inch oracle's first
 call on a fork takes ~1 minute of state fetching).

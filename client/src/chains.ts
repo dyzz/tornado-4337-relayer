@@ -21,8 +21,10 @@ export interface ChainSetup {
   aaveWeth?: Address;
   uniswapSwapRouter02: Address;
   aavePool: Address;
-  /** Token the demo swaps into and supplies to Aave, with the Uniswap V3 fee tier of its WETH pool. */
+  /** Token the ETH demo swaps into and supplies to Aave, with the Uniswap V3 fee tier of its WETH pool. */
   demoTokenOut: { address: Address; symbol: string; uniswapFee: number };
+  /** Aave reserve the ERC-20 demo swaps `demoErc20` into (fee tier of the demoErc20/target pool). */
+  demoSwapTarget?: { address: Address; symbol: string; uniswapFee: number };
   publicRpc: string;
   pimlicoPublicBundler: string;
 }
@@ -91,6 +93,8 @@ export const CHAINS: Record<'mainnet' | 'sepolia', ChainSetup> = {
     aavePool: '0x6Ae43d3271ff6888e7Fc43Fd7321a503ff738951',
     // Aave's Sepolia DAI is also the token behind the DAI/WETH 0.05% pool Kohaku's tests use.
     demoTokenOut: { address: '0xFF34B3d4Aee8ddCd6F9AFFFB6Fe49bD371b8a357', symbol: 'DAI', uniswapFee: 500 },
+    // Aave's Sepolia LINK has no supply cap and a DAI/LINK 0.3% Uniswap pool with ~30k DAI of depth.
+    demoSwapTarget: { address: '0xf8Fb3713D459D7C1018BD0A49D19b4C44290EBE5', symbol: 'LINK', uniswapFee: 3000 },
     // publicnode's Sepolia log index is incomplete (drops ~half the Tornado Deposit logs); tenderly and
     // rpc.sepolia.ethpandaops.io return complete eth_getLogs results.
     publicRpc: 'https://sepolia.gateway.tenderly.co',

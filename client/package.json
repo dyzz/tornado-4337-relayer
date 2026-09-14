@@ -12,7 +12,8 @@
     "e2e": "vitest run --project e2e",
     "test": "vitest run --project unit",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "prove": "tsx src/cli/prove.ts"
+    "prove": "tsx src/cli/prove.ts",
+    "sepolia": "tsx src/cli/sepolia.ts"
   },
   "dependencies": {
     "@kohaku-eth/mimc-tree": "0.0.3",

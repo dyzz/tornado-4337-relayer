@@ -241,7 +241,7 @@ describe('Kohaku SDK -> thin relayer paymaster (Sepolia fork)', () => {
     }
   });
 
-  it('ERC-20 pool: shields 100 DAI with the SDK, unshields via the relayer paymaster with the fee and refund in DAI', async () => {
+  it('ERC-20 pool: shields 100 DAI with the SDK, unshields via the relayer paymaster (fee in DAI) -> Uniswap -> Aave LINK', async () => {
     const { publicClient, setup } = h;
     const dai = setup.demoErc20;
     const daiAsset = { __type: 'erc20' as const, contract: getAddress(dai.address) };
@@ -261,19 +261,34 @@ describe('Kohaku SDK -> thin relayer paymaster (Sepolia fork)', () => {
     expect((await protocol.balance([daiAsset]))[0]!.amount).toBe(before + AMOUNT);
     log(`shielded ${AMOUNT} DAI-units`);
 
-    // --- unshield with a tail call, gas paid in DAI ---------------------------------
-    // Aave Sepolia's DAI reserve sits above its supply cap (2e9 DAI), so the tail here is a plain
-    // transfer of the whole withdrawn amount to the final recipient; DAI -> aDAI is covered by the
-    // mainnet-fork e2e in client/.
+    // --- unshield: swap DAI -> LINK on Uniswap, supply LINK to Aave; gas paid in DAI ---------
+    // Aave Sepolia's DAI reserve sits above its supply cap (2e9 DAI), but LINK has no cap and
+    // Uniswap V3 Sepolia has a DAI/LINK 0.3% pool with ~30k DAI of depth.
     const finalRecipient = privateKeyToAccount(generatePrivateKey()).address;
+    const LINK = setup.demoSwapTarget!;
+    const reserve = await publicClient.readContract({
+      address: setup.aavePool,
+      abi: aavePoolAbi,
+      functionName: 'getReserveData',
+      args: [LINK.address],
+    });
     const op = await protocol.prepareUnshield({ asset: daiAsset, amount: AMOUNT }, finalRecipient, {
       mode: 'paymaster',
-      tailCallsGasEstimate: 120_000n,
+      tailCallsGasEstimate: 450_000n,
       tailCalls: async (_sender, ctx) => [
         {
           to: ctx!.asset!,
           value: 0n,
-          data: encodeFunctionData({ abi: erc20Abi, functionName: 'transfer', args: [finalRecipient, ctx!.amount!] }),
+          data: encodeFunctionData({ abi: erc20Abi, functionName: 'approve', args: [h.zap, ctx!.amount!] }),
+        },
+        {
+          to: h.zap,
+          value: 0n,
+          data: encodeFunctionData({
+            abi: zapAbi,
+            functionName: 'swapTokenAndSupply',
+            args: [ctx!.asset!, ctx!.amount!, LINK.address, LINK.uniswapFee, 0n, finalRecipient],
+          }),
         },
       ],
     });
@@ -288,12 +303,13 @@ describe('Kohaku SDK -> thin relayer paymaster (Sepolia fork)', () => {
 
     // --- assertions --------------------------------------------------------------
     expect((await protocol.balance([daiAsset]))[0]!.amount).toBe(before);
-    // Final recipient: the withdrawn amount (tail transfer) plus the postOp refund, both in DAI.
-    const received = await publicClient.readContract({ address: dai.address, abi: erc20Abi, functionName: 'balanceOf', args: [finalRecipient] });
-    const refund = received - (AMOUNT - fee);
-    log(`final recipient holds ${received} DAI-units = ${AMOUNT - fee} withdrawn + ${refund} refund`);
+    const aLink = await publicClient.readContract({ address: reserve.aTokenAddress, abi: erc20Abi, functionName: 'balanceOf', args: [finalRecipient] });
+    const refund = await publicClient.readContract({ address: dai.address, abi: erc20Abi, functionName: 'balanceOf', args: [finalRecipient] });
+    log(`final recipient: ${aLink} aLINK-units from ${AMOUNT - fee} DAI, plus ${refund} DAI-units refunded`);
+    expect(aLink).toBeGreaterThan(0n);
     expect(refund).toBeGreaterThan(0n);
     expect(await publicClient.readContract({ address: dai.address, abi: erc20Abi, functionName: 'balanceOf', args: [w.userOperation.sender] })).toBe(0n);
+    expect(await publicClient.readContract({ address: dai.address, abi: erc20Abi, functionName: 'balanceOf', args: [h.zap] })).toBe(0n);
     expect(await publicClient.readContract({ address: dai.address, abi: erc20Abi, functionName: 'balanceOf', args: [h.paymaster] })).toBe(fee - refund);
   });
 });
