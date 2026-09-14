@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Block accidental personal identifiers and wrong commit identity (the hook itself is exempt).
+set -e
+pat="^\+.*(/Users/[a-z]+/|jason""zong|dy""zz)"
+if git diff --cached -U0 -- . ':!.githooks/' | grep -iE "$pat" >/dev/null; then
+  echo "pre-commit: personal path/identifier in staged changes" >&2; exit 1
+fi
+if [ "$(git config user.email)" != "327767242+TornadoRefresh@users.noreply.github.com" ]; then
+  echo "pre-commit: commit identity must be TornadoRefresh" >&2; exit 1
+fi
