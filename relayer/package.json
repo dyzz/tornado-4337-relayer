@@ -1,0 +1,28 @@
+{
+  "name": "@tornado-4337/relayer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": { ".": "./src/index.ts" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "tsx src/server.ts",
+    "dev": "tsx watch src/server.ts",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "hono": "^4.9.0",
+    "@hono/node-server": "^1.19.0",
+    "viem": "^2.51.3",
+    "zod": "^4.1.0"
+  },
+  "devDependencies": {
+    "vitest": "^3.2.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.2",
+    "@types/node": "^24.0.0"
+  }
+}

@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+contracts/out/
+contracts/cache/
+contracts/broadcast/
+*.log
+.DS_Store
+client/artifacts/
+kohaku-integration/vendor/

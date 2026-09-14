@@ -1,0 +1,19 @@
+{
+  "name": "tornado-4337-relayer",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Thin Tornado Cash relayer on ERC-4337: verifying paymaster + signing relayer + Kohaku integration",
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "build": "pnpm -r build",
+    "test": "pnpm -r test",
+    "relayer": "pnpm --filter @tornado-4337/relayer start",
+    "e2e": "pnpm --filter @tornado-4337/client e2e"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.2",
+    "tsx": "^4.21.0",
+    "@types/node": "^24.0.0"
+  }
+}

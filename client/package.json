@@ -1,0 +1,36 @@
+{
+  "name": "@tornado-4337/client",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./e2e/harness": "./e2e/harness.ts"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "e2e": "vitest run --project e2e",
+    "test": "vitest run --project unit",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "prove": "tsx src/cli/prove.ts"
+  },
+  "dependencies": {
+    "@kohaku-eth/mimc-tree": "0.0.3",
+    "@noble/curves": "2.2.0",
+    "@noble/hashes": "2.2.0",
+    "@tornado-4337/relayer": "workspace:*",
+    "circomlibjs": "0.1.7",
+    "micro-zk-proofs": "0.3.1",
+    "viem": "^2.51.3"
+  },
+  "devDependencies": {
+    "@hono/node-server": "^1.19.17",
+    "@pimlico/alto": "^0.0.20",
+    "@types/node": "^24.0.0",
+    "hono": "^4.13.7",
+    "prool": "^0.2.4",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.0"
+  }
+}

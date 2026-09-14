@@ -1,0 +1,12 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "rootDir": "..",
+    "noEmit": true,
+    // The Kohaku SDK's dist .d.ts files use extensionless relative re-exports; NodeNext drops them.
+    "module": "ESNext",
+    "moduleResolution": "Bundler"
+  },
+  "include": ["e2e", "example", "../client/src/circomlibjs.d.ts"]
+}

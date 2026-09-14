@@ -1,0 +1,28 @@
+{
+  "name": "@tornado-4337/kohaku-integration",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Kohaku SDK (@kohaku-eth/tornado-cash) integration for the thin relayer: patch, example host and e2e",
+  "scripts": {
+    "setup": "bash scripts/setup.sh",
+    "patch:export": "bash scripts/export-patch.sh",
+    "e2e": "vitest run",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "example": "tsx example/withdraw-with-relayer.ts"
+  },
+  "dependencies": {
+    "@kohaku-eth/plugins": "link:vendor/kohaku/packages/plugins",
+    "@kohaku-eth/provider": "link:vendor/kohaku/packages/provider",
+    "@kohaku-eth/tornado-cash": "link:vendor/kohaku/packages/tornado-cash",
+    "@tornado-4337/client": "workspace:*",
+    "@tornado-4337/relayer": "workspace:*",
+    "viem": "^2.51.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.0"
+  }
+}
