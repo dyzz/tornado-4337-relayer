@@ -1,0 +1,194 @@
+diff --git a/src/utils/plugins.ts b/src/utils/plugins.ts
+index b6d63d7..e200e63 100644
+--- a/src/utils/plugins.ts
++++ b/src/utils/plugins.ts
+@@ -361,12 +361,50 @@ export function configureRailgunForUnshield(
+   rg.setSmartAccount(smartAccount, signer);
+ }
+ 
++/**
++ * Relayer-signed Tornado paymaster (thin relayer over ERC-4337) selected via env:
++ *   KOHAKU_TORNADO_RELAYER_URL  ERC-7677 + tornado_quote endpoint of the relayer
++ *   KOHAKU_TORNADO_PAYMASTER    its TornadoRelayerPaymaster address
++ *   KOHAKU_BUNDLER_URL          optional bundler override (default: Pimlico public)
++ * When set, the SDK routes `mode: 'paymaster'` unshields through the relayer
++ * instead of the trustless PrivacyPaymaster.
++ */
++export function tornadoRelayerPaymasterOverride(): {
++  relayerUrl: string;
++  paymasterAddress: `0x${string}`;
++  bundlerUrl?: string;
++} | undefined {
++  const relayerUrl = process.env.KOHAKU_TORNADO_RELAYER_URL?.trim();
++  const paymasterAddress = process.env.KOHAKU_TORNADO_PAYMASTER?.trim();
++  if (!relayerUrl || !paymasterAddress) return undefined;
++  const bundlerUrl = process.env.KOHAKU_BUNDLER_URL?.trim();
++  return {
++    relayerUrl,
++    paymasterAddress: paymasterAddress as `0x${string}`,
++    ...(bundlerUrl ? { bundlerUrl } : {}),
++  };
++}
++
+ /** ERC-4337 paymaster settings for Tornado unshield (same Pimlico bundler as Railgun). */
+ export function tornadoPaymasterConfig(
+   chainId: bigint
+ ): Record<number, unknown> | undefined {
+   const staticCfg =
+     TornadoPaymasterConfigs[Number(chainId) as keyof typeof TornadoPaymasterConfigs];
++  const override = tornadoRelayerPaymasterOverride();
++  if (override) {
++    return {
++      [Number(chainId)]: {
++        entryPointAddress:
++          staticCfg?.entryPointAddress ??
++          "0x4337084D9E255Ff0702461CF8895CE9E3b5Ff108",
++        poolsAccountsMap: {},
++        paymasterAddress: override.paymasterAddress,
++        bundlerUrl: override.bundlerUrl ?? railgunPimlicoBundlerUrl(chainId),
++        relayer: { url: override.relayerUrl },
++      },
++    };
++  }
+   if (!staticCfg) return undefined;
+   return {
+     [Number(chainId)]: {
+@@ -498,25 +536,46 @@ export function tornadoUnshieldOptions(
+       `Withdrawal amount is too small to cover the Tornado paymaster fee (estimated ${feeReserve.toString()} wei).`
+     );
+   }
+-  const userTailValue = tailCalls.reduce((sum, call) => sum + call.value, 0n);
+-  if (userTailValue > afterFee) {
++  const fixedTailValue = tailCalls
++    .filter((call) => !call.useRemaining)
++    .reduce((sum, call) => sum + call.value, 0n);
++  if (fixedTailValue > afterFee) {
+     throw new Error(
+-      `--tail-calls msg.value total (${userTailValue.toString()} wei) exceeds the amount remaining after the Tornado paymaster fee (${afterFee.toString()} wei).`
++      `--tail-calls msg.value total (${fixedTailValue.toString()} wei) exceeds the amount remaining after the Tornado paymaster fee (${afterFee.toString()} wei).`
+     );
+   }
+-  const forwardValue = afterFee - userTailValue;
++  const hasRemainingTail = tailCalls.some((call) => call.useRemaining);
+ 
+   return {
+     ...base,
+     // Passed through to SDK prepareUnshield → paymasterWithdrawThunk as
+     // `tailCallsGasEstimate` (execution-tail baseline when bundler estimate fails).
+     ...(tailCallsGasEstimate !== undefined ? { tailCallsGasEstimate } : {}),
+-    tailCalls: async () => [
+-      ...(forwardValue > 0n
+-        ? [{ to: recipient, data: "0x" as const, value: forwardValue }]
+-        : []),
+-      ...tailCalls,
+-    ],
++    // The SDK tells us how much the 7702 account actually holds once the proof
++    // fee is final (`ctx.amount`, relayer-signed paymaster); without it fall back
++    // to our pre-estimate. `max` tails take everything that is left, otherwise
++    // the leftover is forwarded to the recipient.
++    tailCalls: async (_address, ctx) => {
++      const available = ctx?.amount ?? afterFee;
++      const remaining = available - fixedTailValue;
++      if (remaining < 0n) {
++        throw new Error(
++          `--tail-calls msg.value total (${fixedTailValue.toString()} wei) exceeds the ${available.toString()} wei available after the paymaster fee.`
++        );
++      }
++      const materialized = tailCalls.map((call) =>
++        call.useRemaining
++          ? { to: call.to, data: call.data, value: remaining }
++          : { to: call.to, data: call.data, value: call.value }
++      );
++      const forwardValue = hasRemainingTail ? 0n : remaining;
++      return [
++        ...(forwardValue > 0n
++          ? [{ to: recipient, data: "0x" as const, value: forwardValue }]
++          : []),
++        ...materialized,
++      ];
++    },
+   };
+ }
+ 
+diff --git a/src/utils/tornado-paymaster-quote.ts b/src/utils/tornado-paymaster-quote.ts
+index c2a1987..14ec566 100644
+--- a/src/utils/tornado-paymaster-quote.ts
++++ b/src/utils/tornado-paymaster-quote.ts
+@@ -9,6 +9,8 @@ const QUOTE_WEI_IN_TOKEN_ABI = parseAbi([
+ ]);
+ 
+ export function tornadoPaymasterAddress(chainId: bigint): `0x${string}` {
++  const override = process.env.KOHAKU_TORNADO_PAYMASTER?.trim();
++  if (override) return override as `0x${string}`;
+   const cfg =
+     TornadoPaymasterConfigs[Number(chainId) as keyof typeof TornadoPaymasterConfigs];
+   const address = cfg?.paymasterAddress;
+diff --git a/src/utils/tornado-tail-gas.ts b/src/utils/tornado-tail-gas.ts
+index 0902c39..f71d32d 100644
+--- a/src/utils/tornado-tail-gas.ts
++++ b/src/utils/tornado-tail-gas.ts
+@@ -17,6 +17,8 @@ export type TornadoTailCall = {
+   to: `0x${string}`;
+   data: `0x${string}`;
+   value: bigint;
++  /** `--tail-calls …:max`: value = everything left after the fee and the fixed-value tails. */
++  useRemaining?: boolean;
+ };
+ 
+ /** Same EIP-7702 SimpleAccount impl the Tornado paymaster SDK delegates to. */
+@@ -379,21 +381,27 @@ function buildSimulationPlan(opts: {
+     };
+   }
+ 
+-  const userTailValue = opts.userTailCalls.reduce(
+-    (sum, call) => sum + call.value,
+-    0n
+-  );
++  const userTailValue = opts.userTailCalls
++    .filter((call) => !call.useRemaining)
++    .reduce((sum, call) => sum + call.value, 0n);
+   if (userTailValue > afterFee) {
+     throw new Error(
+       `--tail-calls msg.value total (${userTailValue.toString()} wei) exceeds the amount remaining after the Tornado paymaster fee (${afterFee.toString()} wei).`
+     );
+   }
+-  const forwardValue = afterFee - userTailValue;
++  const remaining = afterFee - userTailValue;
++  const hasRemainingTail = opts.userTailCalls.some((call) => call.useRemaining);
++  // For the simulation a `max` tail gets the pre-estimated leftover; the SDK
++  // substitutes the exact amount when the proof fee is known.
++  const materialized = opts.userTailCalls.map((call) =>
++    call.useRemaining ? { to: call.to, data: call.data, value: remaining } : call
++  );
++  const forwardValue = hasRemainingTail ? 0n : remaining;
+   const calls: TornadoTailCall[] = [
+     ...(forwardValue > 0n
+       ? [{ to: opts.recipient, data: "0x" as const, value: forwardValue }]
+       : []),
+-    ...opts.userTailCalls,
++    ...materialized,
+   ];
+   return { calls, nativeBalanceWei: afterFee };
+ }
+diff --git a/src/utils/unshield-tail-calls.ts b/src/utils/unshield-tail-calls.ts
+index 920998d..2eeb5b5 100644
+--- a/src/utils/unshield-tail-calls.ts
++++ b/src/utils/unshield-tail-calls.ts
+@@ -33,6 +33,17 @@ export function parseTailCalls(raw: string): UnshieldTailCall[] {
+     }
+ 
+     let value = 0n;
++    // `max`: send whatever the account holds after the paymaster fee and the
++    // other tail values (resolved at execution-plan time from the SDK's tail
++    // context; only exact with a relayer-signed paymaster).
++    if (valueRaw !== undefined && valueRaw.toLowerCase() === "max") {
++      return {
++        to: getAddress(target!) as `0x${string}`,
++        data: data! as `0x${string}`,
++        value: 0n,
++        useRemaining: true,
++      };
++    }
+     if (valueRaw !== undefined) {
+       if (!/^0x[0-9a-fA-F]+$/.test(valueRaw) && !/^[0-9]+$/.test(valueRaw)) {
+         throw new Error(

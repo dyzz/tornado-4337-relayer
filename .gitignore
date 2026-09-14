@@ -12,3 +12,4 @@ client/artifacts/
 kohaku-integration/vendor/
 contracts-tornado/out/
 contracts-tornado/cache/
+.kohaku-cli/

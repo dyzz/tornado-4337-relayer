@@ -30,3 +30,19 @@ echo ">> installing + building @kohaku-eth/{provider,plugins,mimc-tree,tornado-c
 echo ">> linking into this package"
 (cd "$HERE/.." && pnpm install)
 echo "done"
+
+# --- Kohaku CLI (dmarzzz/kohaku-cli) with the relayer-paymaster patch, linked to the patched SDK ---
+CLI="$HERE/vendor/kohaku-cli"
+CLI_COMMIT="$(cat "$HERE/patches/KOHAKU_CLI_COMMIT")"
+if [ ! -d "$CLI/.git" ]; then
+  git clone --filter=blob:none https://github.com/dmarzzz/kohaku-cli.git "$CLI"
+fi
+git -C "$CLI" fetch --depth 1 origin "$CLI_COMMIT" 2>/dev/null || true
+git -C "$CLI" checkout -q --force "$CLI_COMMIT"
+git -C "$CLI" apply "$HERE/patches/0002-kohaku-cli-relayer-paymaster.patch"
+(cd "$CLI" && npm install --no-audit --no-fund)
+rm -rf "$CLI/node_modules/@kohaku-eth/tornado-cash" "$CLI/node_modules/@kohaku-eth/plugins"
+ln -s ../../../kohaku/packages/tornado-cash "$CLI/node_modules/@kohaku-eth/tornado-cash"
+ln -s ../../../kohaku/packages/plugins "$CLI/node_modules/@kohaku-eth/plugins"
+(cd "$CLI" && npm run -s typecheck)
+echo "kohaku-cli ready: (cd $CLI && npm run dev:prod -- --help)"
