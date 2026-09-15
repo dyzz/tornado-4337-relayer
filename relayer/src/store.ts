@@ -16,8 +16,13 @@ export class FileSponsorshipStore extends MemorySponsorshipStore {
     }
   }
 
-  override set(k: Hex, v: SponsoredNote) {
+  protected override set(k: Hex, v: SponsoredNote) {
     super.set(k, v);
+    this.flush();
+  }
+
+  protected override delete(k: Hex) {
+    super.delete(k);
     this.flush();
   }
 

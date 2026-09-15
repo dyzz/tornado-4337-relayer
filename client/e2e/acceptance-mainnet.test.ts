@@ -8,6 +8,10 @@
  * -> pool, the fee lands on the master, swap -> Aave runs atomically.
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { createReadStream, createWriteStream, existsSync, mkdirSync } from 'node:fs';
+import { dirname } from 'node:path';
+import { pipeline } from 'node:stream/promises';
+import { createGunzip } from 'node:zlib';
 import { createPublicClient, createWalletClient, decodeEventLog, encodeFunctionData, http, parseEther } from 'viem';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 
@@ -18,6 +22,7 @@ import { syncLeaves } from '../src/merkle.js';
 import { commitmentHex, createNote, nullifierHashHex } from '../src/note.js';
 import { createTornadoProver, type TornadoProver } from '../src/prover.js';
 import { RelayerRpc } from '../src/relayerClient.js';
+import { FIXTURE_DIR } from './fork-cache.js';
 import { startHarness, type Harness } from './harness.js';
 
 const log = (m: string) => console.log(`[acceptance] ${m}`);
@@ -67,6 +72,12 @@ describe('mainnet acceptance: canonical pool, live DAO contracts, existing relay
     // contributes the blocks after that (our deposit). Cached locally for later runs.
     const t0 = Date.now();
     const cacheFile = new URL(`../.cache/leaves-${h.setup.chain.id}-${h.instance}.json`, import.meta.url).pathname;
+    const fixture = `${FIXTURE_DIR}/leaves-${h.setup.chain.id}-${h.instance}.json.gz`;
+    if (!existsSync(cacheFile) && existsSync(fixture)) {
+      mkdirSync(dirname(cacheFile), { recursive: true });
+      await pipeline(createReadStream(fixture), createGunzip(), createWriteStream(cacheFile));
+      log(`restored leaf cache from ${fixture}`);
+    }
     const upstream = createPublicClient({ chain: setup.chain, transport: http(h.forkUrl, { timeout: 180_000 }) });
     await syncLeaves(upstream, h.instance, {
       fromBlock: POOLS_DEPLOY_BLOCK,

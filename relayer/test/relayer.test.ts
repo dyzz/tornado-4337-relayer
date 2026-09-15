@@ -6,6 +6,11 @@ import { DEFAULT_GAS, minimumFee, serviceFeeFor } from '../src/fee.js';
 import { FixedPriceSource, parseDecimal, weiPerTokenFrom } from '../src/price.js';
 import { encodePaymasterData, DUMMY_SIGNATURE, packInitCode, readGas, totalGas } from '../src/userop.js';
 import { decodeAccountCalls, findSponsoringWithdraw, ValidationError } from '../src/validate.js';
+import { MemorySponsorshipStore } from '../src/service.js';
+import { FileSponsorshipStore } from '../src/store.js';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 const INSTANCE: Address = '0x12D66f87A04A9E220743712cE6d9bB1B5616B8Fc';
 const PAYMASTER: Address = '0x000000000000000000000000000000000000dEaD';
@@ -201,5 +206,34 @@ describe('userop', () => {
       paymasterVerificationGasLimit: 0n,
       paymasterPostOpGasLimit: 0n,
     });
+  });
+});
+
+describe('sponsorship store', () => {
+  const NH: Hex = `0x${'aa'.repeat(32)}`;
+  const a = { validUntil: 2_000_000_000, sender: SENDER, nonce: 0n };
+  const b = { validUntil: 2_000_000_000, sender: MASTER, nonce: 0n };
+
+  it('reserve is check-and-set: a second sender is refused until release or expiry', () => {
+    const store = new MemorySponsorshipStore();
+    expect(store.reserve(NH, a).ok).toBe(true);
+    expect(store.reserve(NH, b).ok).toBe(false);
+    expect(store.reserve(NH, a).ok).toBe(true); // same sender + nonce may retry
+    expect(store.reserve(NH, { ...a, nonce: 1n }).ok).toBe(false);
+    store.release(NH, b); // not the holder: no-op
+    expect(store.get(NH)).toEqual(a);
+    store.release(NH, a);
+    expect(store.reserve(NH, b).ok).toBe(true);
+    store.prune(2_000_000_001);
+    expect(store.get(NH)).toBeUndefined();
+  });
+
+  it('file store persists reservations across instances', () => {
+    const file = join(mkdtempSync(join(tmpdir(), 'sponsor-')), 'sponsorships.json');
+    const first = new FileSponsorshipStore(file);
+    expect(first.reserve(NH, a).ok).toBe(true);
+    const second = new FileSponsorshipStore(file);
+    expect(second.reserve(NH, b).ok).toBe(false);
+    expect(second.get(NH)).toEqual(a);
   });
 });

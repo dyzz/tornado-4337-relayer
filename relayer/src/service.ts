@@ -188,13 +188,21 @@ export interface SponsoredNote {
 }
 
 /**
- * Live sponsorships by nullifier: one signature per note at a time. The default is in-memory; the
- * file store survives restarts. Neither is safe for several relayer instances sharing a key — that
- * needs a shared store behind this interface (a database row with the nullifier as key).
+ * Live sponsorships by nullifier: one signature per note at a time. `reserve` is the check-and-set
+ * that guards the whole signing path (it runs before any await, so concurrent requests for the same
+ * note cannot both pass); `release` undoes a reservation whose signing failed. The default is
+ * in-memory; the file store survives restarts. Several relayer instances sharing a key need a shared
+ * store whose `reserve` is atomic on the backend (SETNX-style), not these.
  */
 export interface SponsorshipStore {
   get(nullifierHash: Hex): SponsoredNote | undefined;
-  set(nullifierHash: Hex, note: SponsoredNote): void;
+  /**
+   * Atomically claim the note for `note.sender`/`note.nonce`. Succeeds when nothing live is held, or
+   * when the live entry belongs to the same sender and nonce (a client retrying the same operation).
+   */
+  reserve(nullifierHash: Hex, note: SponsoredNote): { ok: true } | { ok: false; held: SponsoredNote };
+  /** Drop the reservation `note` made (no-op if someone else holds the note now). */
+  release(nullifierHash: Hex, note: SponsoredNote): void;
   prune(now: number): void;
 }
 
@@ -203,11 +211,24 @@ export class MemorySponsorshipStore implements SponsorshipStore {
   get(k: Hex) {
     return this.notes.get(k);
   }
-  set(k: Hex, v: SponsoredNote) {
+  protected set(k: Hex, v: SponsoredNote) {
     this.notes.set(k, v);
   }
+  protected delete(k: Hex) {
+    this.notes.delete(k);
+  }
+  reserve(k: Hex, note: SponsoredNote): { ok: true } | { ok: false; held: SponsoredNote } {
+    const held = this.notes.get(k);
+    if (held && !(isAddressEqual(held.sender, note.sender) && held.nonce === note.nonce)) return { ok: false, held };
+    this.set(k, note);
+    return { ok: true };
+  }
+  release(k: Hex, note: SponsoredNote) {
+    const held = this.notes.get(k);
+    if (held && isAddressEqual(held.sender, note.sender) && held.nonce === note.nonce) this.delete(k);
+  }
   prune(now: number) {
-    for (const [k, v] of this.notes) if (v.validUntil < now) this.notes.delete(k);
+    for (const [k, v] of this.notes) if (v.validUntil < now) this.delete(k);
   }
 }
 
@@ -559,27 +580,33 @@ export class RelayerService {
       );
     }
 
-    // 3. One live sponsorship per note: a second signature could only ever burn our gas.
-    this.sponsored.prune(Math.floor(Date.now() / 1000));
-    const live = this.sponsored.get(w.nullifierHash);
+    // 3. One live sponsorship per note: a second signature could only ever burn our gas. The note is
+    //    reserved here — synchronously, before any await — and released if a later check fails.
+    const now = Math.floor(Date.now() / 1000);
+    this.sponsored.prune(now);
     const nonce = q(op.nonce, 'nonce');
-    if (live && !(isAddressEqual(live.sender, op.sender) && live.nonce === nonce)) {
-      throw new ValidationError(`note already sponsored; signature valid until ${live.validUntil}`, -32003);
+    const reservation: SponsoredNote = { validUntil: now + this.config.signatureTtlSec, sender: op.sender, nonce };
+    const reserved = this.sponsored.reserve(w.nullifierHash, reservation);
+    if (!reserved.ok) {
+      throw new ValidationError(`note already sponsored; signature valid until ${reserved.held.validUntil}`, -32003);
+    }
+    try {
+      // 4. Optional sender allowlist (defence in depth; the on-chain binding does not depend on it).
+      await this.assertSenderAllowed(op);
+
+      // 5. On-chain sanity: the proof must verify against the instance right now.
+      await this.assertWithdrawSimulates(w);
+
+      // 6. Optional full simulation on the bundler (validation + execution incl. tail calls).
+      if (this.config.simulateWithBundler) await this.assertBundlerSimulates(op, context);
+    } catch (err) {
+      this.sponsored.release(w.nullifierHash, reservation);
+      throw err;
     }
 
-    // 4. Optional sender allowlist (defence in depth; the on-chain binding does not depend on it).
-    await this.assertSenderAllowed(op);
-
-    // 5. On-chain sanity: the proof must verify against the instance right now.
-    await this.assertWithdrawSimulates(w);
-
-    // 6. Optional full simulation on the bundler (validation + execution incl. tail calls).
-    if (this.config.simulateWithBundler) await this.assertBundlerSimulates(op, context);
-
     // 7. Sign.
-    const now = Math.floor(Date.now() / 1000);
     const terms: FeeTerms = {
-      validUntil: now + this.config.signatureTtlSec,
+      validUntil: reservation.validUntil,
       validAfter: 0,
       fee: w.fee,
       serviceFee,
@@ -591,9 +618,13 @@ export class RelayerService {
       withdrawalHash: withdrawalHash(w),
     };
     const hash = paymasterHash({ op, chainId: this.config.chainId, paymaster: this.config.paymaster, terms });
-    const signature = await this.signer.signMessage({ message: { raw: hash } });
-
-    this.sponsored.set(w.nullifierHash, { validUntil: terms.validUntil, sender: op.sender, nonce });
+    let signature: Hex;
+    try {
+      signature = await this.signer.signMessage({ message: { raw: hash } });
+    } catch (err) {
+      this.sponsored.release(w.nullifierHash, reservation);
+      throw err;
+    }
     this.log.info('sponsored', {
       instance: w.instance,
       symbol: info.symbol,

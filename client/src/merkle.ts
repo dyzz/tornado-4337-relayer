@@ -10,6 +10,8 @@ export interface LeafCache {
   lastBlock: string;
   /** commitments as decimal strings, ordered by leafIndex */
   leaves: string[];
+  /** block each leaf was deposited in (same order); lets a cache be rewound to an earlier block */
+  leafBlocks?: string[];
 }
 
 export interface SyncOptions {
@@ -41,13 +43,15 @@ interface TornadoCliDeposit {
 export function leafCacheFromTornadoCli(file: string, instance: Address, chainId: number): LeafCache {
   const deposits = (JSON.parse(readFileSync(file, 'utf8')) as TornadoCliDeposit[]).sort((a, b) => a.leafIndex - b.leafIndex);
   const leaves: string[] = [];
+  const leafBlocks: string[] = [];
   let lastBlock = 0;
   for (const d of deposits) {
     if (d.leafIndex !== leaves.length) throw new Error(`tornado-cli cache ${file}: leaf index gap at ${d.leafIndex}`);
     leaves.push(hexToBigInt(d.commitment as `0x${string}`).toString());
+    leafBlocks.push(String(d.blockNumber));
     if (d.blockNumber > lastBlock) lastBlock = d.blockNumber;
   }
-  return { instance, chainId, lastBlock: lastBlock.toString(), leaves };
+  return { instance, chainId, lastBlock: lastBlock.toString(), leaves, leafBlocks };
 }
 
 /** Fetch every `Deposit` leaf of a Tornado instance, resuming from a cache when present. */
@@ -64,7 +68,18 @@ export async function syncLeaves(client: PublicClient, instance: Address, opts: 
 
   const head = opts.toBlock ?? (await client.getBlockNumber());
   const chunk = opts.chunk ?? 5_000n;
-  const events: { leafIndex: number; commitment: bigint }[] = [];
+  const events: { leafIndex: number; commitment: bigint; block: bigint }[] = [];
+
+  // A cache built past `head` (e.g. at a later fork block) is cut back to the leaves deposited by `head`.
+  if (BigInt(cache.lastBlock) > head) {
+    if (!cache.leafBlocks) throw new Error(`leaf cache is ahead of block ${head} and has no per-leaf blocks to rewind`);
+    let keep = 0;
+    while (keep < cache.leafBlocks.length && BigInt(cache.leafBlocks[keep]!) <= head) keep++;
+    cache.leaves = cache.leaves.slice(0, keep);
+    cache.leafBlocks = cache.leafBlocks.slice(0, keep);
+    cache.lastBlock = head.toString();
+    opts.log?.(`leaf cache rewound to block ${head}: ${keep} leaves`);
+  }
 
   const ranges: [bigint, bigint][] = [];
   for (let from = BigInt(cache.lastBlock) + 1n; from <= head; from += chunk) {
@@ -76,7 +91,7 @@ export async function syncLeaves(client: PublicClient, instance: Address, opts: 
       const [from, to] = ranges[next++]!;
       const logs = await client.getLogs({ address: instance, event: tornadoAbi[0], fromBlock: from, toBlock: to });
       for (const l of logs) {
-        events.push({ leafIndex: Number(l.args.leafIndex), commitment: hexToBigInt(l.args.commitment!) });
+        events.push({ leafIndex: Number(l.args.leafIndex), commitment: hexToBigInt(l.args.commitment!), block: l.blockNumber });
       }
       opts.log?.(`synced ${instance} blocks ${from}-${to}: +${logs.length} leaves`);
     }
@@ -84,11 +99,13 @@ export async function syncLeaves(client: PublicClient, instance: Address, opts: 
   await Promise.all(Array.from({ length: Math.max(1, Math.min(opts.concurrency ?? 1, ranges.length || 1)) }, worker));
 
   events.sort((a, b) => a.leafIndex - b.leafIndex);
+  cache.leafBlocks ??= cache.leaves.map(() => cache.lastBlock);
   for (const e of events) {
     if (e.leafIndex !== cache.leaves.length) {
       throw new Error(`leaf index gap: expected ${cache.leaves.length}, got ${e.leafIndex}`);
     }
     cache.leaves.push(e.commitment.toString());
+    cache.leafBlocks.push(e.block.toString());
   }
   cache.lastBlock = head.toString();
 

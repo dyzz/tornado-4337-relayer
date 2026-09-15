@@ -280,17 +280,17 @@ index c6f9806..8eb0fc1 100644
  
 diff --git a/packages/tornado-cash/src/state/thunks/relayerPaymasterWithdrawThunk.ts b/packages/tornado-cash/src/state/thunks/relayerPaymasterWithdrawThunk.ts
 new file mode 100644
-index 0000000..5d134f7
+index 0000000..d2fa236
 --- /dev/null
 +++ b/packages/tornado-cash/src/state/thunks/relayerPaymasterWithdrawThunk.ts
-@@ -0,0 +1,258 @@
+@@ -0,0 +1,254 @@
 +/* eslint-disable max-lines */
 +import { createAsyncThunk, unwrapResult } from "@reduxjs/toolkit";
 +
 +import { AccountId } from "@kohaku-eth/plugins";
 +import { createTx, TxData } from "@kohaku-eth/provider";
 +import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
-+import { encodeFunctionData, type Hex } from "viem";
++import { encodeFunctionData, erc20Abi, type Hex } from "viem";
 +
 +import { reasonableGasUnitsForBatch } from "../../paymaster/fee";
 +import { RelayerPaymasterClient, relayerPaymasterAbi } from "../../paymaster/relayer-paymaster-client";
@@ -308,8 +308,6 @@ index 0000000..5d134f7
 +import { TornadoProveOutput } from "../../utils/tornado-prover";
 +import { IGenericPaymasterWithdrawalPayload } from "../../relayer/interfaces/paymaster-client.interface";
 +import type { PaymasterWithdrawThunkParams } from "./paymasterWithdrawThunk";
-+
-+const BIP32_PATH = /^m(\/\d+'?)+$/;
 +
 +/**
 + * Relayer-signed paymaster withdrawals (thin Tornado relayer over ERC-4337).
@@ -402,20 +400,6 @@ index 0000000..5d134f7
 +          })
 +    );
 +
-+  const resolveBatchDelegator = async (): Promise<DelegatorAccount> => {
-+    if (delegation?.mode === 'random') return privateKeyToAccount(generatePrivateKey());
-+
-+    if (delegation?.mode === 'deterministic' && delegation.path) {
-+      if (!BIP32_PATH.test(delegation.path)) {
-+        throw new Error(`Invalid delegation path "${delegation.path}": expected a BIP-32 path like m/44'/60'/0'/0/0`);
-+      }
-+
-+      return privateKeyToAccount(await secretManager.deriveDelegatorSigner({ path: delegation.path }));
-+    }
-+
-+    return ephemeralSigner(deposits[0]!);
-+  };
-+
 +  const resolveIndependentSigner = (deposit: (typeof deposits)[number]): Promise<DelegatorAccount> =>
 +    delegation?.mode === 'deterministic'
 +      ? ephemeralSigner(deposit)
@@ -427,7 +411,8 @@ index 0000000..5d134f7
 +  // proof, sponsorship and tail. The relayer refuses operations carrying more than one
 +  // Tornado withdrawal.
 +  const SPONSORING_WITHDRAW_GAS = 400_000n;
-+  const batchGas = reasonableGasUnitsForBatch(poolInfo.isERC20, 0, tailCalls != null, tailCallsGasEstimate);
++  // Gas for the tail: the user's calls, or the single forward transfer.
++  const batchGas = reasonableGasUnitsForBatch(poolInfo.isERC20, 0, true, tailCallsGasEstimate);
 +  const tailCallsGas = batchGas.callGasLimit + SPONSORING_WITHDRAW_GAS;
 +  const sponsorContext = { refundTo: originalRecipientHex };
 +
@@ -446,21 +431,32 @@ index 0000000..5d134f7
 +
 +  const buildOperation = async (deposit: (typeof deposits)[number]): Promise<IGenericPaymasterWithdrawalPayload> => {
 +    const depositPool = pools.get(deposit.pool)!;
-+    // With tail calls the sender must hold the funds first; otherwise the pool pays the recipient directly.
-+    const needsSender = tailCalls != null;
-+    const signer = needsSender ? await resolveBatchDelegator() : await resolveIndependentSigner(deposit);
++    // One fresh sender per note (derived per deposit in deterministic mode, random otherwise): each
++    // operation is the sender's first, so nonce 0 and its own EIP-7702 authorization are always right.
++    // The proof always names the sender as recipient — `relayWithdraw` only accepts the recipient as
++    // caller — and, without user tail calls, the sender forwards the note to the real recipient.
++    const signer = await resolveIndependentSigner(deposit);
 +    const senderAddress = BigInt(signer.address) as Address;
-+    const recipient = needsSender ? senderAddress : originalRecipient;
++    const recipient = senderAddress;
 +
-+    // callData: the relayed withdraw, then the caller's tailCalls (or nothing: the pool paid the recipient).
++    const forwardCalls = (fee: bigint): TxData[] => {
++      const forwardAmount = depositPool.denomination - fee;
++      if (depositPool.isERC20) {
++        const data = encodeFunctionData({ abi: erc20Abi, functionName: 'transfer', args: [originalRecipientHex, forwardAmount] });
++        return [createTx(addressToHex(depositPool.asset), data, 0n)];
++      }
++      return [createTx(originalRecipientHex, '0x', forwardAmount)];
++    };
++
++    // callData: the relayed withdraw, then the caller's tailCalls or the forward to the recipient.
 +    const composeCalls = async (paymaster: `0x${string}`, proof: TornadoProveOutput, fee: bigint): Promise<TxData[]> => [
 +      relayWithdrawCall(paymaster, deposit.pool, proof),
-+      ...(needsSender
-+        ? await tailCalls!(signer.address as AccountId, {
++      ...(tailCalls
++        ? await tailCalls(signer.address as AccountId, {
 +            amount: depositPool.denomination - fee,
 +            asset: depositPool.isERC20 ? addressToHex(depositPool.asset) : undefined,
 +          })
-+        : []),
++        : forwardCalls(fee)),
 +    ];
 +
 +    const unsignedOp = (

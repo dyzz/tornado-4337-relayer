@@ -16,11 +16,9 @@ git -C "$VENDOR" fetch --depth 1 origin "$KOHAKU_COMMIT" 2>/dev/null || true
 git -C "$VENDOR" checkout -q --force "$KOHAKU_COMMIT"
 git -C "$VENDOR" clean -fdq -e node_modules -e dist
 
-echo ">> applying patches"
-for p in "$HERE"/patches/*.patch; do
-  git -C "$VENDOR" apply --index "$p"
-  echo "   applied $(basename "$p")"
-done
+echo ">> applying the SDK patch"
+git -C "$VENDOR" apply --index "$HERE/patches/0001-tornado-cash-relayer-signed-paymaster.patch"
+echo "   applied 0001-tornado-cash-relayer-signed-paymaster.patch"
 
 echo ">> installing + building @kohaku-eth/{provider,plugins,mimc-tree,tornado-cash}"
 (cd "$VENDOR" && pnpm install --ignore-scripts)

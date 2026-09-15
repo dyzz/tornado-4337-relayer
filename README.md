@@ -178,6 +178,11 @@ E2E_CHAIN=sepolia pnpm --filter @tornado-4337/client e2e          # same suites 
 pnpm --filter @tornado-4337/kohaku-integration setup && pnpm --filter @tornado-4337/kohaku-integration e2e   # real Kohaku SDK, Sepolia fork
 ```
 
+Forks are pinned to a fixed block (`client/e2e/harness.ts`, `E2E_FORK_BLOCK=latest` to override) and anvil's
+RPC cache for that block ships in `client/e2e/fork-cache/`, so the mainnet suites need no archive node: every
+upstream read the suites make is replayed from the fixture. After moving the pin, warm the caches once and
+`pnpm --filter @tornado-4337/client fork-cache:save`.
+
 The mainnet fork (anvil + alto bundler + the relayer in-process) runs against the real contracts: ETH pool →
 swap → Aave; DAI pool → Aave with the fee priced by the 1inch oracle; and the DAO path through the real
 `TornadoRouter` / `RelayerRegistry` / FeeManager — the paymaster as a fresh master (~0.116 TORN burned per
@@ -210,7 +215,10 @@ an Aave tail call. That withdrawal is a single transaction:
 — EntryPoint → worker contract `relayWithdraw` (only with the arguments the relayer signed) → `TornadoRouter`
 → `RelayerRegistry.burn` (0.1137 TORN from the master's stake) → pool → wrap → Aave. Fee bound in the proof
 0.002212 ETH, paid to the master; actual gas 0.000787 ETH, paid from the worker's EntryPoint deposit;
-0.097788 aWETH landed in the wallet. An earlier run through the experimental 7702 variant is
+0.097788 aWETH landed in the wallet. A plain `kohaku unshield` without tail calls goes the same way, the
+sender forwarding the note to the wallet's fresh address:
+[`0xd4e04a7e…26c6`](https://sepolia.etherscan.io/tx/0xd4e04a7e88f5e3bf96bebabf4a24c431c474d1f8a1f6218b55a5e936743026c6)
+(0.098270 ETH received, 0.1137 TORN burned). An earlier run through the experimental 7702 variant is
 [`0x0411a50f…e7df`](https://sepolia.etherscan.io/tx/0x0411a50f9b54e642382c28c1b13df74ca763583f33dc566af1687e80e181e7df).
 
 ## Repository
@@ -381,6 +389,8 @@ E2E_CHAIN=sepolia pnpm --filter @tornado-4337/client e2e          # 同一套跑
 pnpm --filter @tornado-4337/kohaku-integration setup && pnpm --filter @tornado-4337/kohaku-integration e2e   # 真实 Kohaku SDK，Sepolia fork
 ```
 
+fork 固定在一个区块高度（`client/e2e/harness.ts`，`E2E_FORK_BLOCK=latest` 可覆盖），anvil 在该高度的 RPC 缓存随仓库一起提交在 `client/e2e/fork-cache/`，所以主网套件不需要归档节点：测试碰到的所有上游读取都从 fixture 回放。改了高度后先热跑一遍，再 `pnpm --filter @tornado-4337/client fork-cache:save`。
+
 主网 fork（anvil + alto bundler + 进程内 relayer）对着真实合约跑：ETH 池 → swap → Aave；DAI 池 → Aave，fee 用 1inch 预言机定价；以及走真实 `TornadoRouter` / `RelayerRegistry` / FeeManager 的 DAO 路径——paymaster 作为新注册的 master（每笔烧约 0.116 TORN，退款照常）、作为一个真实已注册 relayer 的 worker 合约（由 relayer 软件自己部署；fee 到 master、烧它的质押）、以及实验性的 7702 变体。验收套件再加上主网真实的 ETH 100 池及其完整存款树（从 tornado-cli 的事件缓存起步）、且不碰任何 governance 持有的状态；bundler 是关闭严格 mempool 规则的 alto——这是 fork 唯一复现不了的生产条件。
 
 ## 我们在 Sepolia 做了什么
@@ -390,7 +400,7 @@ DAO 自己的 Sepolia registry 没有 router、没有启用的池子、费用为
 然后我们扮演一个现有 relayer：一个 EOA 注册为 master `existing-relayer.sandbox.eth`，质押 5000 TORN——和一套 `tornado-relayer` 部署完全一样；用一个 relayer key 启动新软件，`REWARD_ACCOUNT` 填 master。软件启动时自己部署了 worker 合约 [`0xAeF52571…7D0A`](https://sepolia.etherscan.io/address/0xAeF5257102B5A5b3Ba80a7fD60eA36653D337D0A)（[部署](https://sepolia.etherscan.io/tx/0xfc7210a6fa6aea040c439c40b4810f1ad531a26f57875f791243a9e244764589)），质押、入金后等待；master 用一笔 [`registerWorker`](https://sepolia.etherscan.io/tx/0x2c06aab2127662e4fe7709b7de9cfcb5b8ceea3b270c9d1b9885a2d9d1b8e38c) 登记它，服务随即上线。再用 Kohaku CLI 钱包 `kohaku shield` 0.1 ETH，`kohaku unshield` 一次并带上存 Aave 的尾调用。这笔提现是一笔交易：
 
 [`0x30fca6f5…d059`](https://sepolia.etherscan.io/tx/0x30fca6f5e1a6b8a05ea0b1b3099e05c3add5055238e8d425b09d43f5a47ed059)
-——EntryPoint → worker 合约 `relayWithdraw`（只接受 relayer 签过的那组参数）→ `TornadoRouter` → `RelayerRegistry.burn`（从 master 的质押里烧 0.1137 TORN）→ 池子 → wrap → 存 Aave。证明里绑定的 fee 0.002212 ETH 付给 master；实际 gas 0.000787 ETH 从 worker 的 EntryPoint 押金里出；钱包到账 0.097788 aWETH。更早一笔走实验性 7702 变体的记录：[`0x0411a50f…e7df`](https://sepolia.etherscan.io/tx/0x0411a50f9b54e642382c28c1b13df74ca763583f33dc566af1687e80e181e7df)。
+——EntryPoint → worker 合约 `relayWithdraw`（只接受 relayer 签过的那组参数）→ `TornadoRouter` → `RelayerRegistry.burn`（从 master 的质押里烧 0.1137 TORN）→ 池子 → wrap → 存 Aave。证明里绑定的 fee 0.002212 ETH 付给 master；实际 gas 0.000787 ETH 从 worker 的 EntryPoint 押金里出；钱包到账 0.097788 aWETH。不带尾调用的普通 `kohaku unshield` 走同一条路，由 sender 把 note 转给钱包的新地址：[`0xd4e04a7e…26c6`](https://sepolia.etherscan.io/tx/0xd4e04a7e88f5e3bf96bebabf4a24c431c474d1f8a1f6218b55a5e936743026c6)（收到 0.098270 ETH，烧 0.1137 TORN）。更早一笔走实验性 7702 变体的记录：[`0x0411a50f…e7df`](https://sepolia.etherscan.io/tx/0x0411a50f9b54e642382c28c1b13df74ca763583f33dc566af1687e80e181e7df)。
 
 ## 目录
 

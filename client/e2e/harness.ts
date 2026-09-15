@@ -29,6 +29,7 @@ import {
   type PriceSource,
 } from '@tornado-4337/relayer';
 import { CHAINS, type ChainSetup } from '../src/chains.js';
+import { restoreForkCache } from './fork-cache.js';
 import {
   deployErc20Tornado,
   deployEthTornado,
@@ -105,9 +106,28 @@ export interface Harness {
   stop(): Promise<void>;
 }
 
+/**
+ * Pinned fork heights. A pinned block lets anvil cache every upstream read on disk
+ * (~/.foundry/cache/rpc/<chain>/<block>), so the second run of any suite — including the 1inch oracle
+ * warm-up — never touches the upstream node, and keeps prices / registry state deterministic.
+ * Override with E2E_FORK_BLOCK=<number> or E2E_FORK_BLOCK=latest. Bump when the DAO state moves on.
+ */
+export const PINNED_FORK_BLOCKS: Record<'mainnet' | 'sepolia', bigint> = {
+  mainnet: 25_981_000n, // 2026-09-15
+  sepolia: 11_710_500n, // after the sandbox DAO deployment and the live runs
+};
+
+export function pinnedForkBlock(chainKey: 'mainnet' | 'sepolia'): bigint | undefined {
+  const env = process.env.E2E_FORK_BLOCK;
+  if (env === 'latest') return undefined;
+  if (env) return BigInt(env);
+  return PINNED_FORK_BLOCKS[chainKey];
+}
+
 export interface HarnessOptions {
   chainKey?: 'mainnet' | 'sepolia';
   forkUrl?: string;
+  /** Fork height (default: the pinned block for the chain; `E2E_FORK_BLOCK=latest` to fork the head). */
   forkBlockNumber?: bigint;
   /** Serve the chain's canonical Tornado pools instead of deploying a fresh instance. */
   canonicalInstances?: boolean;
@@ -164,9 +184,11 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
 
   // --- anvil ---------------------------------------------------------------
   const anvilPort = opts.anvilPort ?? (await freePort());
+  const forkBlockNumber = opts.forkBlockNumber ?? pinnedForkBlock(opts.chainKey ?? 'mainnet');
+  if (forkBlockNumber) await restoreForkCache(setup.chain.id, forkBlockNumber, log);
   const anvilInstance = Instance.anvil({
     forkUrl,
-    forkBlockNumber: opts.forkBlockNumber,
+    forkBlockNumber,
     port: anvilPort,
     hardfork: 'Prague',
     chainId: setup.chain.id,
@@ -174,7 +196,7 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
   });
   await anvilInstance.start();
   const rpcUrl = `http://127.0.0.1:${anvilPort}`;
-  log(`anvil forked ${forkUrl} on ${rpcUrl}`);
+  log(`anvil forked ${forkUrl}${forkBlockNumber ? ` @ ${forkBlockNumber} (cached)` : ' @ latest'} on ${rpcUrl}`);
 
   const chain = setup.chain;
   const publicClient = createPublicClient({ chain, transport: http(rpcUrl) });

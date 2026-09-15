@@ -14,7 +14,8 @@
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "prove": "tsx src/cli/prove.ts",
     "sepolia": "tsx src/cli/sepolia.ts",
-    "fork": "tsx scripts/fork.ts"
+    "fork": "tsx scripts/fork.ts",
+    "fork-cache:save": "tsx scripts/save-fork-cache.ts"
   },
   "dependencies": {
     "@kohaku-eth/mimc-tree": "0.0.3",
