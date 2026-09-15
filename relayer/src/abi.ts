@@ -22,8 +22,21 @@ export const paymasterAbi = parseAbi([
   'function postOpGasOverhead() view returns (uint256)',
   'function router() view returns (address)',
   'function getDeposit() view returns (uint256)',
+  'function deposit() payable',
+  'function addStake(uint32 unstakeDelaySec) payable',
   'function PAYMASTER_AND_DATA_LENGTH() view returns (uint256)',
   'function relayWithdraw(address pool, bytes proof, bytes32 root, bytes32 nullifierHash, address recipient, address relayer, uint256 fee)',
+  'function simulateRelayWithdraw(address pool, bytes proof, bytes32 root, bytes32 nullifierHash, address recipient, address relayer, uint256 fee)',
+  'error SimulationResult(bool success, bytes result)',
+  'error NotSponsored(address sender)',
+  'error OnlyRecipient()',
+]);
+
+/** EntryPoint v0.8 stake / deposit info. */
+export const entryPointAbi = parseAbi([
+  'struct DepositInfo { uint256 deposit; bool staked; uint112 stake; uint32 unstakeDelaySec; uint48 withdrawTime; }',
+  'function getDepositInfo(address account) view returns (DepositInfo info)',
+  'function balanceOf(address account) view returns (uint256)',
 ]);
 
 /** DAO TornadoRouter (mainnet 0xd90e2f925DA726b50C4Ed8D0Fb90Ad053324F31b). */
@@ -39,6 +52,7 @@ export const relayerRegistryAbi = parseAbi([
   'function getRelayerEnsHash(address relayer) view returns (bytes32)',
   'function minStakeAmount() view returns (uint256)',
   'function feeManager() view returns (address)',
+  'function tornadoRouter() view returns (address)',
 ]);
 
 /** FeeManager: TORN burned per withdrawal of an instance (0 where governance set no protocol fee). */

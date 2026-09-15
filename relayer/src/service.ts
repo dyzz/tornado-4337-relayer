@@ -1,5 +1,8 @@
 import {
+  BaseError,
+  ContractFunctionRevertedError,
   createPublicClient,
+  decodeErrorResult,
   getAddress,
   hexToBigInt,
   http,
@@ -588,7 +591,11 @@ export class RelayerService {
     };
   }
 
-  /** Proof + registry check: simulate `relayWithdraw` from the recipient (Router -> burn -> pool.withdraw). */
+  /**
+   * Proof + registry check: dry-run the relay through `simulateRelayWithdraw`, which grants the
+   * sponsorship the EntryPoint would grant, runs Router -> burn -> pool.withdraw, and reverts with the
+   * result so nothing persists.
+   */
   private async assertWithdrawSimulates(w: ReturnType<typeof findSponsoringWithdraw>) {
     const [spent, known] = await Promise.all([
       this.client.readContract({
@@ -606,16 +613,29 @@ export class RelayerService {
     ]);
     if (spent) throw new ValidationError('note already spent', -32004);
     if (!known) throw new ValidationError('merkle root is not known to the instance (stale tree?)', -32005);
+    // simulateRelayWithdraw always reverts with SimulationResult(success, innerResult).
+    let outcome: { success: boolean; result: Hex } | undefined;
     try {
       await this.client.simulateContract({
         address: this.config.paymaster,
         abi: paymasterAbi,
-        functionName: 'relayWithdraw',
+        functionName: 'simulateRelayWithdraw',
         args: [w.instance, w.proof, w.root, w.nullifierHash, w.recipient, w.relayer, w.fee],
         account: w.recipient,
       });
     } catch (err) {
-      throw new ValidationError(`relayWithdraw simulation failed: ${shortError(err)}`, -32006);
+      const reverted = err instanceof BaseError ? err.walk((e) => e instanceof ContractFunctionRevertedError) : undefined;
+      const data = reverted instanceof ContractFunctionRevertedError ? reverted.data : undefined;
+      if (data?.errorName === 'SimulationResult') {
+        const [success, result] = data.args as readonly [boolean, Hex];
+        outcome = { success, result };
+      } else {
+        throw new ValidationError(`relay simulation failed: ${data?.errorName ?? shortError(err)}`, -32006);
+      }
+    }
+    if (!outcome) throw new ValidationError('relay simulation did not revert with SimulationResult', -32006);
+    if (!outcome.success) {
+      throw new ValidationError(`relayWithdraw would revert: ${decodeRevert(outcome.result)}`, -32006);
     }
   }
 
@@ -710,6 +730,24 @@ export async function probeRegistry(
 
 function stripUndefined<T extends object>(obj: T): Partial<T> {
   return Object.fromEntries(Object.entries(obj).filter(([, v]) => v !== undefined)) as Partial<T>;
+}
+
+/** Human-readable form of inner revert data (Error(string), Panic, or a raw selector). */
+function decodeRevert(data: Hex): string {
+  if (data.startsWith('0x08c379a0')) {
+    try {
+      const { args } = decodeErrorResult({ abi: [{ type: 'error', name: 'Error', inputs: [{ type: 'string' }] }], data });
+      return String(args?.[0]);
+    } catch {
+      /* fall through */
+    }
+  }
+  try {
+    const { errorName } = decodeErrorResult({ abi: paymasterAbi, data });
+    return errorName;
+  } catch {
+    return data === '0x' ? 'reverted without data' : data.slice(0, 74);
+  }
 }
 
 function shortError(err: unknown): string {

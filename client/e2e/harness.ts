@@ -21,13 +21,21 @@ import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 
 import {
   createRelayerApp,
+  ensurePaymasterSetup,
   FixedPriceSource,
   OneInchPriceSource,
   RelayerService,
   type PriceSource,
 } from '@tornado-4337/relayer';
 import { CHAINS, type ChainSetup } from '../src/chains.js';
-import { deployErc20Tornado, deployEthTornado, deployMimcHasher, deployPaymaster, deployZap } from '../src/deploy.js';
+import {
+  deployErc20Tornado,
+  deployEthTornado,
+  deployMimcHasher,
+  deployPaymaster,
+  deployPaymaster7702Implementation,
+  deployZap,
+} from '../src/deploy.js';
 import { erc20Abi, instanceRegistryAbi, paymasterAdminAbi, relayerRegistryAbi } from '../src/abi.js';
 
 // Well-known anvil dev keys (accounts 0..4).
@@ -54,6 +62,8 @@ export interface Harness {
   erc20Instance: Address;
   erc20Denomination: bigint;
   paymaster: Address;
+  /** 7702 mode: the shared implementation the relayer EOA delegates to. */
+  paymasterImplementation?: Address;
   zap: Address;
   relayer: RelayerService;
   /** Address the proofs name as relayer: the paymaster, or the master EOA in worker mode. */
@@ -84,6 +94,11 @@ export interface HarnessOptions {
   forkBlockNumber?: bigint;
   /** Serve the chain's canonical Tornado pools instead of deploying a fresh instance. */
   canonicalInstances?: boolean;
+  /**
+   * Also set up the ERC-20 demo pool and token pricing (default true). Suites that only use ETH pools
+   * pass false: on mainnet forks the 1inch oracle warm-up alone costs ~2-3 minutes of RPC round-trips.
+   */
+  erc20?: boolean;
   denomination?: bigint;
   serviceFeeBps?: bigint;
   gasMarginBps?: bigint;
@@ -96,6 +111,13 @@ export interface HarnessOptions {
   registry?: 'master' | 'worker';
   /** Worker mode: master EOA of the existing relayer (default: solid-relayer.eth's, registered 2026). */
   workerOf?: Address;
+  /**
+   * standalone (default): deploy a TornadoRelayerPaymaster contract.
+   * 7702: the relayer signer EOA *is* the paymaster — it is registered as the worker, delegated to a freshly
+   * deployed TornadoRelayerPaymaster7702 implementation, staked and funded by the relayer's own setup step.
+   * Implies `registry: 'worker'`.
+   */
+  paymasterMode?: 'standalone' | '7702';
   /** Protocol fee (burn) set on the fresh instances, in 1e-4 (default 30 = 0.30 %, the DAO's ETH-1 setting). */
   protocolFeePercentage?: number;
   anvilPort?: number;
@@ -207,15 +229,29 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
     const balance = await publicClient.readContract({ address: token, abi: erc20Abi, functionName: 'balanceOf', args: [to] });
     if (balance < amount) throw new Error(`dealErc20 failed: balance ${balance} < ${amount}`);
   };
+  const paymasterMode = opts.paymasterMode ?? 'standalone';
+  if (paymasterMode === '7702' && opts.registry !== 'worker') throw new Error('7702 mode is the worker of an existing relayer: use registry: "worker"');
   const router = opts.registry ? setup.dao.tornadoRouter : undefined;
   if (opts.registry && !router) throw new Error(`registry mode needs a TornadoRouter; ${setup.chain.name} has none`);
-  const paymaster = await deployPaymaster(wallet, publicClient, {
-    entryPoint: setup.entryPoint,
-    verifyingSigner: relayerSigner.address,
-    gasMarginBps: opts.gasMarginBps ?? 1_000n,
-    postOpGasOverhead: 45_000n,
-    router,
-  });
+  let paymaster: Address;
+  let paymasterImplementation: Address | undefined;
+  if (paymasterMode === '7702') {
+    paymasterImplementation = await deployPaymaster7702Implementation(wallet, publicClient, {
+      entryPoint: setup.entryPoint,
+      router: router!,
+      gasMarginBps: opts.gasMarginBps ?? 1_000n,
+      postOpGasOverhead: 45_000n,
+    });
+    paymaster = relayerSigner.address; // delegated below, after it is registered as a worker
+  } else {
+    paymaster = await deployPaymaster(wallet, publicClient, {
+      entryPoint: setup.entryPoint,
+      verifyingSigner: relayerSigner.address,
+      gasMarginBps: opts.gasMarginBps ?? 1_000n,
+      postOpGasOverhead: 45_000n,
+      router,
+    });
+  }
 
   // --- DAO router / registry wiring -------------------------------------------
   let rewardAccount: Address = paymaster;
@@ -336,14 +372,33 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
     swapRouter: setup.uniswapSwapRouter02,
     aavePool: setup.aavePool,
   });
-  const depositHash = await wallet.writeContract({
-    address: paymaster,
-    abi: paymasterAdminAbi,
-    functionName: 'deposit',
-    value: parseEther('2'),
-  });
-  await publicClient.waitForTransactionReceipt({ hash: depositHash });
-  log(`deployed tornado=${instance} tornado-${setup.demoErc20.symbol}=${erc20Instance} paymaster=${paymaster} zap=${zap} hasher=${hasher}`);
+  if (paymasterMode === '7702') {
+    // Exactly what the relayer software does on first start: delegate, stake, deposit — from its own key.
+    await ensurePaymasterSetup(
+      {
+        chainId: BigInt(chain.id),
+        rpcUrl,
+        entryPoint: setup.entryPoint,
+        signerKey: relayerKey,
+        mode: '7702',
+        implementation: paymasterImplementation,
+        autoSetup: true,
+        stakeWei: parseEther('0.1'),
+        unstakeDelaySec: 86_400,
+        depositWei: parseEther('2'),
+      },
+      { info: (m, meta) => log(`setup: ${m} ${meta ? JSON.stringify(meta) : ''}`), warn: (m) => log(`setup WARN: ${m}`) },
+    );
+  } else {
+    const depositHash = await wallet.writeContract({
+      address: paymaster,
+      abi: paymasterAdminAbi,
+      functionName: 'deposit',
+      value: parseEther('2'),
+    });
+    await publicClient.waitForTransactionReceipt({ hash: depositHash });
+  }
+  log(`deployed tornado=${instance} tornado-${setup.demoErc20.symbol}=${erc20Instance} paymaster=${paymaster}${paymasterImplementation ? ` (7702 -> ${paymasterImplementation})` : ''} zap=${zap} hasher=${hasher}`);
 
   // --- alto -----------------------------------------------------------------
   const altoPort = opts.altoPort ?? 4337 + Math.floor(Math.random() * 500);
@@ -369,11 +424,12 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
   // Sepolia has no oracle, so the demo token gets a fixed 3000/ETH rate.
   // The oracle aggregates dozens of DEX pools, so its first call on a fork pulls a lot of state
   // through the upstream RPC: give it a long timeout (the result is cached afterwards).
+  const erc20 = opts.erc20 ?? true;
   const priceSource: PriceSource =
-    chain.id === 1
+    chain.id === 1 && erc20
       ? new OneInchPriceSource(createPublicClient({ chain, transport: http(rpcUrl, { timeout: 600_000 }) }))
       : new FixedPriceSource({ [setup.demoErc20.address]: '3000' });
-  if (chain.id === 1) {
+  if (chain.id === 1 && erc20) {
     const t0 = Date.now();
     const rate = await priceSource.tokenPerEth(setup.demoErc20.address, setup.demoErc20.decimals);
     log(`1inch oracle: ${rate} ${setup.demoErc20.symbol}-units per ETH (${((Date.now() - t0) / 1000).toFixed(0)}s)`);
@@ -388,8 +444,8 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
       signerKey: relayerKey,
       rewardAccount,
       instances: opts.canonicalInstances
-        ? [...Object.values(setup.tornadoEth), erc20Instance]
-        : [instance, erc20Instance],
+        ? [...Object.values(setup.tornadoEth), ...(erc20 ? [erc20Instance] : [])]
+        : [instance, ...(erc20 ? [erc20Instance] : [])],
       priceSource,
       serviceFeeBps: opts.serviceFeeBps ?? 30n,
       signatureTtlSec: 300,
@@ -420,6 +476,7 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
     erc20Instance,
     erc20Denomination,
     paymaster,
+    paymasterImplementation,
     zap,
     relayer,
     rewardAccount,

@@ -124,6 +124,16 @@ export async function deployPaymaster(
   return paymaster;
 }
 
+/** Deploy the shared EIP-7702 paymaster implementation (one per chain). */
+export async function deployPaymaster7702Implementation(
+  wallet: Signer,
+  publicClient: PublicClient,
+  params: { entryPoint: Address; router: Address; gasMarginBps: bigint; postOpGasOverhead: bigint },
+): Promise<Address> {
+  const artifact = forgeArtifact('contracts', 'TornadoRelayerPaymaster7702.sol', 'TornadoRelayerPaymaster7702');
+  return deploy(wallet, publicClient, artifact, [params.entryPoint, params.router, params.gasMarginBps, params.postOpGasOverhead]);
+}
+
 export async function deployZap(
   wallet: Signer,
   publicClient: PublicClient,

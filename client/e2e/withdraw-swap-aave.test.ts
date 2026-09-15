@@ -26,7 +26,7 @@ describe('withdraw -> swap -> Aave supply, atomically over ERC-4337 with the thi
   let prover: TornadoProver;
 
   beforeAll(async () => {
-    h = await startHarness({ chainKey: (process.env.E2E_CHAIN as 'mainnet' | 'sepolia') ?? 'mainnet', log });
+    h = await startHarness({ chainKey: (process.env.E2E_CHAIN as 'mainnet' | 'sepolia') ?? 'mainnet', erc20: false, log });
     const { circuit, provingKey } = await loadArtifacts();
     prover = await createTornadoProver(circuit, provingKey);
   });

@@ -30,6 +30,12 @@ export const paymasterAdminAbi = parseAbi([
   'function postOpGasOverhead() view returns (uint256)',
   'function router() view returns (address)',
   'function setRouter(address router)',
+  'function owner() view returns (address)',
+  'function transferOwnership(address newOwner)',
+  'function addStake(uint32 unstakeDelaySec) payable',
+  'function unlockStake()',
+  'function withdrawStake(address to)',
+  'function sponsorshipAllowance(address sender) view returns (uint256)',
   'function registerAsRelayer(address registry, string ensName, uint256 stake)',
   'function adminCall(address target, uint256 value, bytes data) returns (bytes)',
   'function relayWithdraw(address pool, bytes proof, bytes32 root, bytes32 nullifierHash, address recipient, address relayer, uint256 fee)',
@@ -40,6 +46,16 @@ export const paymasterAdminAbi = parseAbi([
   'event RefundFailed(bytes32 indexed userOpHash, address indexed refundTo, address indexed feeToken, uint256 amount)',
   'event FeeNotReceived(bytes32 indexed userOpHash, address indexed feeToken, uint256 expectedFee)',
   'event Relayed(address indexed pool, bytes32 indexed nullifierHash, address indexed relayer, uint256 fee, bool viaRouter)',
+]);
+
+/** TornadoRelayerPaymaster7702: per-delegator overrides on top of the shared implementation. */
+export const paymaster7702Abi = parseAbi([
+  'function defaultRouter() view returns (address)',
+  'function defaultGasMarginBps() view returns (uint256)',
+  'function defaultPostOpGasOverhead() view returns (uint256)',
+  'function setVerifyingSigner(address signer)',
+  'function setGasParams(uint256 gasMarginBps, uint256 postOpGasOverhead)',
+  'function setRouter(address router)',
 ]);
 
 /** Tornado DAO relayer registry (mainnet 0x58E8dCC13BE9780fC42E8723D8EaD4CF46943dF2). */

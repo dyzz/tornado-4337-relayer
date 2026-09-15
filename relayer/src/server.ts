@@ -1,9 +1,10 @@
 import { readFileSync } from 'node:fs';
 import { parseEnv } from 'node:util';
 import { serve } from '@hono/node-server';
-import { configFromEnv } from './config.js';
+import { configFromEnv, setupConfigFromEnv } from './config.js';
 import { createRelayerApp } from './rpc.js';
 import { RelayerService } from './service.js';
+import { ensurePaymasterSetup } from './setup.js';
 
 // Load ./.env (relayer/.env) for keys not already set in the environment.
 try {
@@ -13,7 +14,13 @@ try {
   // no .env file: rely on the process environment
 }
 
-const service = await RelayerService.create(configFromEnv());
+const log = {
+  info: (msg: string, meta?: Record<string, unknown>) => console.log(`[relayer] ${msg}`, meta ?? ''),
+  warn: (msg: string, meta?: Record<string, unknown>) => console.warn(`[relayer] ${msg}`, meta ?? ''),
+};
+// 7702 mode: delegate the relayer address to the paymaster implementation, stake and fund it if needed.
+const paymaster = await ensurePaymasterSetup(setupConfigFromEnv(), log);
+const service = await RelayerService.create(configFromEnv(paymaster), log);
 const app = createRelayerApp(service);
 const port = Number(process.env.PORT ?? '8787');
 

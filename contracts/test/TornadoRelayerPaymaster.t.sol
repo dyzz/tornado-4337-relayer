@@ -12,6 +12,8 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 
 import {TornadoRelayerPaymaster} from "../src/TornadoRelayerPaymaster.sol";
+import {TornadoRelayerPaymasterCore} from "../src/TornadoRelayerPaymasterCore.sol";
+import {TornadoRelayerPaymaster7702} from "../src/TornadoRelayerPaymaster7702.sol";
 import {ITornadoInstance} from "../src/interfaces/ITornadoInstance.sol";
 import {MockTornado, MockTornadoERC20, MockERC20} from "./mocks/MockTornado.sol";
 import {MockRelayerRegistry, MockTornadoRouter} from "./mocks/MockRegistry.sol";
@@ -21,6 +23,15 @@ contract RejectsEth {
     receive() external payable {
         revert("no");
     }
+}
+
+/// A note owner's helper contract: it is the proof's recipient, so it passes the recipient check.
+contract RecipientProxy {
+    function pull(TornadoRelayerPaymasterCore pm, address pool, bytes32 nh, address relayer) external {
+        pm.relayWithdraw(ITornadoInstance(pool), hex"", bytes32(0), nh, payable(address(this)), payable(relayer), 0);
+    }
+
+    receive() external payable {}
 }
 
 contract TornadoRelayerPaymasterTest is Test {
@@ -100,7 +111,7 @@ contract TornadoRelayerPaymasterTest is Test {
             target: address(paymaster),
             value: 0,
             data: abi.encodeCall(
-                TornadoRelayerPaymaster.relayWithdraw,
+                TornadoRelayerPaymasterCore.relayWithdraw,
                 (
                     ITornadoInstance(instance),
                     hex"",
@@ -128,13 +139,13 @@ contract TornadoRelayerPaymasterTest is Test {
         return abi.encodePacked(address(paymaster), uint128(100_000), uint128(80_000));
     }
 
-    function _encode(TornadoRelayerPaymaster.Terms memory t, bytes memory sig) internal view returns (bytes memory) {
+    function _encode(TornadoRelayerPaymasterCore.Terms memory t, bytes memory sig) internal view returns (bytes memory) {
         return abi.encodePacked(
             _pmPrefix(), t.validUntil, t.validAfter, t.fee, t.serviceFee, t.refundTo, t.feeToken, t.tokenPerEth, sig
         );
     }
 
-    function _attachPaymaster(PackedUserOperation memory op, TornadoRelayerPaymaster.Terms memory t, uint256 signerKey)
+    function _attachPaymaster(PackedUserOperation memory op, TornadoRelayerPaymasterCore.Terms memory t, uint256 signerKey)
         internal
         view
     {
@@ -147,9 +158,9 @@ contract TornadoRelayerPaymasterTest is Test {
     function _terms(uint256 fee, uint256 serviceFee, address refundTo, address feeToken, uint256 rate)
         internal
         view
-        returns (TornadoRelayerPaymaster.Terms memory)
+        returns (TornadoRelayerPaymasterCore.Terms memory)
     {
-        return TornadoRelayerPaymaster.Terms({
+        return TornadoRelayerPaymasterCore.Terms({
             validUntil: uint48(block.timestamp + 300),
             validAfter: uint48(block.timestamp > 0 ? block.timestamp - 1 : 0),
             fee: fee,
@@ -213,10 +224,10 @@ contract TornadoRelayerPaymasterTest is Test {
     function test_parsePaymasterAndData_roundTrip() public view {
         bytes memory sig = new bytes(65);
         sig[0] = 0xAA;
-        TornadoRelayerPaymaster.Terms memory t = _terms(7 ether, 0.01 ether, finalRecipient, address(dai), 123456);
+        TornadoRelayerPaymasterCore.Terms memory t = _terms(7 ether, 0.01 ether, finalRecipient, address(dai), 123456);
         t.validUntil = 1234;
         t.validAfter = 56;
-        (TornadoRelayerPaymaster.Terms memory p, bytes memory s) = paymaster.parsePaymasterAndData(_encode(t, sig));
+        (TornadoRelayerPaymasterCore.Terms memory p, bytes memory s) = paymaster.parsePaymasterAndData(_encode(t, sig));
         assertEq(p.validUntil, 1234);
         assertEq(p.validAfter, 56);
         assertEq(p.fee, 7 ether);
@@ -230,7 +241,7 @@ contract TornadoRelayerPaymasterTest is Test {
 
     function test_parsePaymasterAndData_rejectsWrongLength() public {
         bytes memory data = abi.encodePacked(_pmPrefix(), uint48(1), uint48(0));
-        vm.expectRevert(abi.encodeWithSelector(TornadoRelayerPaymaster.InvalidPaymasterDataLength.selector, 64, 265));
+        vm.expectRevert(abi.encodeWithSelector(TornadoRelayerPaymasterCore.InvalidPaymasterDataLength.selector, 64, 265));
         paymaster.parsePaymasterAndData(data);
     }
 
@@ -339,7 +350,7 @@ contract TornadoRelayerPaymasterTest is Test {
         _handle(op);
         Vm.Log[] memory logs = vm.getRecordedLogs();
 
-        assertTrue(_sawEvent(logs, TornadoRelayerPaymaster.RefundFailed.selector), "RefundFailed expected");
+        assertTrue(_sawEvent(logs, TornadoRelayerPaymasterCore.RefundFailed.selector), "RefundFailed expected");
         (,, uint256 refund) = _findSponsored(logs);
         assertEq(refund, 0, "refund must be reported as 0 when it fails");
         assertEq(address(rejecter).balance, 0);
@@ -365,7 +376,7 @@ contract TornadoRelayerPaymasterTest is Test {
         calls[0] = _withdrawCall(address(tornado), keccak256("y"), fee);
         PackedUserOperation memory op = _baseOp(abi.encodeCall(BaseAccount.executeBatch, (calls)));
         vm.warp(1_000_000);
-        TornadoRelayerPaymaster.Terms memory t = _terms(fee, 0, address(0), address(0), 0);
+        TornadoRelayerPaymasterCore.Terms memory t = _terms(fee, 0, address(0), address(0), 0);
         t.validUntil = uint48(block.timestamp - 1);
         t.validAfter = 0;
         _attachPaymaster(op, t, relayerKey);
@@ -400,7 +411,7 @@ contract TornadoRelayerPaymasterTest is Test {
         assertEq(finalRecipient.balance, 0);
         assertEq(address(paymaster).balance, 0);
         assertLt(paymaster.getDeposit(), depositBefore);
-        assertTrue(_sawEvent(vm.getRecordedLogs(), TornadoRelayerPaymaster.SponsoredOpReverted.selector));
+        assertTrue(_sawEvent(vm.getRecordedLogs(), TornadoRelayerPaymasterCore.SponsoredOpReverted.selector));
     }
 
     function test_onlyOwnerAdmin() public {
@@ -413,7 +424,7 @@ contract TornadoRelayerPaymasterTest is Test {
         paymaster.setGasMarginBps(500);
         assertEq(paymaster.gasMarginBps(), 500);
 
-        vm.expectRevert(TornadoRelayerPaymaster.OnlySelf.selector);
+        vm.expectRevert(TornadoRelayerPaymasterCore.OnlySelf.selector);
         paymaster.refundToken(dai, finalRecipient, 1);
     }
 
@@ -439,7 +450,7 @@ contract TornadoRelayerPaymasterTest is Test {
         (,, uint256 refund) = _findSponsored(logs);
         assertGt(refund, 0, "master mode still refunds");
         assertGt(paymaster.getDeposit(), depositBefore, "fee re-deposited");
-        assertTrue(_sawEvent(logs, TornadoRelayerPaymaster.Relayed.selector));
+        assertTrue(_sawEvent(logs, TornadoRelayerPaymasterCore.Relayed.selector));
     }
 
     /// Worker mode: an existing relayer registers the paymaster as a worker. The proof names the
@@ -477,7 +488,7 @@ contract TornadoRelayerPaymasterTest is Test {
         assertLt(paymaster.getDeposit(), depositBefore, "deposit paid the gas");
         (,, uint256 refund) = _findSponsored(logs);
         assertEq(refund, 0);
-        assertFalse(_sawEvent(logs, TornadoRelayerPaymaster.FeeNotReceived.selector), "no refund promised, no warning");
+        assertFalse(_sawEvent(logs, TornadoRelayerPaymasterCore.FeeNotReceived.selector), "no refund promised, no warning");
     }
 
     /// Registry rule: a registered worker may only relay for its own master.
@@ -491,6 +502,7 @@ contract TornadoRelayerPaymasterTest is Test {
         vm.stopPrank();
         paymaster.setRouter(ITornadoRouter(address(router)));
 
+        _sponsor(address(account));
         vm.prank(address(account));
         vm.expectRevert("only relayer");
         paymaster.relayWithdraw(
@@ -499,11 +511,132 @@ contract TornadoRelayerPaymasterTest is Test {
         );
     }
 
+    /// What the EntryPoint does before execution: validate the op, which grants `sender` one relay.
+    function _sponsor(address sender) internal {
+        PackedUserOperation memory op;
+        op.sender = sender;
+        op.paymasterAndData = abi.encodePacked(_pmPrefix(), new bytes(213));
+        vm.prank(address(entryPoint));
+        paymaster.validatePaymasterUserOp(op, bytes32(0), 0);
+    }
+
+    /// Audit finding: without the allowance a note owner could route fee-0 withdrawals through the
+    /// paymaster (via a contract recipient) and burn the relayer's stake for free.
+    function test_relayWithdraw_requiresSponsorship() public {
+        _registerPaymasterAsMaster();
+        RecipientProxy proxy = new RecipientProxy();
+        vm.expectRevert(abi.encodeWithSelector(TornadoRelayerPaymasterCore.NotSponsored.selector, address(proxy)));
+        proxy.pull(paymaster, address(tornado), keccak256("free"), address(paymaster));
+        assertEq(registry.totalBurned(), 0);
+
+        // One validation = one relay, even for the legitimate sender.
+        _sponsor(address(account));
+        assertEq(paymaster.sponsorshipAllowance(address(account)), 1);
+        vm.startPrank(address(account));
+        paymaster.relayWithdraw(
+            ITornadoInstance(address(tornado)), hex"", bytes32(0), keccak256("one"), payable(address(account)),
+            payable(address(paymaster)), 0.01 ether
+        );
+        assertEq(paymaster.sponsorshipAllowance(address(account)), 0);
+        vm.expectRevert(abi.encodeWithSelector(TornadoRelayerPaymasterCore.NotSponsored.selector, address(account)));
+        paymaster.relayWithdraw(
+            ITornadoInstance(address(tornado)), hex"", bytes32(0), keccak256("two"), payable(address(account)),
+            payable(address(paymaster)), 0.01 ether
+        );
+        vm.stopPrank();
+        assertEq(registry.totalBurned(), BURN_PER_WITHDRAW);
+    }
+
+    /// The relayer's pre-signing dry run: reverts with the inner result and leaves no trace.
+    function test_simulateRelayWithdraw_dryRunRevertsWithResult() public {
+        _registerPaymasterAsMaster();
+        bytes memory ok = abi.encodeWithSelector(TornadoRelayerPaymasterCore.SimulationResult.selector, true, bytes(""));
+        vm.expectRevert(ok);
+        paymaster.simulateRelayWithdraw(
+            ITornadoInstance(address(tornado)), hex"", bytes32(0), keccak256("sim"), payable(address(account)),
+            payable(address(paymaster)), 0.01 ether
+        );
+        assertEq(registry.totalBurned(), 0, "dry run must not persist");
+        assertFalse(tornado.isSpent(keccak256("sim")));
+
+        // Failures are reported, not swallowed: wrong relayer for a registered master.
+        bytes memory inner = abi.encodeWithSignature("Error(string)", "only relayer");
+        vm.expectRevert(abi.encodeWithSelector(TornadoRelayerPaymasterCore.SimulationResult.selector, false, inner));
+        paymaster.simulateRelayWithdraw(
+            ITornadoInstance(address(tornado)), hex"", bytes32(0), keccak256("sim2"), payable(address(account)),
+            payable(makeAddr("someone")), 0.01 ether
+        );
+        // The inner step is not callable directly.
+        vm.expectRevert(TornadoRelayerPaymasterCore.OnlySelf.selector);
+        paymaster.relayWithdrawSimulated(
+            ITornadoInstance(address(tornado)), hex"", bytes32(0), keccak256("sim3"), payable(address(account)),
+            payable(address(paymaster)), 0.01 ether
+        );
+    }
+
+    /// EIP-7702: an existing relayer's worker EOA delegates to the shared implementation and *is* the
+    /// paymaster. The registry already knows it as a worker, so nothing changes on the DAO side.
+    function test_7702_workerEoaIsThePaymaster() public {
+        uint256 workerKey = 0x7702;
+        address worker = vm.addr(workerKey);
+        address master = makeAddr("existingRelayer");
+        torn.mint(master, MIN_STAKE);
+        vm.startPrank(master);
+        torn.approve(address(registry), MIN_STAKE);
+        registry.register("existing-relayer.eth", MIN_STAKE, new address[](0));
+        registry.registerWorker(master, worker); // the worker the relayer already runs today
+        vm.stopPrank();
+
+        TornadoRelayerPaymaster7702 impl =
+            new TornadoRelayerPaymaster7702(entryPoint, ITornadoRouter(address(router)), GAS_MARGIN_BPS, POST_OP_OVERHEAD);
+        vm.signAndAttachDelegation(address(impl), workerKey);
+        TornadoRelayerPaymaster7702 pm = TornadoRelayerPaymaster7702(payable(worker));
+        assertEq(pm.owner(), worker);
+        assertEq(pm.verifyingSigner(), worker);
+        assertEq(address(pm.router()), address(router));
+
+        // Setup the relayer software does at boot: self-calls from the worker key.
+        vm.deal(worker, 10 ether);
+        vm.startPrank(worker);
+        pm.addStake{value: 0.1 ether}(1 days);
+        pm.deposit{value: 2 ether}();
+        vm.stopPrank();
+
+        // A sponsored op: proof names the master, callData calls worker.relayWithdraw.
+        uint256 fee = 0.02 ether;
+        BaseAccount.Call[] memory calls = new BaseAccount.Call[](2);
+        calls[0] = BaseAccount.Call({
+            target: worker,
+            value: 0,
+            data: abi.encodeCall(
+                TornadoRelayerPaymasterCore.relayWithdraw,
+                (ITornadoInstance(address(tornado)), hex"", bytes32(0), keccak256("7702"), payable(address(account)), payable(master), fee)
+            )
+        });
+        calls[1] = BaseAccount.Call({target: finalRecipient, value: DENOMINATION - fee, data: ""});
+        PackedUserOperation memory op = _baseOp(abi.encodeCall(BaseAccount.executeBatch, (calls)));
+        TornadoRelayerPaymasterCore.Terms memory t = _terms(fee, 0, address(0), address(0), 0);
+        op.paymasterAndData = abi.encodePacked(worker, uint128(100_000), uint128(80_000), t.validUntil, t.validAfter, t.fee, t.serviceFee, t.refundTo, t.feeToken, t.tokenPerEth, new bytes(65));
+        bytes32 h = pm.getHash(op, t);
+        (uint8 v, bytes32 r, bytes32 s_) = vm.sign(workerKey, MessageHashUtils.toEthSignedMessageHash(h));
+        op.paymasterAndData = abi.encodePacked(worker, uint128(100_000), uint128(80_000), t.validUntil, t.validAfter, t.fee, t.serviceFee, t.refundTo, t.feeToken, t.tokenPerEth, abi.encodePacked(r, s_, v));
+        _signAccount(op);
+
+        uint256 depositBefore = pm.getDeposit();
+        _handle(op);
+
+        assertEq(master.balance, fee, "fee to the existing relayer's master");
+        assertEq(finalRecipient.balance, DENOMINATION - fee);
+        assertEq(registry.getRelayerBalance(master), MIN_STAKE - BURN_PER_WITHDRAW, "master stake burned");
+        assertLt(pm.getDeposit(), depositBefore, "worker's deposit paid the gas");
+        assertEq(worker.balance, 10 ether - 0.1 ether - 2 ether, "worker EOA balance untouched otherwise");
+    }
+
     /// Only the note's recipient may trigger the relay (no one else can burn the relayer's stake).
     function test_relayWithdraw_onlyRecipient() public {
         _registerPaymasterAsMaster();
         vm.prank(makeAddr("stranger"));
-        vm.expectRevert(TornadoRelayerPaymaster.OnlyRecipient.selector);
+        vm.expectRevert(TornadoRelayerPaymasterCore.OnlyRecipient.selector);
         paymaster.relayWithdraw(
             ITornadoInstance(address(tornado)), hex"", bytes32(0), keccak256("q"), payable(address(account)),
             payable(address(paymaster)), 0.01 ether
@@ -521,7 +654,7 @@ contract TornadoRelayerPaymasterTest is Test {
         assertEq(registry.totalBurned(), 0);
         bool sawDirect;
         for (uint256 i = 0; i < logs.length; i++) {
-            if (logs[i].emitter == address(paymaster) && logs[i].topics[0] == TornadoRelayerPaymaster.Relayed.selector) {
+            if (logs[i].emitter == address(paymaster) && logs[i].topics[0] == TornadoRelayerPaymasterCore.Relayed.selector) {
                 (, bool viaRouter) = abi.decode(logs[i].data, (uint256, bool));
                 sawDirect = !viaRouter;
             }
@@ -557,7 +690,7 @@ contract TornadoRelayerPaymasterTest is Test {
 
         vm.expectRevert(
             abi.encodeWithSelector(
-                TornadoRelayerPaymaster.AdminCallFailed.selector, abi.encodeWithSignature("Error(string)", "!registered")
+                TornadoRelayerPaymasterCore.AdminCallFailed.selector, abi.encodeWithSignature("Error(string)", "!registered")
             )
         );
         paymaster.adminCall(
@@ -573,7 +706,7 @@ contract TornadoRelayerPaymasterTest is Test {
         returns (address feeToken, uint256 actualGasCost, uint256 refund)
     {
         for (uint256 i = 0; i < logs.length; i++) {
-            if (logs[i].emitter == address(paymaster) && logs[i].topics[0] == TornadoRelayerPaymaster.Sponsored.selector)
+            if (logs[i].emitter == address(paymaster) && logs[i].topics[0] == TornadoRelayerPaymasterCore.Sponsored.selector)
             {
                 feeToken = address(uint160(uint256(logs[i].topics[3])));
                 (, actualGasCost, refund) = abi.decode(logs[i].data, (uint256, uint256, uint256));
