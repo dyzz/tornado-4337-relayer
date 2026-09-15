@@ -50,7 +50,8 @@ import {ITornadoRouter, IRelayerRegistry} from "./interfaces/ITornadoRouter.sol"
 ///   [128:148] address refundTo     (receives fee - gas - serviceFee; address(0) = no refund)
 ///   [148:168] address feeToken     (address(0) = ETH instance)
 ///   [168:200] uint256 tokenPerEth  (feeToken units per 1e18 wei; ignored for ETH)
-///   [200:265] bytes   signature    (65 bytes, EIP-191 over getHash(...))
+///   [200:232] bytes32 withdrawalHash  (withdrawalHash(...) of the one relayWithdraw the relayer approved)
+///   [232:297] bytes   signature    (65 bytes, EIP-191 over getHash(...))
 abstract contract TornadoRelayerPaymasterCore is IPaymaster {
     using SafeERC20 for IERC20;
     using UserOperationLib for PackedUserOperation;
@@ -63,6 +64,8 @@ abstract contract TornadoRelayerPaymasterCore is IPaymaster {
         address refundTo;
         address feeToken;
         uint256 tokenPerEth;
+        /// @dev `withdrawalHash(...)` of the exact relayWithdraw call this sponsorship is for.
+        bytes32 withdrawalHash;
     }
 
     uint256 private constant PAYMASTER_VALIDATION_GAS_OFFSET = UserOperationLib.PAYMASTER_VALIDATION_GAS_OFFSET; // 20
@@ -74,14 +77,15 @@ abstract contract TornadoRelayerPaymasterCore is IPaymaster {
     uint256 private constant REFUND_TO_OFFSET = SERVICE_FEE_OFFSET + 32; // 128
     uint256 private constant FEE_TOKEN_OFFSET = REFUND_TO_OFFSET + 20; // 148
     uint256 private constant TOKEN_PER_ETH_OFFSET = FEE_TOKEN_OFFSET + 20; // 168
-    uint256 private constant SIGNATURE_OFFSET = TOKEN_PER_ETH_OFFSET + 32; // 200
-    uint256 public constant PAYMASTER_AND_DATA_LENGTH = SIGNATURE_OFFSET + 65; // 265
+    uint256 private constant WITHDRAWAL_HASH_OFFSET = TOKEN_PER_ETH_OFFSET + 32; // 200
+    uint256 private constant SIGNATURE_OFFSET = WITHDRAWAL_HASH_OFFSET + 32; // 232
+    uint256 public constant PAYMASTER_AND_DATA_LENGTH = SIGNATURE_OFFSET + 65; // 297
 
     uint256 public constant BPS = 10_000;
     uint256 public constant RATE_SCALE = 1e18;
     /// @dev gas forwarded to `refundTo` for ETH refunds; enough for an EOA / Simple7702Account receive().
     uint256 public constant REFUND_GAS = 30_000;
-    /// @dev transient-storage namespaces: per-sender sponsorship allowance, and the fee `relayWithdraw`
+    /// @dev transient-storage namespaces: per-(sender, withdrawal) sponsorship, and the fee `relayWithdraw`
     /// actually received for that sender (ETH and pool token), read back by postOp.
     bytes32 private constant SPONSORSHIP_SLOT_SEED = keccak256("tornado-4337-relayer.sponsorship");
     bytes32 private constant RECEIVED_ETH_SLOT_SEED = keccak256("tornado-4337-relayer.received.eth");
@@ -113,8 +117,8 @@ abstract contract TornadoRelayerPaymasterCore is IPaymaster {
     error OnlyOwner();
     error OnlyEntryPoint();
     error OnlyRecipient();
-    /// @dev `relayWithdraw` called outside an operation this paymaster validated for `msg.sender`.
-    error NotSponsored(address sender);
+    /// @dev `relayWithdraw` called with arguments the paymaster did not approve for `msg.sender` in this operation.
+    error NotSponsored(address sender, bytes32 withdrawalHash);
     error AdminCallFailed(bytes result);
     /// @dev Always thrown by `simulateRelayWithdraw`: `success` and the inner return / revert data.
     error SimulationResult(bool success, bytes result);
@@ -215,8 +219,9 @@ abstract contract TornadoRelayerPaymasterCore is IPaymaster {
 
     /// @notice Execute a Tornado withdrawal as the registered relayer. Called by the userOp sender
     /// (the note's recipient) during the execution phase of an operation this paymaster validated.
-    /// @dev Only the recipient may trigger it and only with a sponsorship allowance, so neither a
-    /// third party nor the note owner can burn the relayer's stake without the relayer's signature.
+    /// @dev Only the recipient may trigger it, and only with exactly the arguments the relayer signed
+    /// (`withdrawalHash`), so neither a third party, nor the note owner, nor a sender account with
+    /// unusual execution semantics can burn the relayer's stake for anything the relayer did not approve.
     /// `refund` is always 0 (the sender is a contract account that needs no gas top-up).
     function relayWithdraw(
         ITornadoInstance pool,
@@ -232,8 +237,9 @@ abstract contract TornadoRelayerPaymasterCore is IPaymaster {
     }
 
     /// @notice Dry-run of `relayWithdraw` for the relayer's pre-signing check (`eth_call` only): grants
-    /// `recipient` a sponsorship, runs the relay, and always reverts with `SimulationResult`, so nothing
-    /// persists. Proof, root, nullifier, registry state and the router path are all exercised.
+    /// `recipient` the sponsorship for exactly these arguments, runs the relay, and always reverts with
+    /// `SimulationResult`, so nothing persists. Proof, root, nullifier, registry state and the router
+    /// path are all exercised.
     function simulateRelayWithdraw(
         ITornadoInstance pool,
         bytes calldata proof,
@@ -243,7 +249,7 @@ abstract contract TornadoRelayerPaymasterCore is IPaymaster {
         address payable relayer,
         uint256 fee
     ) external {
-        _grantSponsorship(recipient);
+        _grantSponsorship(recipient, withdrawalHash(pool, proof, root, nullifierHash, recipient, relayer, fee));
         (bool ok, bytes memory data) = address(this).call(
             abi.encodeCall(this.relayWithdrawSimulated, (pool, proof, root, nullifierHash, recipient, relayer, fee))
         );
@@ -273,7 +279,7 @@ abstract contract TornadoRelayerPaymasterCore is IPaymaster {
         address payable relayer,
         uint256 fee
     ) internal {
-        _consumeSponsorship(recipient);
+        _consumeSponsorship(recipient, withdrawalHash(pool, proof, root, nullifierHash, recipient, relayer, fee));
 
         // Measure what this withdrawal pays us (master mode: the fee; worker mode: nothing), so postOp
         // settles exactly that and never touches ETH or tokens the address held beforehand — under
@@ -324,32 +330,45 @@ abstract contract TornadoRelayerPaymasterCore is IPaymaster {
         }
     }
 
-    /// @notice Sponsorship allowances currently open for `sender` (transient; non-zero only inside a bundle).
-    function sponsorshipAllowance(address sender) public view returns (uint256 allowance) {
-        bytes32 slot = _sponsorshipSlot(sender);
+    /// @notice Identity of a relayWithdraw call — what the relayer signs into `Terms.withdrawalHash`.
+    function withdrawalHash(
+        ITornadoInstance pool,
+        bytes calldata proof,
+        bytes32 root,
+        bytes32 nullifierHash,
+        address recipient,
+        address relayer,
+        uint256 fee
+    ) public pure returns (bytes32) {
+        return keccak256(abi.encode(pool, keccak256(proof), root, nullifierHash, recipient, relayer, fee));
+    }
+
+    /// @notice Sponsorships currently open for (sender, withdrawal) (transient; non-zero only inside a bundle).
+    function sponsorshipAllowance(address sender, bytes32 withdrawal) public view returns (uint256 allowance) {
+        bytes32 slot = _sponsorshipSlot(sender, withdrawal);
         assembly ("memory-safe") {
             allowance := tload(slot)
         }
     }
 
-    function _sponsorshipSlot(address sender) internal pure returns (bytes32) {
-        return keccak256(abi.encode(SPONSORSHIP_SLOT_SEED, sender));
+    function _sponsorshipSlot(address sender, bytes32 withdrawal) internal pure returns (bytes32) {
+        return keccak256(abi.encode(SPONSORSHIP_SLOT_SEED, sender, withdrawal));
     }
 
-    function _grantSponsorship(address sender) internal {
-        bytes32 slot = _sponsorshipSlot(sender);
+    function _grantSponsorship(address sender, bytes32 withdrawal) internal {
+        bytes32 slot = _sponsorshipSlot(sender, withdrawal);
         assembly ("memory-safe") {
             tstore(slot, add(tload(slot), 1))
         }
     }
 
-    function _consumeSponsorship(address sender) internal {
-        bytes32 slot = _sponsorshipSlot(sender);
+    function _consumeSponsorship(address sender, bytes32 withdrawal) internal {
+        bytes32 slot = _sponsorshipSlot(sender, withdrawal);
         uint256 allowance;
         assembly ("memory-safe") {
             allowance := tload(slot)
         }
-        if (allowance == 0) revert NotSponsored(sender);
+        if (allowance == 0) revert NotSponsored(sender, withdrawal);
         assembly ("memory-safe") {
             tstore(slot, sub(allowance, 1))
         }
@@ -370,7 +389,8 @@ abstract contract TornadoRelayerPaymasterCore is IPaymaster {
                 terms.serviceFee,
                 terms.refundTo,
                 terms.feeToken,
-                terms.tokenPerEth
+                terms.tokenPerEth,
+                terms.withdrawalHash
             )
         );
     }
@@ -405,7 +425,8 @@ abstract contract TornadoRelayerPaymasterCore is IPaymaster {
         terms.serviceFee = uint256(bytes32(paymasterAndData[SERVICE_FEE_OFFSET:REFUND_TO_OFFSET]));
         terms.refundTo = address(bytes20(paymasterAndData[REFUND_TO_OFFSET:FEE_TOKEN_OFFSET]));
         terms.feeToken = address(bytes20(paymasterAndData[FEE_TOKEN_OFFSET:TOKEN_PER_ETH_OFFSET]));
-        terms.tokenPerEth = uint256(bytes32(paymasterAndData[TOKEN_PER_ETH_OFFSET:SIGNATURE_OFFSET]));
+        terms.tokenPerEth = uint256(bytes32(paymasterAndData[TOKEN_PER_ETH_OFFSET:WITHDRAWAL_HASH_OFFSET]));
+        terms.withdrawalHash = bytes32(paymasterAndData[WITHDRAWAL_HASH_OFFSET:SIGNATURE_OFFSET]);
         signature = paymasterAndData[SIGNATURE_OFFSET:];
     }
 
@@ -423,10 +444,10 @@ abstract contract TornadoRelayerPaymasterCore is IPaymaster {
         (address recovered, ECDSA.RecoverError err,) = ECDSA.tryRecover(digest, sig);
         bool sigFailed = err != ECDSA.RecoverError.NoError || recovered != verifyingSigner();
 
-        // One relay per validated operation. Granted regardless of the signature so that bundler gas
-        // estimation (dummy signature) exercises the execution path; an invalid signature never
-        // reaches execution (AA34).
-        _grantSponsorship(userOp.sender);
+        // Exactly the withdrawal the relayer approved may be relayed in this operation. Granted
+        // regardless of the signature so that bundler gas estimation (dummy signature) exercises the
+        // execution path; an invalid signature never reaches execution (AA34).
+        _grantSponsorship(userOp.sender, terms.withdrawalHash);
 
         // The context is returned even when the signature is invalid so estimation exercises postOp.
         context = abi.encode(userOpHash, userOp.sender, terms);

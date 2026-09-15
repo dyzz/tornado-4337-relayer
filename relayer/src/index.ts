@@ -1,4 +1,6 @@
-export { RelayerService } from './service.js';
+export { RelayerService, MemorySponsorshipStore } from './service.js';
+export type { SponsorshipStore, SponsoredNote } from './service.js';
+export { FileSponsorshipStore } from './store.js';
 export * from './price.js';
 export type {
   RelayerConfig,

@@ -140,9 +140,23 @@ contract TornadoRelayerPaymasterTest is Test {
     }
 
     function _encode(TornadoRelayerPaymasterCore.Terms memory t, bytes memory sig) internal view returns (bytes memory) {
-        return abi.encodePacked(
-            _pmPrefix(), t.validUntil, t.validAfter, t.fee, t.serviceFee, t.refundTo, t.feeToken, t.tokenPerEth, sig
-        );
+        return _encodeFor(address(paymaster), t, sig);
+    }
+
+    /// paymasterAndData for an arbitrary paymaster address (the 7702 test's worker EOA).
+    function _encodeFor(address pm, TornadoRelayerPaymasterCore.Terms memory t, bytes memory sig)
+        internal
+        pure
+        returns (bytes memory)
+    {
+        bytes memory head = abi.encodePacked(pm, uint128(100_000), uint128(80_000), t.validUntil, t.validAfter, t.fee, t.serviceFee);
+        bytes memory tail = abi.encodePacked(t.refundTo, t.feeToken, t.tokenPerEth, t.withdrawalHash);
+        return bytes.concat(head, tail, sig);
+    }
+
+    /// Hash of the relayWithdraw call `_relayCall` builds (empty proof, zero root).
+    function _wh(address instance, bytes32 nullifierHash, address relayer, uint256 fee) internal view returns (bytes32) {
+        return keccak256(abi.encode(ITornadoInstance(instance), keccak256(hex""), bytes32(0), nullifierHash, address(account), relayer, fee));
     }
 
     function _attachPaymaster(PackedUserOperation memory op, TornadoRelayerPaymasterCore.Terms memory t, uint256 signerKey)
@@ -160,6 +174,14 @@ contract TornadoRelayerPaymasterTest is Test {
         view
         returns (TornadoRelayerPaymasterCore.Terms memory)
     {
+        return _termsFor(fee, serviceFee, refundTo, feeToken, rate, bytes32(0));
+    }
+
+    function _termsFor(uint256 fee, uint256 serviceFee, address refundTo, address feeToken, uint256 rate, bytes32 wh)
+        internal
+        view
+        returns (TornadoRelayerPaymasterCore.Terms memory)
+    {
         return TornadoRelayerPaymasterCore.Terms({
             validUntil: uint48(block.timestamp + 300),
             validAfter: uint48(block.timestamp > 0 ? block.timestamp - 1 : 0),
@@ -167,7 +189,8 @@ contract TornadoRelayerPaymasterTest is Test {
             serviceFee: serviceFee,
             refundTo: refundTo,
             feeToken: feeToken,
-            tokenPerEth: rate
+            tokenPerEth: rate,
+            withdrawalHash: wh
         });
     }
 
@@ -189,11 +212,13 @@ contract TornadoRelayerPaymasterTest is Test {
         view
         returns (PackedUserOperation memory op)
     {
+        bytes32 nh = keccak256(abi.encode("eth", fee, serviceFee, refundTo));
         BaseAccount.Call[] memory calls = new BaseAccount.Call[](2);
-        calls[0] = _withdrawCall(address(tornado), keccak256(abi.encode("eth", fee, serviceFee, refundTo)), fee);
+        calls[0] = _withdrawCall(address(tornado), nh, fee);
         calls[1] = BaseAccount.Call({target: finalRecipient, value: DENOMINATION - fee, data: ""});
         op = _baseOp(abi.encodeCall(BaseAccount.executeBatch, (calls)));
-        _attachPaymaster(op, _terms(fee, serviceFee, refundTo, address(0), 0), relayerKey);
+        bytes32 wh = _wh(address(tornado), nh, address(paymaster), fee);
+        _attachPaymaster(op, _termsFor(fee, serviceFee, refundTo, address(0), 0, wh), relayerKey);
         _signAccount(op);
     }
 
@@ -203,28 +228,30 @@ contract TornadoRelayerPaymasterTest is Test {
         view
         returns (PackedUserOperation memory op)
     {
+        bytes32 nh = keccak256(abi.encode("dai", fee, serviceFee, refundTo));
         BaseAccount.Call[] memory calls = new BaseAccount.Call[](2);
-        calls[0] = _withdrawCall(address(tornadoDai), keccak256(abi.encode("dai", fee, serviceFee, refundTo)), fee);
+        calls[0] = _withdrawCall(address(tornadoDai), nh, fee);
         calls[1] = BaseAccount.Call({
             target: address(dai),
             value: 0,
             data: abi.encodeCall(IERC20.transfer, (finalRecipient, TOKEN_DENOMINATION - fee))
         });
         op = _baseOp(abi.encodeCall(BaseAccount.executeBatch, (calls)));
-        _attachPaymaster(op, _terms(fee, serviceFee, refundTo, address(dai), TOKEN_PER_ETH), relayerKey);
+        bytes32 wh = _wh(address(tornadoDai), nh, address(paymaster), fee);
+        _attachPaymaster(op, _termsFor(fee, serviceFee, refundTo, address(dai), TOKEN_PER_ETH, wh), relayerKey);
         _signAccount(op);
     }
 
     // ------------------------------------------------------------ tests
 
     function test_layoutConstants() public view {
-        assertEq(paymaster.PAYMASTER_AND_DATA_LENGTH(), 265);
+        assertEq(paymaster.PAYMASTER_AND_DATA_LENGTH(), 297);
     }
 
     function test_parsePaymasterAndData_roundTrip() public view {
         bytes memory sig = new bytes(65);
         sig[0] = 0xAA;
-        TornadoRelayerPaymasterCore.Terms memory t = _terms(7 ether, 0.01 ether, finalRecipient, address(dai), 123456);
+        TornadoRelayerPaymasterCore.Terms memory t = _termsFor(7 ether, 0.01 ether, finalRecipient, address(dai), 123456, keccak256("wh"));
         t.validUntil = 1234;
         t.validAfter = 56;
         (TornadoRelayerPaymasterCore.Terms memory p, bytes memory s) = paymaster.parsePaymasterAndData(_encode(t, sig));
@@ -235,13 +262,14 @@ contract TornadoRelayerPaymasterTest is Test {
         assertEq(p.refundTo, finalRecipient);
         assertEq(p.feeToken, address(dai));
         assertEq(p.tokenPerEth, 123456);
+        assertEq(p.withdrawalHash, keccak256("wh"));
         assertEq(s.length, 65);
         assertEq(uint8(s[0]), 0xAA);
     }
 
     function test_parsePaymasterAndData_rejectsWrongLength() public {
         bytes memory data = abi.encodePacked(_pmPrefix(), uint48(1), uint48(0));
-        vm.expectRevert(abi.encodeWithSelector(TornadoRelayerPaymasterCore.InvalidPaymasterDataLength.selector, 64, 265));
+        vm.expectRevert(abi.encodeWithSelector(TornadoRelayerPaymasterCore.InvalidPaymasterDataLength.selector, 64, 297));
         paymaster.parsePaymasterAndData(data);
     }
 
@@ -472,7 +500,8 @@ contract TornadoRelayerPaymasterTest is Test {
         calls[0] = _relayCall(address(tornado), keccak256("worker"), master, fee);
         calls[1] = BaseAccount.Call({target: finalRecipient, value: DENOMINATION - fee, data: ""});
         PackedUserOperation memory op = _baseOp(abi.encodeCall(BaseAccount.executeBatch, (calls)));
-        _attachPaymaster(op, _terms(fee, 0, address(0), address(0), 0), relayerKey); // refundTo = 0
+        bytes32 wh = _wh(address(tornado), keccak256("worker"), master, fee);
+        _attachPaymaster(op, _termsFor(fee, 0, address(0), address(0), 0, wh), relayerKey); // refundTo = 0
         _signAccount(op);
 
         uint256 depositBefore = paymaster.getDeposit();
@@ -502,7 +531,7 @@ contract TornadoRelayerPaymasterTest is Test {
         vm.stopPrank();
         paymaster.setRouter(ITornadoRouter(address(router)));
 
-        _sponsor(address(account));
+        _sponsor(address(account), _wh(address(tornado), keccak256("z"), address(paymaster), 0.01 ether));
         vm.prank(address(account));
         vm.expectRevert("only relayer");
         paymaster.relayWithdraw(
@@ -511,11 +540,11 @@ contract TornadoRelayerPaymasterTest is Test {
         );
     }
 
-    /// What the EntryPoint does before execution: validate the op, which grants `sender` one relay.
-    function _sponsor(address sender) internal {
+    /// What the EntryPoint does before execution: validate the op, which grants `sender` exactly `wh`.
+    function _sponsor(address sender, bytes32 wh) internal {
         PackedUserOperation memory op;
         op.sender = sender;
-        op.paymasterAndData = abi.encodePacked(_pmPrefix(), new bytes(213));
+        op.paymasterAndData = abi.encodePacked(_pmPrefix(), new bytes(148), wh, new bytes(65));
         vm.prank(address(entryPoint));
         paymaster.validatePaymasterUserOp(op, bytes32(0), 0);
     }
@@ -525,22 +554,37 @@ contract TornadoRelayerPaymasterTest is Test {
     function test_relayWithdraw_requiresSponsorship() public {
         _registerPaymasterAsMaster();
         RecipientProxy proxy = new RecipientProxy();
-        vm.expectRevert(abi.encodeWithSelector(TornadoRelayerPaymasterCore.NotSponsored.selector, address(proxy)));
+        bytes32 freeHash = keccak256(abi.encode(ITornadoInstance(address(tornado)), keccak256(hex""), bytes32(0), keccak256("free"), address(proxy), address(paymaster), uint256(0)));
+        vm.expectRevert(abi.encodeWithSelector(TornadoRelayerPaymasterCore.NotSponsored.selector, address(proxy), freeHash));
         proxy.pull(paymaster, address(tornado), keccak256("free"), address(paymaster));
         assertEq(registry.totalBurned(), 0);
 
-        // One validation = one relay, even for the legitimate sender.
-        _sponsor(address(account));
-        assertEq(paymaster.sponsorshipAllowance(address(account)), 1);
+        // One validation = exactly one approved relay, even for the legitimate sender: a different
+        // note (or a different fee / relayer) than the one the relayer signed is refused.
+        bytes32 approved = _wh(address(tornado), keccak256("one"), address(paymaster), 0.01 ether);
+        _sponsor(address(account), approved);
+        assertEq(paymaster.sponsorshipAllowance(address(account), approved), 1);
         vm.startPrank(address(account));
+        bytes32 other = _wh(address(tornado), keccak256("two"), address(paymaster), 0.01 ether);
+        vm.expectRevert(abi.encodeWithSelector(TornadoRelayerPaymasterCore.NotSponsored.selector, address(account), other));
+        paymaster.relayWithdraw(
+            ITornadoInstance(address(tornado)), hex"", bytes32(0), keccak256("two"), payable(address(account)),
+            payable(address(paymaster)), 0.01 ether
+        );
+        bytes32 cheaper = _wh(address(tornado), keccak256("one"), address(paymaster), 0);
+        vm.expectRevert(abi.encodeWithSelector(TornadoRelayerPaymasterCore.NotSponsored.selector, address(account), cheaper));
+        paymaster.relayWithdraw(
+            ITornadoInstance(address(tornado)), hex"", bytes32(0), keccak256("one"), payable(address(account)),
+            payable(address(paymaster)), 0
+        );
         paymaster.relayWithdraw(
             ITornadoInstance(address(tornado)), hex"", bytes32(0), keccak256("one"), payable(address(account)),
             payable(address(paymaster)), 0.01 ether
         );
-        assertEq(paymaster.sponsorshipAllowance(address(account)), 0);
-        vm.expectRevert(abi.encodeWithSelector(TornadoRelayerPaymasterCore.NotSponsored.selector, address(account)));
+        assertEq(paymaster.sponsorshipAllowance(address(account), approved), 0);
+        vm.expectRevert(abi.encodeWithSelector(TornadoRelayerPaymasterCore.NotSponsored.selector, address(account), approved));
         paymaster.relayWithdraw(
-            ITornadoInstance(address(tornado)), hex"", bytes32(0), keccak256("two"), payable(address(account)),
+            ITornadoInstance(address(tornado)), hex"", bytes32(0), keccak256("one"), payable(address(account)),
             payable(address(paymaster)), 0.01 ether
         );
         vm.stopPrank();
@@ -615,11 +659,12 @@ contract TornadoRelayerPaymasterTest is Test {
         });
         calls[1] = BaseAccount.Call({target: finalRecipient, value: DENOMINATION - fee, data: ""});
         PackedUserOperation memory op = _baseOp(abi.encodeCall(BaseAccount.executeBatch, (calls)));
-        TornadoRelayerPaymasterCore.Terms memory t = _terms(fee, 0, address(0), address(0), 0);
-        op.paymasterAndData = abi.encodePacked(worker, uint128(100_000), uint128(80_000), t.validUntil, t.validAfter, t.fee, t.serviceFee, t.refundTo, t.feeToken, t.tokenPerEth, new bytes(65));
+        TornadoRelayerPaymasterCore.Terms memory t =
+            _termsFor(fee, 0, address(0), address(0), 0, _wh(address(tornado), keccak256("7702"), master, fee));
+        op.paymasterAndData = _encodeFor(worker, t, new bytes(65));
         bytes32 h = pm.getHash(op, t);
         (uint8 v, bytes32 r, bytes32 s_) = vm.sign(workerKey, MessageHashUtils.toEthSignedMessageHash(h));
-        op.paymasterAndData = abi.encodePacked(worker, uint128(100_000), uint128(80_000), t.validUntil, t.validAfter, t.fee, t.serviceFee, t.refundTo, t.feeToken, t.tokenPerEth, abi.encodePacked(r, s_, v));
+        op.paymasterAndData = _encodeFor(worker, t, abi.encodePacked(r, s_, v));
         _signAccount(op);
 
         uint256 depositBefore = pm.getDeposit();

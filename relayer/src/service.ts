@@ -34,6 +34,7 @@ import {
   paymasterHash,
   q,
   readGas,
+  withdrawalHash,
   type FeeTerms,
   type RpcUserOperation,
   type UserOpGas,
@@ -58,6 +59,14 @@ export interface RelayerConfig {
   rewardAccount?: Address;
   /** Start even if the paymaster is not registered in the RelayerRegistry the router uses. */
   allowUnregistered?: boolean;
+  /** Where live sponsorships are kept (default: in memory). */
+  sponsorshipStore?: SponsorshipStore;
+  /**
+   * Optional defence in depth: only sponsor senders whose code (or pending EIP-7702 delegation) is one
+   * of these implementations, e.g. Simple7702Account v0.8. The sponsorship is bound on-chain to the exact
+   * withdrawal regardless; this only avoids paying gas for accounts that would revert anyway.
+   */
+  allowedSenderImplementations?: Address[];
   /** Tornado instances this relayer sponsors (ETH or ERC-20; detected on boot). */
   instances: Address[];
   /** Token pricing for ERC-20 instances. Required when any instance is an ERC-20 pool. */
@@ -144,6 +153,7 @@ export interface PaymasterDataResult {
     refundTo: Address;
     feeToken: Address;
     tokenPerEth: Hex;
+    withdrawalHash: Hex;
     minFee: Hex;
   };
 }
@@ -171,10 +181,34 @@ export interface RegistryInfo {
   burnPerWithdraw: Record<Address, bigint>;
 }
 
-interface SponsoredNote {
+export interface SponsoredNote {
   validUntil: number;
   sender: Address;
   nonce: bigint;
+}
+
+/**
+ * Live sponsorships by nullifier: one signature per note at a time. The default is in-memory; the
+ * file store survives restarts. Neither is safe for several relayer instances sharing a key — that
+ * needs a shared store behind this interface (a database row with the nullifier as key).
+ */
+export interface SponsorshipStore {
+  get(nullifierHash: Hex): SponsoredNote | undefined;
+  set(nullifierHash: Hex, note: SponsoredNote): void;
+  prune(now: number): void;
+}
+
+export class MemorySponsorshipStore implements SponsorshipStore {
+  protected readonly notes = new Map<Hex, SponsoredNote>();
+  get(k: Hex) {
+    return this.notes.get(k);
+  }
+  set(k: Hex, v: SponsoredNote) {
+    this.notes.set(k, v);
+  }
+  prune(now: number) {
+    for (const [k, v] of this.notes) if (v.validUntil < now) this.notes.delete(k);
+  }
 }
 
 export interface Logger {
@@ -194,7 +228,7 @@ const consoleLogger: Logger = {
  */
 export class RelayerService {
   readonly signer: PrivateKeyAccount;
-  private readonly sponsored = new Map<Hex, SponsoredNote>();
+  private readonly sponsored: SponsorshipStore;
 
   readonly rewardAccount: Address;
 
@@ -208,6 +242,7 @@ export class RelayerService {
   ) {
     this.signer = privateKeyToAccount(config.signerKey);
     this.rewardAccount = getAddress(config.rewardAccount ?? config.paymaster);
+    this.sponsored = config.sponsorshipStore ?? new MemorySponsorshipStore();
   }
 
   /** Worker mode: the fee is paid to the master EOA, so nothing can be refunded by the paymaster. */
@@ -457,11 +492,13 @@ export class RelayerService {
     let fee = 0n;
     let feeToken: Address = zeroAddress;
     let refundTo: Address = this.refunds ? (context.refundTo ?? op.sender) : zeroAddress;
+    let approved: Hex = `0x${'00'.repeat(32)}`;
     try {
       const w = findSponsoringWithdraw(decodeAccountCalls(op.callData), this.rules(op.sender));
       fee = w.fee;
       feeToken = this.instance(w.instance).token;
       if (this.refunds) refundTo = context.refundTo ?? w.recipient;
+      approved = withdrawalHash(w);
     } catch {
       // Estimation may run before the withdraw call is final; a zero fee still exercises postOp.
     }
@@ -474,6 +511,7 @@ export class RelayerService {
       refundTo,
       feeToken,
       tokenPerEth: 0n,
+      withdrawalHash: approved,
     };
     return {
       paymaster: this.config.paymaster,
@@ -522,20 +560,23 @@ export class RelayerService {
     }
 
     // 3. One live sponsorship per note: a second signature could only ever burn our gas.
-    this.pruneSponsored();
+    this.sponsored.prune(Math.floor(Date.now() / 1000));
     const live = this.sponsored.get(w.nullifierHash);
     const nonce = q(op.nonce, 'nonce');
     if (live && !(isAddressEqual(live.sender, op.sender) && live.nonce === nonce)) {
       throw new ValidationError(`note already sponsored; signature valid until ${live.validUntil}`, -32003);
     }
 
-    // 4. On-chain sanity: the proof must verify against the instance right now.
+    // 4. Optional sender allowlist (defence in depth; the on-chain binding does not depend on it).
+    await this.assertSenderAllowed(op);
+
+    // 5. On-chain sanity: the proof must verify against the instance right now.
     await this.assertWithdrawSimulates(w);
 
-    // 5. Optional full simulation on the bundler (validation + execution incl. tail calls).
+    // 6. Optional full simulation on the bundler (validation + execution incl. tail calls).
     if (this.config.simulateWithBundler) await this.assertBundlerSimulates(op, context);
 
-    // 6. Sign.
+    // 7. Sign.
     const now = Math.floor(Date.now() / 1000);
     const terms: FeeTerms = {
       validUntil: now + this.config.signatureTtlSec,
@@ -546,6 +587,8 @@ export class RelayerService {
       refundTo: this.refunds ? (context.refundTo ?? w.recipient) : zeroAddress,
       feeToken: info.token,
       tokenPerEth,
+      // Binds the sponsorship to exactly this relayWithdraw call, whatever the sender account executes.
+      withdrawalHash: withdrawalHash(w),
     };
     const hash = paymasterHash({ op, chainId: this.config.chainId, paymaster: this.config.paymaster, terms });
     const signature = await this.signer.signMessage({ message: { raw: hash } });
@@ -575,6 +618,7 @@ export class RelayerService {
         refundTo: terms.refundTo,
         feeToken: terms.feeToken,
         tokenPerEth: toHex(terms.tokenPerEth),
+        withdrawalHash: terms.withdrawalHash,
         minFee: toHex(minFee),
       },
     };
@@ -679,9 +723,21 @@ export class RelayerService {
     return body.result;
   }
 
-  private pruneSponsored() {
-    const now = Math.floor(Date.now() / 1000);
-    for (const [k, v] of this.sponsored) if (v.validUntil < now) this.sponsored.delete(k);
+  /** Sender code must be one of the allowed implementations (deployed code or the op's pending 7702 delegation). */
+  private async assertSenderAllowed(op: RpcUserOperation) {
+    const allowed = this.config.allowedSenderImplementations;
+    if (!allowed || allowed.length === 0) return;
+    const code = ((await this.client.getCode({ address: op.sender })) ?? '0x').toLowerCase();
+    let implementation: Address | undefined;
+    if (code.startsWith('0xef0100') && code.length === 2 + 46) implementation = getAddress(`0x${code.slice(8)}`);
+    else if (code === '0x') {
+      const auth = (op as { eip7702Auth?: { address?: Address; contractAddress?: Address } }).eip7702Auth;
+      implementation = auth?.address ?? auth?.contractAddress;
+      if (!implementation) throw new ValidationError('sender has no code and the op carries no EIP-7702 authorization', -32009);
+    }
+    if (!implementation || !allowed.some((a) => isAddressEqual(a, implementation!))) {
+      throw new ValidationError(`sender implementation ${implementation ?? code.slice(0, 20)} is not sponsored`, -32009);
+    }
   }
 }
 

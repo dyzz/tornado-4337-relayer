@@ -1,4 +1,5 @@
 import { serve, type ServerType } from '@hono/node-server';
+import { createServer } from 'node:net';
 import { Instance } from 'prool';
 import {
   createPublicClient,
@@ -47,12 +48,28 @@ export const ANVIL_KEYS: Hex[] = [
   '0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a',
 ];
 
+/** An unused TCP port assigned by the OS (random ports collide with whatever else runs on the machine). */
+export async function freePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const srv = createServer();
+    srv.unref();
+    srv.on('error', reject);
+    srv.listen(0, '127.0.0.1', () => {
+      const { port } = srv.address() as { port: number };
+      srv.close(() => resolve(port));
+    });
+  });
+}
+
 export interface Harness {
   setup: ChainSetup;
   rpcUrl: string;
   bundlerUrl: string;
   relayerUrl: string;
   publicClient: PublicClient;
+  /** Upstream RPC the fork was taken from, and the block it was taken at. */
+  forkUrl: string;
+  forkBlock: bigint;
   deployer: ReturnType<typeof privateKeyToAccount>;
   relayerSigner: ReturnType<typeof privateKeyToAccount>;
   instance: Address;
@@ -94,6 +111,8 @@ export interface HarnessOptions {
   forkBlockNumber?: bigint;
   /** Serve the chain's canonical Tornado pools instead of deploying a fresh instance. */
   canonicalInstances?: boolean;
+  /** Which canonical ETH pool `instance` points at (default '0.1'). */
+  canonicalDenomination?: string;
   /**
    * Also set up the ERC-20 demo pool and token pricing (default true). Suites that only use ETH pools
    * pass false: on mainnet forks the 1inch oracle warm-up alone costs ~2-3 minutes of RPC round-trips.
@@ -144,7 +163,7 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
     setup.publicRpc;
 
   // --- anvil ---------------------------------------------------------------
-  const anvilPort = opts.anvilPort ?? 8545 + Math.floor(Math.random() * 500);
+  const anvilPort = opts.anvilPort ?? (await freePort());
   const anvilInstance = Instance.anvil({
     forkUrl,
     forkBlockNumber: opts.forkBlockNumber,
@@ -159,6 +178,7 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
 
   const chain = setup.chain;
   const publicClient = createPublicClient({ chain, transport: http(rpcUrl) });
+  const forkBlock = await publicClient.getBlockNumber();
   const testClient = createTestClient({ chain, mode: 'anvil', transport: http(rpcUrl) });
   const setBalance = (address: Address, wei: bigint) => testClient.setBalance({ address, value: wei });
   const mine = (blocks = 1) => testClient.mine({ blocks });
@@ -191,8 +211,9 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
   let hasher: Address | undefined;
   if (opts.canonicalInstances) {
     // Use the chain's real Tornado pools (needed when a wallet SDK discovers pools from the registry).
-    instance = setup.tornadoEth['0.1']!;
-    denomination = parseEther('0.1');
+    const key = opts.canonicalDenomination ?? '0.1';
+    instance = setup.tornadoEth[key]!;
+    denomination = parseEther(key);
     erc20Instance = setup.tornadoErc20['dai-100']!;
   } else {
     hasher = setup.tornadoHasher ?? (await deployMimcHasher(wallet, publicClient));
@@ -235,6 +256,7 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
   if (opts.registry && !router) throw new Error(`registry mode needs a TornadoRouter; ${setup.chain.name} has none`);
   let paymaster: Address;
   let paymasterImplementation: Address | undefined;
+  const setupLog = { info: (m: string, meta?: Record<string, unknown>) => log(`setup: ${m} ${meta ? JSON.stringify(meta) : ''}`), warn: (m: string) => log(`setup WARN: ${m}`) };
   if (paymasterMode === '7702') {
     paymasterImplementation = await deployPaymaster7702Implementation(wallet, publicClient, {
       entryPoint: setup.entryPoint,
@@ -243,6 +265,27 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
       postOpGasOverhead: 45_000n,
     });
     paymaster = relayerSigner.address; // delegated below, after it is registered as a worker
+  } else if (opts.registry === 'worker') {
+    // The production path: the relayer software deploys its own worker contract from its key,
+    // stakes and funds it; the master registers it afterwards (impersonated below).
+    paymaster = await ensurePaymasterSetup(
+      {
+        chainId: BigInt(chain.id),
+        rpcUrl,
+        entryPoint: setup.entryPoint,
+        signerKey: relayerKey,
+        mode: 'standalone',
+        autoSetup: true,
+        stakeWei: parseEther('0.1'),
+        unstakeDelaySec: 86_400,
+        depositWei: parseEther('2'),
+        router,
+        gasMarginBps: opts.gasMarginBps ?? 1_000n,
+        postOpGasOverhead: 45_000n,
+        requireRegistration: false,
+      },
+      setupLog,
+    );
   } else {
     paymaster = await deployPaymaster(wallet, publicClient, {
       entryPoint: setup.entryPoint,
@@ -386,9 +429,12 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
         stakeWei: parseEther('0.1'),
         unstakeDelaySec: 86_400,
         depositWei: parseEther('2'),
+        requireRegistration: false,
       },
-      { info: (m, meta) => log(`setup: ${m} ${meta ? JSON.stringify(meta) : ''}`), warn: (m) => log(`setup WARN: ${m}`) },
+      setupLog,
     );
+  } else if (opts.registry === 'worker') {
+    // already staked and funded by the setup step above
   } else {
     const depositHash = await wallet.writeContract({
       address: paymaster,
@@ -401,7 +447,7 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
   log(`deployed tornado=${instance} tornado-${setup.demoErc20.symbol}=${erc20Instance} paymaster=${paymaster}${paymasterImplementation ? ` (7702 -> ${paymasterImplementation})` : ''} zap=${zap} hasher=${hasher}`);
 
   // --- alto -----------------------------------------------------------------
-  const altoPort = opts.altoPort ?? 4337 + Math.floor(Math.random() * 500);
+  const altoPort = opts.altoPort ?? (await freePort());
   const altoInstance = Instance.alto({
     rpcUrl,
     entrypoints: [setup.entryPoint],
@@ -455,7 +501,7 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
     },
     { info: (m, meta) => log(`relayer: ${m} ${meta ? JSON.stringify(meta) : ''}`), warn: (m) => log(`relayer WARN: ${m}`) },
   );
-  const relayerPort = opts.relayerPort ?? 8787 + Math.floor(Math.random() * 500);
+  const relayerPort = opts.relayerPort ?? (await freePort());
   const server: ServerType = await new Promise((resolve) => {
     const s = serve({ fetch: createRelayerApp(relayer).fetch, port: relayerPort }, () => resolve(s));
   });
@@ -468,6 +514,8 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
     bundlerUrl,
     relayerUrl,
     publicClient,
+    forkUrl,
+    forkBlock,
     deployer,
     relayerSigner,
     instance,

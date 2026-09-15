@@ -65,10 +65,12 @@ export interface FeeTerms {
   feeToken: Address;
   /** feeToken base units per 1e18 wei; 0 for ETH. */
   tokenPerEth: bigint;
+  /** `withdrawalHash(...)` of the one relayWithdraw call this sponsorship approves. */
+  withdrawalHash: Hex;
 }
 
 export const PAYMASTER_DATA_OFFSET = 52;
-export const PAYMASTER_AND_DATA_LENGTH = 265;
+export const PAYMASTER_AND_DATA_LENGTH = 297;
 export const SIGNATURE_LENGTH = 65;
 export const RATE_SCALE = 10n ** 18n;
 
@@ -117,13 +119,14 @@ export function totalGas(gas: UserOpGas): bigint {
 }
 
 /**
- * The 213-byte suffix of paymasterAndData understood by TornadoRelayerPaymaster:
- * validUntil(6) | validAfter(6) | fee(32) | serviceFee(32) | refundTo(20) | feeToken(20) | tokenPerEth(32) | signature(65).
+ * The 245-byte suffix of paymasterAndData understood by TornadoRelayerPaymaster:
+ * validUntil(6) | validAfter(6) | fee(32) | serviceFee(32) | refundTo(20) | feeToken(20) | tokenPerEth(32) |
+ * withdrawalHash(32) | signature(65).
  */
 export function encodePaymasterData(terms: FeeTerms, signature: Hex): Hex {
   if ((signature.length - 2) / 2 !== SIGNATURE_LENGTH) throw new Error('signature must be 65 bytes');
   return encodePacked(
-    ['uint48', 'uint48', 'uint256', 'uint256', 'address', 'address', 'uint256', 'bytes'],
+    ['uint48', 'uint48', 'uint256', 'uint256', 'address', 'address', 'uint256', 'bytes32', 'bytes'],
     [
       terms.validUntil,
       terms.validAfter,
@@ -132,8 +135,35 @@ export function encodePaymasterData(terms: FeeTerms, signature: Hex): Hex {
       terms.refundTo,
       terms.feeToken ?? zeroAddress,
       terms.tokenPerEth ?? 0n,
+      terms.withdrawalHash,
       signature,
     ],
+  );
+}
+
+/** Mirrors TornadoRelayerPaymasterCore.withdrawalHash: identity of one relayWithdraw call. */
+export function withdrawalHash(w: {
+  instance: Address;
+  proof: Hex;
+  root: Hex;
+  nullifierHash: Hex;
+  recipient: Address;
+  relayer: Address;
+  fee: bigint;
+}): Hex {
+  return keccak256(
+    encodeAbiParameters(
+      [
+        { type: 'address' },
+        { type: 'bytes32' },
+        { type: 'bytes32' },
+        { type: 'bytes32' },
+        { type: 'address' },
+        { type: 'address' },
+        { type: 'uint256' },
+      ],
+      [w.instance, keccak256(w.proof), w.root, w.nullifierHash, w.recipient, w.relayer, w.fee],
+    ),
   );
 }
 
@@ -191,6 +221,7 @@ export function paymasterHash(params: {
         { type: 'address' },
         { type: 'address' },
         { type: 'uint256' },
+        { type: 'bytes32' },
       ],
       [
         fieldsHash,
@@ -203,6 +234,7 @@ export function paymasterHash(params: {
         terms.refundTo,
         terms.feeToken ?? zeroAddress,
         terms.tokenPerEth ?? 0n,
+        terms.withdrawalHash,
       ],
     ),
   );

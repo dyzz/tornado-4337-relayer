@@ -21,6 +21,8 @@ export const paymasterAbi = parseAbi([
   'function gasMarginBps() view returns (uint256)',
   'function postOpGasOverhead() view returns (uint256)',
   'function router() view returns (address)',
+  'function owner() view returns (address)',
+  'function setRouter(address router)',
   'function getDeposit() view returns (uint256)',
   'function deposit() payable',
   'function addStake(uint32 unstakeDelaySec) payable',

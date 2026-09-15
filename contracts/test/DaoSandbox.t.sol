@@ -99,17 +99,18 @@ contract DaoSandboxTest is Test {
         paymaster.registerAsRelayer(IRelayerRegistry(address(registry)), name, MIN_STAKE);
     }
 
-    /// What the EntryPoint does before execution: validate the op, which grants `sender` one relay.
-    function _sponsor(address sender) internal {
+    /// What the EntryPoint does before execution: validate the op, which grants `sender` exactly this withdrawal.
+    function _sponsor(address sender, address pool, bytes32 nullifierHash, address relayer, uint256 fee) internal {
+        bytes32 wh = keccak256(abi.encode(ITornadoInstance(pool), keccak256(hex""), bytes32(0), nullifierHash, sender, relayer, fee));
         PackedUserOperation memory op;
         op.sender = sender;
-        op.paymasterAndData = abi.encodePacked(address(paymaster), uint128(0), uint128(0), new bytes(213));
+        op.paymasterAndData = abi.encodePacked(address(paymaster), uint128(0), uint128(0), new bytes(148), wh, new bytes(65));
         vm.prank(address(entryPoint));
         paymaster.validatePaymasterUserOp(op, bytes32(0), 0);
     }
 
     function _relay(address pool, bytes32 nullifierHash, address relayer, uint256 fee) internal {
-        _sponsor(user);
+        _sponsor(user, pool, nullifierHash, relayer, fee);
         _relaySponsored(pool, nullifierHash, relayer, fee);
     }
 
@@ -154,7 +155,7 @@ contract DaoSandboxTest is Test {
         assertEq(torn.balanceOf(address(staking)), MIN_STAKE);
 
         uint256 fee = 0.002 ether;
-        _sponsor(user);
+        _sponsor(user, address(ethPool), keccak256("eth"), address(paymaster), fee);
         vm.expectEmit(address(registry));
         emit SandboxRelayerRegistry.StakeBurned(address(paymaster), 0.1137e18);
         _relaySponsored(address(ethPool), keccak256("eth"), address(paymaster), fee);
@@ -186,7 +187,7 @@ contract DaoSandboxTest is Test {
 
         // A worker may not relay for another registered master.
         _registerOtherMaster();
-        _sponsor(user);
+        _sponsor(user, address(ethPool), keccak256("x"), address(paymaster), fee);
         vm.expectRevert("only relayer");
         _relaySponsored(address(ethPool), keccak256("x"), address(paymaster), fee);
     }
@@ -206,14 +207,14 @@ contract DaoSandboxTest is Test {
         assertEq(staking.totalBurnRewards(), 0);
         // ... but it may not name a registered relayer.
         _registerOtherMaster();
-        _sponsor(user);
+        _sponsor(user, address(ethPool), keccak256("d"), makeAddr("other"), 0.001 ether);
         vm.expectRevert("Only custom relayer");
         _relaySponsored(address(ethPool), keccak256("d"), makeAddr("other"), 0.001 ether);
     }
 
     function test_router_rejectsUnknownInstance_andDepositsErc20() public {
         MockTornado stray = new MockTornado(1 ether);
-        _sponsor(user);
+        _sponsor(user, address(stray), keccak256("s"), address(paymaster), 0);
         vm.prank(user);
         vm.expectRevert("The instance is not supported");
         paymaster.relayWithdraw(ITornadoInstance(address(stray)), hex"", bytes32(0), keccak256("s"), payable(user), payable(address(paymaster)), 0);

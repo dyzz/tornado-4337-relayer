@@ -1,6 +1,7 @@
 import { createPublicClient, getAddress, http, isAddress, isHex, type Address, type Hex } from 'viem';
 import { FixedPriceSource, ONEINCH_OFFCHAIN_ORACLE_MAINNET, OneInchPriceSource, type PriceSource } from './price.js';
 import type { RelayerConfig } from './service.js';
+import { FileSponsorshipStore } from './store.js';
 import { DEFAULT_STAKE_WEI, DEFAULT_UNSTAKE_DELAY_SEC, type PaymasterSetupConfig } from './setup.js';
 
 const ENTRY_POINT_V08: Address = '0x4337084D9E255Ff0702461CF8895CE9E3b5Ff108';
@@ -16,8 +17,16 @@ const ALIASES: Record<string, string> = {
   CHAIN_ID: 'NET_ID',
 };
 
-/** Per-chain deployments of TornadoRelayerPaymaster7702 (the shared 7702 implementation). */
-export const PAYMASTER_7702_IMPLEMENTATIONS: Record<string, Address> = {};
+/** Per-chain deployments of TornadoRelayerPaymaster7702 (the shared, experimental 7702 implementation). */
+export const PAYMASTER_7702_IMPLEMENTATIONS: Record<string, Address> = {
+  '11155111': '0x9917840A8843aCE7F525BC24D518Ad059D86Eb31',
+};
+
+/** Tornado DAO routers. Sepolia's is our sandbox copy (the DAO never deployed one there). */
+export const TORNADO_ROUTERS: Record<string, Address> = {
+  '1': '0xd90e2f925DA726b50C4Ed8D0Fb90Ad053324F31b',
+  '11155111': '0xF2DafFd789ec02211a8f1be1034165cFf759a04D',
+};
 
 function env(name: string, fallback?: string): string {
   const v = process.env[name];
@@ -61,21 +70,26 @@ export function priceSourceFromEnv(rpcUrl: string, chainId: bigint): PriceSource
 
 /**
  * Paymaster setup from env:
- *   PAYMASTER_MODE            7702 (default when PAYMASTER_ADDRESS is unset: the relayer key's own address
- *                             is the paymaster) | standalone (PAYMASTER_ADDRESS = deployed contract)
- *   PAYMASTER_IMPLEMENTATION  7702 implementation to delegate to (per-chain default when known)
- *   AUTO_SETUP                send delegation / stake / deposit transactions when missing (default true)
+ *   PAYMASTER_MODE            standalone (default): a TornadoRelayerPaymaster contract owned by the relayer key,
+ *                             deployed by the service on first start unless PAYMASTER_ADDRESS is given;
+ *                             7702 (experimental): the relayer key's own address delegates to PAYMASTER_IMPLEMENTATION
+ *   TORNADO_ROUTER            DAO router wired into a freshly deployed contract (per-chain default)
+ *   PAYMASTER_STATE_FILE      where the self-deployed address is remembered (default ./.paymaster-<chainId>.json)
+ *   AUTO_SETUP                send deployment / delegation / stake / deposit transactions when missing (default true)
  *   PAYMASTER_STAKE_WEI       EntryPoint stake to keep (default 0.1 ETH), UNSTAKE_DELAY_SEC (default 86400)
  *   PAYMASTER_DEPOSIT_WEI     minimum EntryPoint deposit to keep (default 0 = never top up)
+ *   WAIT_FOR_REGISTRATION     keep polling until the master has registered the paymaster as its worker (default true)
+ *   GAS_MARGIN_BPS / POST_OP_GAS_OVERHEAD   parameters of a freshly deployed contract (1000 / 45000)
  */
 export function setupConfigFromEnv(): PaymasterSetupConfig {
   const signerKey = env('RELAYER_PRIVATE_KEY');
   if (!isHex(signerKey) || signerKey.length !== 66) throw new Error('RELAYER_PRIVATE_KEY / PRIVATE_KEY must be a 32-byte hex key');
   const chainId = BigInt(env('CHAIN_ID', '1'));
   const hasAddress = Boolean(process.env.PAYMASTER_ADDRESS);
-  const mode = env('PAYMASTER_MODE', hasAddress ? 'standalone' : '7702') as PaymasterSetupConfig['mode'];
+  const mode = env('PAYMASTER_MODE', 'standalone') as PaymasterSetupConfig['mode'];
   if (mode !== '7702' && mode !== 'standalone') throw new Error(`unknown PAYMASTER_MODE ${mode}`);
   const implDefault = PAYMASTER_7702_IMPLEMENTATIONS[chainId.toString()];
+  const routerDefault = TORNADO_ROUTERS[chainId.toString()];
   return {
     chainId,
     rpcUrl: env('RPC_URL'),
@@ -88,6 +102,13 @@ export function setupConfigFromEnv(): PaymasterSetupConfig {
     stakeWei: BigInt(env('PAYMASTER_STAKE_WEI', DEFAULT_STAKE_WEI.toString())),
     unstakeDelaySec: Number(env('UNSTAKE_DELAY_SEC', String(DEFAULT_UNSTAKE_DELAY_SEC))),
     depositWei: BigInt(env('PAYMASTER_DEPOSIT_WEI', '0')),
+    router: process.env.TORNADO_ROUTER || routerDefault ? addr('TORNADO_ROUTER', routerDefault) : undefined,
+    gasMarginBps: BigInt(env('GAS_MARGIN_BPS', '1000')),
+    postOpGasOverhead: BigInt(env('POST_OP_GAS_OVERHEAD', '45000')),
+    stateFile: env('PAYMASTER_STATE_FILE', `./.paymaster-${chainId}.json`),
+    rewardAccount: process.env.REWARD_ACCOUNT ? addr('REWARD_ACCOUNT') : undefined,
+    requireRegistration: true,
+    waitForRegistration: env('WAIT_FOR_REGISTRATION', 'true') === 'true',
   };
 }
 
@@ -112,6 +133,15 @@ export function configFromEnv(paymaster: Address): RelayerConfig {
     signerKey: signerKey as Hex,
     rewardAccount: process.env.REWARD_ACCOUNT ? addr('REWARD_ACCOUNT') : undefined,
     allowUnregistered: env('ALLOW_UNREGISTERED', 'false') === 'true',
+    // SPONSORSHIP_STORE=path keeps live sponsorships across restarts (single process).
+    sponsorshipStore: process.env.SPONSORSHIP_STORE ? new FileSponsorshipStore(process.env.SPONSORSHIP_STORE) : undefined,
+    // ALLOWED_SENDER_IMPLEMENTATIONS=0x…,0x… restricts sponsorship to known account implementations.
+    allowedSenderImplementations: process.env.ALLOWED_SENDER_IMPLEMENTATIONS
+      ? process.env.ALLOWED_SENDER_IMPLEMENTATIONS.split(',').map((s) => s.trim()).filter(Boolean).map((s) => {
+          if (!isAddress(s)) throw new Error(`ALLOWED_SENDER_IMPLEMENTATIONS entry is not an address: ${s}`);
+          return getAddress(s);
+        })
+      : undefined,
     instances: env('TORNADO_INSTANCES')
       .split(',')
       .map((s) => s.trim())

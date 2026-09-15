@@ -280,22 +280,21 @@ index c6f9806..8eb0fc1 100644
  
 diff --git a/packages/tornado-cash/src/state/thunks/relayerPaymasterWithdrawThunk.ts b/packages/tornado-cash/src/state/thunks/relayerPaymasterWithdrawThunk.ts
 new file mode 100644
-index 0000000..c5902fc
+index 0000000..5d134f7
 --- /dev/null
 +++ b/packages/tornado-cash/src/state/thunks/relayerPaymasterWithdrawThunk.ts
-@@ -0,0 +1,311 @@
+@@ -0,0 +1,258 @@
 +/* eslint-disable max-lines */
 +import { createAsyncThunk, unwrapResult } from "@reduxjs/toolkit";
 +
 +import { AccountId } from "@kohaku-eth/plugins";
 +import { createTx, TxData } from "@kohaku-eth/provider";
 +import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
-+import { encodeFunctionData, erc20Abi, type Hex } from "viem";
++import { encodeFunctionData, type Hex } from "viem";
 +
 +import { reasonableGasUnitsForBatch } from "../../paymaster/fee";
 +import { RelayerPaymasterClient, relayerPaymasterAbi } from "../../paymaster/relayer-paymaster-client";
 +import { buildSignedTornadoUserOp, createPaymasterBundlerClient, estimateUserOperationGas } from "../../paymaster/utils";
-+import { poolAbi } from "../../data/abis/pool.abi";
 +import { addressToHex } from "../../utils";
 +import { UserOpGasLimits } from "../../interfaces/user-ops.interface";
 +import { Address } from "../../interfaces/types.interface";
@@ -422,27 +421,15 @@ index 0000000..c5902fc
 +      ? ephemeralSigner(deposit)
 +      : Promise.resolve(privateKeyToAccount(generatePrivateKey()));
 +
-+  // A single note with no tail calls needs no consolidation: the sender only
-+  // executes the withdraw and the funds go straight to the user's recipient.
-+  const needsConsolidation = deposits.length > 1 || tailCalls != null;
-+  const sponsoringDeposit = deposits[0]!;
-+  const directDeposits = needsConsolidation ? deposits.slice(1) : [];
-+  const signer = needsConsolidation
-+    ? await resolveBatchDelegator()
-+    : await resolveIndependentSigner(sponsoringDeposit);
-+  const senderAddress = BigInt(signer.address) as Address;
-+  const sponsoringRecipient = needsConsolidation ? senderAddress : originalRecipient;
-+
-+  const withdrawCall = (poolAddress: Address, proof: TornadoProveOutput): TxData => {
-+    const [root, nullifierHash, proofRecipient, relayerArg, feeArg, refundArg] = proof.args;
-+    const data = encodeFunctionData({
-+      abi: poolAbi,
-+      functionName: 'withdraw',
-+      args: [proof.proof, root, nullifierHash, proofRecipient, relayerArg, BigInt(feeArg), BigInt(refundArg)],
-+    });
-+
-+    return createTx(addressToHex(poolAddress), data, 0n);
-+  };
++  // One note per UserOperation: every relayed withdrawal goes through TornadoRouter on its
++  // own (one registry burn per note, exactly as with a classic relayer), so a multi-note
++  // unshield becomes several independent operations, each with its own sender, quote,
++  // proof, sponsorship and tail. The relayer refuses operations carrying more than one
++  // Tornado withdrawal.
++  const SPONSORING_WITHDRAW_GAS = 400_000n;
++  const batchGas = reasonableGasUnitsForBatch(poolInfo.isERC20, 0, tailCalls != null, tailCallsGasEstimate);
++  const tailCallsGas = batchGas.callGasLimit + SPONSORING_WITHDRAW_GAS;
++  const sponsorContext = { refundTo: originalRecipientHex };
 +
 +  // The sponsoring note: `paymaster.relayWithdraw` (Router / RelayerRegistry path). The
 +  // paymaster only accepts the recipient as caller, which the sender is.
@@ -457,141 +444,101 @@ index 0000000..c5902fc
 +    return createTx(paymaster, data, 0n);
 +  };
 +
-+  // deposits[1..]: proved with recipient = sender, relayer = 0, fee = 0 — the
-+  // sponsoring note already pays for the whole userOp.
-+  const ZERO_ADDRESS = 0n as Address;
-+  const directWithdrawCalls: TxData[] = [];
++  const buildOperation = async (deposit: (typeof deposits)[number]): Promise<IGenericPaymasterWithdrawalPayload> => {
++    const depositPool = pools.get(deposit.pool)!;
++    // With tail calls the sender must hold the funds first; otherwise the pool pays the recipient directly.
++    const needsSender = tailCalls != null;
++    const signer = needsSender ? await resolveBatchDelegator() : await resolveIndependentSigner(deposit);
++    const senderAddress = BigInt(signer.address) as Address;
++    const recipient = needsSender ? senderAddress : originalRecipient;
 +
-+  for (const deposit of directDeposits) {
-+    directWithdrawCalls.push(withdrawCall(deposit.pool, await prove(deposit, senderAddress, ZERO_ADDRESS, 0n)));
-+  }
++    // callData: the relayed withdraw, then the caller's tailCalls (or nothing: the pool paid the recipient).
++    const composeCalls = async (paymaster: `0x${string}`, proof: TornadoProveOutput, fee: bigint): Promise<TxData[]> => [
++      relayWithdrawCall(paymaster, deposit.pool, proof),
++      ...(needsSender
++        ? await tailCalls!(signer.address as AccountId, {
++            amount: depositPool.denomination - fee,
++            asset: depositPool.isERC20 ? addressToHex(depositPool.asset) : undefined,
++          })
++        : []),
++    ];
 +
-+  const totalDenomination = deposits.reduce((sum, d) => sum + pools.get(d.pool)!.denomination, 0n);
-+
-+  const forwardCalls = (fee: bigint): TxData[] => {
-+    const forwardAmount = totalDenomination - fee;
-+
-+    if (poolInfo.isERC20) {
-+      const data = encodeFunctionData({
-+        abi: erc20Abi,
-+        functionName: 'transfer',
-+        args: [originalRecipientHex, forwardAmount],
-+      });
-+
-+      return [createTx(addressToHex(poolInfo.asset), data, 0n)];
-+    }
-+
-+    return [createTx(originalRecipientHex, '0x', forwardAmount)];
-+  };
-+
-+  // callData order: the sponsoring withdraw (pays the paymaster), the direct
-+  // withdraws, then the caller's tailCalls or the synthesized forward.
-+  const composeCalls = async (paymaster: `0x${string}`, sponsoringProof: TornadoProveOutput, fee: bigint): Promise<TxData[]> => [
-+    relayWithdrawCall(paymaster, sponsoringDeposit.pool, sponsoringProof),
-+    ...directWithdrawCalls,
-+    ...(needsConsolidation
-+      ? (tailCalls
-+          // The sender holds every withdrawn note minus the sponsoring fee when the tail runs
-+          // (ETH for native pools, the pool token for ERC-20 pools; the fee is in the same asset).
-+          ? await tailCalls(signer.address as AccountId, {
-+              amount: totalDenomination - fee,
-+              asset: poolInfo.isERC20 ? addressToHex(poolInfo.asset) : undefined,
-+            })
-+          : forwardCalls(fee))
-+      : []),
-+  ];
-+
-+  // Execution-phase budget for the quote: the sponsoring withdraw runs in
-+  // callData here (unlike the trustless flow), so it is added to the tail.
-+  const SPONSORING_WITHDRAW_GAS = 400_000n;
-+  const batchGas = reasonableGasUnitsForBatch(
-+    poolInfo.isERC20,
-+    directDeposits.length,
-+    tailCalls != null,
-+    tailCallsGasEstimate,
-+  );
-+  const tailCallsGas = batchGas.callGasLimit + SPONSORING_WITHDRAW_GAS;
-+
-+  const sponsorContext = { refundTo: originalRecipientHex };
-+  const unsignedOp = (
-+    calls: TxData[],
-+    gas: UserOpGasLimits,
-+    maxFeePerGas: bigint,
-+    maxPriorityFeePerGas: bigint,
-+    paymaster: { paymaster: `0x${string}`; paymasterData: Hex },
-+  ) => buildSignedTornadoUserOp({
-+    signer,
-+    chainId,
-+    paymasterAddress: paymaster.paymaster,
-+    paymasterData: paymaster.paymasterData,
-+    gas,
-+    maxFeePerGas,
-+    maxPriorityFeePerGas,
-+    tailCalls: async () => calls,
-+    nonce: 0n,
-+  });
-+
-+  // 1. Baseline quote and proof.
-+  let quote = await relayerClient.quote({ instance: addressToHex(sponsoringDeposit.pool), tailCallsGas });
-+  const relayerAddress = BigInt(quote.relayer) as Address;
-+  let fee = quote.fee;
-+  let gas: UserOpGasLimits = quote.gas;
-+  let sponsoringProof = await prove(sponsoringDeposit, sponsoringRecipient, relayerAddress, fee);
-+  let calls = await composeCalls(quote.paymaster, sponsoringProof, fee);
-+
-+  // 2. Bundler estimation with the relayer's stub paymasterData (nothing signed yet).
-+  const stubFields = (op: Awaited<ReturnType<typeof buildSignedTornadoUserOp>>) =>
-+    relayerClient.getPaymasterStubData(op, entryPointAddress, chainId, sponsorContext);
-+  const provisional = await unsignedOp(calls, gas, quote.maxFeePerGas, quote.maxPriorityFeePerGas, {
-+    paymaster: quote.paymaster,
-+    paymasterData: '0x',
-+  });
-+  const stub = await stubFields(provisional);
-+  const provisionalWithStub = await unsignedOp(calls, gas, quote.maxFeePerGas, quote.maxPriorityFeePerGas, stub);
-+
-+  try {
-+    const estimated = await estimateUserOperationGas(bundlerClient, provisionalWithStub, entryPointAddress);
-+    const buffer = (x: bigint) => (x * 12n) / 10n;
-+    const orBaseline = (e: bigint, b: bigint) => (e > 0n ? buffer(e) : b);
-+    const refined: UserOpGasLimits = {
-+      callGasLimit: orBaseline(estimated.callGasLimit, gas.callGasLimit),
-+      verificationGasLimit: orBaseline(estimated.verificationGasLimit, gas.verificationGasLimit),
-+      preVerificationGas: orBaseline(estimated.preVerificationGas, gas.preVerificationGas),
-+      paymasterVerificationGasLimit: orBaseline(estimated.paymasterVerificationGasLimit, gas.paymasterVerificationGasLimit),
-+      paymasterPostOpGasLimit: orBaseline(estimated.paymasterPostOpGasLimit, gas.paymasterPostOpGasLimit),
-+    };
-+    const requote = await relayerClient.quote({
-+      instance: addressToHex(sponsoringDeposit.pool),
-+      gas: refined,
-+      maxFeePerGas: quote.maxFeePerGas,
++    const unsignedOp = (
++      calls: TxData[],
++      gas: UserOpGasLimits,
++      maxFeePerGas: bigint,
++      maxPriorityFeePerGas: bigint,
++      paymaster: { paymaster: `0x${string}`; paymasterData: Hex },
++    ) => buildSignedTornadoUserOp({
++      signer,
++      chainId,
++      paymasterAddress: paymaster.paymaster,
++      paymasterData: paymaster.paymasterData,
++      gas,
++      maxFeePerGas,
++      maxPriorityFeePerGas,
++      tailCalls: async () => calls,
++      nonce: 0n,
 +    });
 +
-+    gas = refined;
++    // 1. Baseline quote and proof.
++    let quote = await relayerClient.quote({ instance: addressToHex(deposit.pool), tailCallsGas });
++    const relayerAddress = BigInt(quote.relayer) as Address;
++    let fee = quote.fee;
++    let gas: UserOpGasLimits = quote.gas;
++    let proof = await prove(deposit, recipient, relayerAddress, fee);
++    let calls = await composeCalls(quote.paymaster, proof, fee);
 +
-+    if (requote.fee !== fee) {
-+      fee = requote.fee;
-+      sponsoringProof = await prove(sponsoringDeposit, sponsoringRecipient, relayerAddress, fee);
-+      calls = await composeCalls(quote.paymaster, sponsoringProof, fee);
++    // 2. Bundler estimation with the relayer's stub paymasterData (nothing signed yet).
++    const provisional = await unsignedOp(calls, gas, quote.maxFeePerGas, quote.maxPriorityFeePerGas, {
++      paymaster: quote.paymaster,
++      paymasterData: '0x',
++    });
++    const stub = await relayerClient.getPaymasterStubData(provisional, entryPointAddress, chainId, sponsorContext);
++    const provisionalWithStub = await unsignedOp(calls, gas, quote.maxFeePerGas, quote.maxPriorityFeePerGas, stub);
++
++    try {
++      const estimated = await estimateUserOperationGas(bundlerClient, provisionalWithStub, entryPointAddress);
++      const buffer = (x: bigint) => (x * 12n) / 10n;
++      const orBaseline = (e: bigint, b: bigint) => (e > 0n ? buffer(e) : b);
++      const refined: UserOpGasLimits = {
++        callGasLimit: orBaseline(estimated.callGasLimit, gas.callGasLimit),
++        verificationGasLimit: orBaseline(estimated.verificationGasLimit, gas.verificationGasLimit),
++        preVerificationGas: orBaseline(estimated.preVerificationGas, gas.preVerificationGas),
++        paymasterVerificationGasLimit: orBaseline(estimated.paymasterVerificationGasLimit, gas.paymasterVerificationGasLimit),
++        paymasterPostOpGasLimit: orBaseline(estimated.paymasterPostOpGasLimit, gas.paymasterPostOpGasLimit),
++      };
++      const requote = await relayerClient.quote({ instance: addressToHex(deposit.pool), gas: refined, maxFeePerGas: quote.maxFeePerGas });
++      gas = refined;
++      if (requote.fee !== fee) {
++        fee = requote.fee;
++        proof = await prove(deposit, recipient, relayerAddress, fee);
++        calls = await composeCalls(quote.paymaster, proof, fee);
++      }
++      quote = requote;
++    } catch (error) {
++      // Estimation unavailable: keep the relayer's conservative ceilings.
++      console.warn('[relayer-paymaster] bundler estimation failed, using quoted gas', error);
 +    }
-+    quote = requote;
-+  } catch (error) {
-+    // Estimation unavailable: keep the relayer's conservative ceilings.
-+    console.warn('[relayer-paymaster] bundler estimation failed, using quoted gas', error);
-+  }
 +
-+  // 3. Relayer signature (ERC-7677 pm_getPaymasterData) over the final op, then the sender signs.
-+  const forSigning = await unsignedOp(calls, gas, quote.maxFeePerGas, quote.maxPriorityFeePerGas, stub);
-+  const signed = await relayerClient.getPaymasterData(forSigning, entryPointAddress, chainId, sponsorContext);
-+  const userOperation = await unsignedOp(calls, gas, quote.maxFeePerGas, quote.maxPriorityFeePerGas, signed);
++    // 3. Relayer signature (ERC-7677 pm_getPaymasterData) over the final op, then the sender signs.
++    const forSigning = await unsignedOp(calls, gas, quote.maxFeePerGas, quote.maxPriorityFeePerGas, stub);
++    const signed = await relayerClient.getPaymasterData(forSigning, entryPointAddress, chainId, sponsorContext);
++    const userOperation = await unsignedOp(calls, gas, quote.maxFeePerGas, quote.maxPriorityFeePerGas, signed);
 +
-+  return [{
-+    mode: 'paymaster' as const,
-+    proof: sponsoringProof,
-+    poolAddress: sponsoringDeposit.pool,
-+    isERC20: poolInfo.isERC20,
-+    paymasterAddress: signed.paymaster,
-+    entryPointAddress,
-+    bundlerUrl,
-+    userOperation,
-+  }] satisfies IGenericPaymasterWithdrawalPayload[];
++    return {
++      mode: 'paymaster' as const,
++      proof,
++      poolAddress: deposit.pool,
++      isERC20: depositPool.isERC20,
++      paymasterAddress: signed.paymaster,
++      entryPointAddress,
++      bundlerUrl,
++      userOperation,
++    };
++  };
++
++  const payloads: IGenericPaymasterWithdrawalPayload[] = [];
++  for (const deposit of deposits) payloads.push(await buildOperation(deposit));
++  return payloads;
 +});

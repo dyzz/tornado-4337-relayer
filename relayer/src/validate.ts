@@ -111,11 +111,13 @@ export interface SponsorRules {
 }
 
 /**
- * Find the withdraw that pays for this userOp. It must be a `relayWithdraw` on the
- * paymaster (so the DAO's Router / RelayerRegistry sees the paymaster as the relayer
- * and burns its stake) naming `rewardAccount` as relayer and the sender as recipient.
- * A batch may carry further *direct* withdraws (Kohaku consolidates several notes into
- * one userOp; those name relayer = 0, fee = 0), but nothing else may touch the paymaster.
+ * Find the withdraw that pays for this userOp. It must be the *only* Tornado withdrawal
+ * in the operation, performed as a `relayWithdraw` on the paymaster (so the DAO's Router
+ * / RelayerRegistry sees the paymaster as the relayer and burns the stake once per
+ * relayed withdrawal, as today), naming `rewardAccount` as relayer and the sender as
+ * recipient. Direct `pool.withdraw` calls in the same operation are refused: they would
+ * ride on the sponsored gas without going through the router. Nothing else may touch
+ * the paymaster.
  */
 export function findSponsoringWithdraw(calls: DecodedCall[], rules: SponsorRules): TornadoWithdrawCall {
   const withdraws = decodeTornadoWithdraws(calls, rules.paymaster);
@@ -129,10 +131,9 @@ export function findSponsoringWithdraw(calls: DecodedCall[], rules: SponsorRules
   if (relayed.length === 0) {
     throw new ValidationError(`no relayWithdraw call on the paymaster ${rules.paymaster}`);
   }
-  if (relayed.length > 1) throw new ValidationError('more than one relayWithdraw on the paymaster');
-
-  const paying = withdraws.filter((w) => isAddressEqual(w.relayer, rules.rewardAccount));
-  if (paying.length > 1) throw new ValidationError(`more than one withdraw names ${rules.rewardAccount} as relayer`);
+  if (withdraws.length > 1) {
+    throw new ValidationError('one Tornado withdrawal per operation: every relayed note must go through the router');
+  }
   const w = relayed[0]!;
   if (!isAddressEqual(w.relayer, rules.rewardAccount)) {
     throw new ValidationError(`relayWithdraw must name ${rules.rewardAccount} as relayer, got ${w.relayer}`);

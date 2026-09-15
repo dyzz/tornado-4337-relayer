@@ -248,6 +248,7 @@ describe('withdraw -> swap -> Aave supply, atomically over ERC-4337 with the thi
       refundTo: h.deployer.address,
       feeToken: h.setup.demoErc20.address,
       tokenPerEth: 3000n * 10n ** 18n,
+      withdrawalHash: `0x${'ab'.repeat(32)}` as Hex,
     };
     const local = paymasterHash({ op, chainId: BigInt(h.setup.chain.id), paymaster: h.paymaster, terms });
 
@@ -256,7 +257,7 @@ describe('withdraw -> swap -> Aave supply, atomically over ERC-4337 with the thi
       (0xea60).toString(16).padStart(32, '0') +
       (0x15f90).toString(16).padStart(32, '0') +
       encodePaymasterData(terms, DUMMY_SIGNATURE).slice(2)) as Hex;
-    expect((paymasterAndData.length - 2) / 2).toBe(265);
+    expect((paymasterAndData.length - 2) / 2).toBe(297);
     const packed = {
       sender: op.sender,
       nonce: 5n,
@@ -302,6 +303,7 @@ describe('withdraw -> swap -> Aave supply, atomically over ERC-4337 with the thi
                 { name: 'refundTo', type: 'address' },
                 { name: 'feeToken', type: 'address' },
                 { name: 'tokenPerEth', type: 'uint256' },
+                { name: 'withdrawalHash', type: 'bytes32' },
               ],
             },
           ],

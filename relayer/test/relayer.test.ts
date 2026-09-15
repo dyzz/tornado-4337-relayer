@@ -45,20 +45,19 @@ const single = (target: Address, value: bigint, data: Hex) =>
   decodeAccountCalls(encodeFunctionData({ abi: baseAccountAbi, functionName: 'execute', args: [target, value, data] }));
 
 describe('validate', () => {
-  it('finds the sponsoring relayWithdraw in an executeBatch with extra direct withdraws and tail calls', () => {
+  it('finds the sponsoring relayWithdraw in an executeBatch with tail calls', () => {
     const callData = encodeFunctionData({
       abi: baseAccountAbi,
       functionName: 'executeBatch',
       args: [
         [
           { target: PAYMASTER, value: 0n, data: relayData(PAYMASTER, 123n) },
-          { target: INSTANCE, value: 0n, data: withdrawData(zeroAddress, 0n, `0x${'02'.repeat(32)}`) },
           { target: SENDER, value: 1n, data: '0x' },
         ],
       ],
     });
     const calls = decodeAccountCalls(callData);
-    expect(calls).toHaveLength(3);
+    expect(calls).toHaveLength(2);
     const w = findSponsoringWithdraw(calls, rules());
     expect(w.index).toBe(0);
     expect(w.via).toBe('paymaster');
@@ -107,15 +106,16 @@ describe('validate', () => {
         rules(),
       ),
     ).toThrow(/only relayWithdraw/);
+    // A second note withdrawn directly would ride on the sponsored gas without a router burn.
     expect(() =>
       findSponsoringWithdraw(
         batch([
           { target: PAYMASTER, value: 0n, data: relayData(PAYMASTER, 5n) },
-          { target: INSTANCE, value: 0n, data: withdrawData(PAYMASTER, 5n, `0x${'03'.repeat(32)}`) },
+          { target: INSTANCE, value: 0n, data: withdrawData(zeroAddress, 0n, `0x${'03'.repeat(32)}`) },
         ]),
         rules(),
       ),
-    ).toThrow(/more than one withdraw names/);
+    ).toThrow(/one Tornado withdrawal per operation/);
     expect(() =>
       findSponsoringWithdraw(
         batch([
@@ -124,7 +124,7 @@ describe('validate', () => {
         ]),
         rules(),
       ),
-    ).toThrow(/more than one relayWithdraw/);
+    ).toThrow(/one Tornado withdrawal per operation/);
 
     expect(() => decodeAccountCalls('0xdeadbeef')).toThrow(ValidationError);
   });
@@ -174,12 +174,12 @@ describe('userop', () => {
     ).toBe(`${SENDER.toLowerCase()}abcd`);
   });
 
-  it('encodes 213 bytes of paymasterData (265 with the EntryPoint prefix)', () => {
+  it('encodes 245 bytes of paymasterData (297 with the EntryPoint prefix)', () => {
     const data = encodePaymasterData(
-      { validUntil: 1, validAfter: 0, fee: 1n, serviceFee: 1n, refundTo: SENDER, feeToken: DAI, tokenPerEth: 5n },
+      { validUntil: 1, validAfter: 0, fee: 1n, serviceFee: 1n, refundTo: SENDER, feeToken: DAI, tokenPerEth: 5n, withdrawalHash: `0x${'ab'.repeat(32)}` },
       DUMMY_SIGNATURE,
     );
-    expect((data.length - 2) / 2).toBe(6 + 6 + 32 + 32 + 20 + 20 + 32 + 65);
+    expect((data.length - 2) / 2).toBe(6 + 6 + 32 + 32 + 20 + 20 + 32 + 32 + 65);
     expect(data.slice(2 + 2 * (6 + 6 + 32 + 32 + 20), 2 + 2 * (6 + 6 + 32 + 32 + 20 + 20))).toBe(DAI.slice(2).toLowerCase());
   });
 
