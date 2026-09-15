@@ -24,9 +24,9 @@ const paymasterConfig = {
   [chainId]: {
     bundlerUrl: 'https://public.pimlico.io/v2/11155111/rpc',
     entryPointAddress: '0x4337084D9E255Ff0702461CF8895CE9E3b5Ff108',
-    paymasterAddress: '<TornadoRelayerPaymaster>',
+    paymasterAddress: '<the relayer's paymaster: its worker EOA (EIP-7702) or a standalone TornadoRelayerPaymaster>',
     poolsAccountsMap: {},
-    relayer: { url: 'https://relayer.example/' },   // <- thin relayer
+    relayer: { url: 'https://relayer.example/' },   // <- thin relayer (ERC-7677 + tornado_quote)
   },
 };
 const protocol = new TornadoCashProtocol(host, { protocolConfig, paymasterConfig });
@@ -38,6 +38,12 @@ const op = await protocol.prepareUnshield(asset, recipient, {
 });
 await broadcaster.broadcast(op);
 ```
+
+## The CLI patch (`patches/0002-kohaku-cli-relayer-paymaster.patch`)
+
+Against `dmarzzz/kohaku-cli` @ `patches/KOHAKU_CLI_COMMIT`. Adds `KOHAKU_TORNADO_RELAYER_URL`,
+`KOHAKU_TORNADO_PAYMASTER` (and `KOHAKU_BUNDLER_URL`) so `kohaku unshield --tail-calls target:calldata:max`
+goes through the relayer; `max` spends everything the sender holds after the fee.
 
 ## Layout
 

@@ -63,6 +63,22 @@ means replacing the relayer software — same worker key, same `REWARD_ACCOUNT`,
 A standalone paymaster contract can also be registered as a new relayer master (it then refunds users the
 unused part of the fee), but the delegated worker is the path for an existing operator.
 
+### Running it as an existing relayer
+
+```bash
+cd relayer && cp .env.example .env
+# PRIVATE_KEY      your worker key (as in tornado-relayer)         REWARD_ACCOUNT  your master address
+# RELAYER_FEE      0.3 (percent, as in tornado-relayer)             HTTP_RPC_URL / NET_ID as before
+# PAYMASTER_IMPLEMENTATION  the chain's TornadoRelayerPaymaster7702 (Sepolia: 0x9917840A8843aCE7F525BC24D518Ad059D86Eb31)
+# PAYMASTER_DEPOSIT_WEI     gas float to keep on the EntryPoint (the worker needs ETH for it, as it needs ETH for gas today)
+pnpm start
+```
+
+On first start the service sends three transactions from the worker key — the EIP-7702 delegation, a 0.1 ETH
+EntryPoint stake, the deposit — checks that the registry resolves the worker to `REWARD_ACCOUNT`, and then
+only signs. `GET /status` shows the mode, the master, the stake left and the TORN burned per pool. Wallets
+use the worker address as the paymaster and the service URL as the ERC-7677 endpoint.
+
 ## For Kohaku
 
 Kohaku only needs a relayer-signed sponsorship path:
@@ -100,7 +116,7 @@ thin Tornado relayer
       ↓
 sign sponsorship
       ↓
-paymaster
+paymaster  (= the relayer's worker EOA, delegated via EIP-7702)
       ↓
 ERC-4337 bundler
       ↓
@@ -179,6 +195,15 @@ That withdrawal is a single transaction:
 0.002253 ETH, paid to the master; actual gas 0.000772 ETH, paid from the worker's EntryPoint deposit;
 0.097747 aWETH landed in the wallet.
 
+## Repository
+
+| Path | |
+| --- | --- |
+| `contracts/` | `TornadoRelayerPaymasterCore.sol` (logic), `TornadoRelayerPaymaster7702.sol` (delegate for worker EOAs), `TornadoRelayerPaymaster.sol` (standalone), `SwapAndSupplyZap.sol`, `dao-sandbox/` (testnet copy of the DAO relayer stack) |
+| `relayer/` | the signing service (`setup.ts` = first-start delegation / stake / deposit) |
+| `client/` | reference wallet flow, proof generation, e2e harness (anvil fork + alto) |
+| `kohaku-integration/` | patches for `@kohaku-eth/tornado-cash` and `kohaku-cli`, Kohaku e2e |
+
 ---
 
 # 简体中文
@@ -239,6 +264,19 @@ relayer 现有的 **worker 地址直接成为 paymaster**。`tornado-relayer` �
 
 也可以把一个独立部署的 paymaster 合约注册成新的 relayer master（这种模式会把 fee 里没用掉的部分退给用户），但对现有运营者，委托 worker 才是接入路径。
 
+### 作为现有 relayer 怎么跑
+
+```bash
+cd relayer && cp .env.example .env
+# PRIVATE_KEY      你的 worker key（和 tornado-relayer 一样）        REWARD_ACCOUNT  你的 master 地址
+# RELAYER_FEE      0.3（百分比，和 tornado-relayer 一样）            HTTP_RPC_URL / NET_ID 照旧
+# PAYMASTER_IMPLEMENTATION  该链的 TornadoRelayerPaymaster7702（Sepolia：0x9917840A8843aCE7F525BC24D518Ad059D86Eb31）
+# PAYMASTER_DEPOSIT_WEI     要在 EntryPoint 保持的 gas 浮存（worker 需要 ETH，就像它今天也需要 ETH 付 gas）
+pnpm start
+```
+
+首次启动时服务用 worker key 发三笔交易——EIP-7702 委托、0.1 ETH 的 EntryPoint 质押、入金——再核对 registry 把 worker 解析到的 master 就是 `REWARD_ACCOUNT`，然后就只做签名。`GET /status` 显示模式、master、剩余质押和各池每笔要烧的 TORN。钱包把 worker 地址当 paymaster、把服务 URL 当 ERC-7677 端点即可。
+
 ## 对 Kohaku 来说
 
 Kohaku 只需要增加一条由 relayer 签名的 sponsorship 路径：
@@ -274,7 +312,7 @@ thin Tornado relayer
       ↓
 签 sponsorship
       ↓
-paymaster
+paymaster（= relayer 的 worker EOA，经 EIP-7702 委托）
       ↓
 ERC-4337 bundler
       ↓
@@ -328,3 +366,12 @@ DAO 自己的 Sepolia registry 没有 router、没有启用的池子、费用为
 
 [`0x0411a50f…e7df`](https://sepolia.etherscan.io/tx/0x0411a50f9b54e642382c28c1b13df74ca763583f33dc566af1687e80e181e7df)
 ——EntryPoint → worker EOA（即 paymaster）`relayWithdraw` → `TornadoRouter` → `RelayerRegistry.burn`（从 master 的质押里烧 0.1137 TORN，5000 → 4999.8863）→ 池子 → wrap → 存 Aave。证明里绑定的 fee 0.002253 ETH 付给 master；实际 gas 0.000772 ETH 从 worker 的 EntryPoint 押金里出；钱包到账 0.097747 aWETH。
+
+## 目录
+
+| 路径 | |
+| --- | --- |
+| `contracts/` | `TornadoRelayerPaymasterCore.sol`（逻辑）、`TornadoRelayerPaymaster7702.sol`（worker EOA 的委托目标）、`TornadoRelayerPaymaster.sol`（独立部署版）、`SwapAndSupplyZap.sol`、`dao-sandbox/`（测试网用的 DAO relayer 栈副本） |
+| `relayer/` | 签名服务（`setup.ts` = 首次启动的委托 / 质押 / 入金） |
+| `client/` | 参考钱包流程、证明生成、e2e 测试台（anvil fork + alto） |
+| `kohaku-integration/` | `@kohaku-eth/tornado-cash` 与 `kohaku-cli` 的补丁、Kohaku e2e |
