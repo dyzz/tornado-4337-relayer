@@ -18,6 +18,7 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 
 import { entryPointAbi, paymasterAbi, relayerRegistryAbi, tornadoRouterAbi } from './abi.js';
 import { paymasterArtifact } from './generated/paymaster-artifact.js';
+import { PAYMASTER_AND_DATA_LENGTH } from './userop.js';
 import type { Logger } from './service.js';
 
 export type PaymasterMode = 'standalone' | '7702';
@@ -78,50 +79,26 @@ interface StateFile {
  * With `autoSetup` off, anything missing is reported as an error with the exact step to take.
  */
 export async function ensurePaymasterSetup(cfg: PaymasterSetupConfig, log: Logger): Promise<Address> {
+  if (cfg.mode === '7702') {
+    throw new Error(
+      'PAYMASTER_MODE=7702 is not supported in this release: the relayer-EOA-as-paymaster variant is ' +
+        'experimental and its deployed implementations predate the current sponsorship-terms layout. ' +
+        'Use the standalone worker contract (PAYMASTER_MODE=standalone).',
+    );
+  }
   const account = privateKeyToAccount(cfg.signerKey);
   const chain = { id: Number(cfg.chainId), name: `chain-${cfg.chainId}`, nativeCurrency: { name: 'ETH', symbol: 'ETH', decimals: 18 }, rpcUrls: { default: { http: [cfg.rpcUrl] } } } as const satisfies Chain;
   const publicClient = createPublicClient({ chain, transport: http(cfg.rpcUrl) });
   const wallet = createWalletClient({ account, chain, transport: http(cfg.rpcUrl) });
   let paymaster: Address;
 
-  if (cfg.mode === 'standalone') {
-    paymaster = await ensureStandaloneContract(cfg, account.address, publicClient, wallet, log);
-  } else {
-    paymaster = getAddress(cfg.paymaster ?? account.address);
-  }
+  // Only the standalone worker contract is supported; `PAYMASTER_MODE=7702` is refused above.
+  paymaster = await ensureStandaloneContract(cfg, account.address, publicClient, wallet, log);
 
-  if (cfg.mode === '7702') {
-    if (!isAddressEqual(paymaster, account.address)) {
-      throw new Error(`7702 mode: PAYMASTER_ADDRESS must be the signer's own address ${account.address}`);
-    }
-    if (!cfg.implementation || cfg.implementation === zeroAddress) {
-      throw new Error('7702 mode needs PAYMASTER_IMPLEMENTATION (the TornadoRelayerPaymaster7702 deployment on this chain)');
-    }
-    const expected = delegationCode(cfg.implementation);
-    const code = ((await publicClient.getCode({ address: account.address })) ?? '0x').toLowerCase();
-    if (code !== expected) {
-      const msg =
-        `relayer address ${account.address} is not delegated to ${cfg.implementation} (code: ${code}). ` +
-        'Send an EIP-7702 transaction from this key delegating to the implementation, or enable AUTO_SETUP.';
-      if (!cfg.autoSetup) throw new Error(msg);
-      log.info('7702: delegating the relayer address to the paymaster implementation', {
-        address: account.address,
-        implementation: cfg.implementation,
-      });
-      const nonce = await publicClient.getTransactionCount({ address: account.address });
-      const authorization = await account.signAuthorization({
-        address: cfg.implementation,
-        chainId: Number(cfg.chainId),
-        nonce: nonce + 1, // the EOA sends the transaction itself, so the authorization uses the next nonce
-      });
-      const hash = await wallet.sendTransaction({ to: account.address, data: '0x', authorizationList: [authorization] });
-      const receipt = await publicClient.waitForTransactionReceipt({ hash });
-      if (receipt.status !== 'success') throw new Error(`7702 delegation transaction ${hash} failed`);
-      const after = ((await publicClient.getCode({ address: account.address })) ?? '0x').toLowerCase();
-      if (after !== expected) throw new Error(`delegation did not take effect (code ${after})`);
-      log.info('7702: delegated', { tx: hash });
-    }
-  }
+  // Read-only compatibility check before a single wei moves: a paymaster from an older release parses
+  // paymasterAndData with a different layout, so staking and funding it would only burn ETH on a
+  // contract that will reject every sponsorship this software signs.
+  await assertPaymasterCompatible(cfg, paymaster, account.address, publicClient, log);
 
   // Stake (needed for validation-phase storage access under ERC-7562) and gas deposit.
   const info = await publicClient.readContract({ address: cfg.entryPoint, abi: entryPointAbi, functionName: 'getDepositInfo', args: [paymaster] });
@@ -155,6 +132,91 @@ export async function ensurePaymasterSetup(cfg: PaymasterSetupConfig, log: Logge
 }
 
 /** Deploy the standalone worker contract from the relayer key on first start; remember it in the state file. */
+/**
+ * Everything that must already be true of a paymaster before the service spends anything on it. All
+ * reads, no transactions, so a mismatch costs nothing: wrong network, wrong EntryPoint, a contract that
+ * answers to another signing key, a router other than the configured one, and — the reason this exists —
+ * a sponsorship-terms layout this software cannot produce.
+ *
+ * The layout check compares `PAYMASTER_AND_DATA_LENGTH()` with the local encoder. That catches a
+ * paymaster from a release whose terms were a different size, which is exactly the upgrade that has
+ * already happened once. It cannot catch a future change that keeps the length and alters the meaning of
+ * a field; such a change needs an explicit version in the contract, not a longer length.
+ */
+async function assertPaymasterCompatible(
+  cfg: PaymasterSetupConfig,
+  paymaster: Address,
+  signer: Address,
+  publicClient: ReturnType<typeof createPublicClient>,
+  log: Logger,
+): Promise<void> {
+  const code = (await publicClient.getCode({ address: paymaster })) ?? '0x';
+  if (code === '0x') throw new Error(`no contract at paymaster address ${paymaster}`);
+
+  const chainId = BigInt(await publicClient.getChainId());
+  if (chainId !== cfg.chainId) throw new Error(`RPC chain id ${chainId} does not match configured ${cfg.chainId}`);
+
+  const read = async <T>(functionName: 'PAYMASTER_AND_DATA_LENGTH' | 'entryPoint' | 'verifyingSigner' | 'router'): Promise<T> => {
+    try {
+      return (await publicClient.readContract({ address: paymaster, abi: paymasterAbi, functionName })) as T;
+    } catch (err) {
+      throw new Error(
+        `paymaster ${paymaster} does not answer ${functionName}(): it is not a TornadoRelayerPaymaster this ` +
+          `software can drive (${(err as Error).message.split('\n')[0]})`,
+      );
+    }
+  };
+
+  const [onChainLength, entryPoint, verifyingSigner, router] = await Promise.all([
+    read<bigint>('PAYMASTER_AND_DATA_LENGTH'),
+    read<Address>('entryPoint'),
+    read<Address>('verifyingSigner'),
+    read<Address>('router'),
+  ]);
+
+  if (onChainLength !== BigInt(PAYMASTER_AND_DATA_LENGTH)) {
+    throw new Error(
+      `paymaster ${paymaster} encodes paymasterAndData as ${onChainLength} bytes, this software produces ` +
+        `${PAYMASTER_AND_DATA_LENGTH}: it was deployed by a different release. Deploy a new worker contract ` +
+        '(unset PAYMASTER_ADDRESS and remove the state file) and have your master register it.',
+    );
+  }
+  if (!isAddressEqual(entryPoint, cfg.entryPoint)) {
+    throw new Error(`paymaster ${paymaster} is bound to EntryPoint ${entryPoint}, configured ${cfg.entryPoint}`);
+  }
+  if (!isAddressEqual(verifyingSigner, signer)) {
+    throw new Error(`paymaster ${paymaster} expects signatures from ${verifyingSigner}, this key is ${signer}`);
+  }
+  if (cfg.router && cfg.router !== zeroAddress && !isAddressEqual(router, cfg.router)) {
+    throw new Error(
+      `paymaster ${paymaster} routes withdrawals through ${router}, configured TORNADO_ROUTER is ${cfg.router}: ` +
+        'a mismatch would burn the wrong relayer stake or bypass the registry',
+    );
+  }
+  if (cfg.rewardAccount && cfg.router && cfg.router !== zeroAddress) {
+    // The worker -> master relationship the proofs will name. Not fatal here (the master may not have
+    // registered us yet, which `ensureRegistered` waits for), but a *different* master is a misconfiguration.
+    const master = await publicClient
+      .readContract({ address: router, abi: tornadoRouterAbi, functionName: 'relayerRegistry' })
+      .then((registry) =>
+        publicClient.readContract({ address: registry as Address, abi: relayerRegistryAbi, functionName: 'workers', args: [paymaster] }),
+      )
+      .catch(() => zeroAddress as Address);
+    if (master !== zeroAddress && !isAddressEqual(master, cfg.rewardAccount)) {
+      throw new Error(
+        `the registry resolves paymaster ${paymaster} to master ${master}, but REWARD_ACCOUNT is ${cfg.rewardAccount}`,
+      );
+    }
+  }
+  log.info('paymaster preflight passed', {
+    paymaster,
+    paymasterAndDataLength: onChainLength.toString(),
+    entryPoint,
+    router,
+    verifyingSigner,
+  });
+}
+
 async function ensureStandaloneContract(
   cfg: PaymasterSetupConfig,
   signer: Address,

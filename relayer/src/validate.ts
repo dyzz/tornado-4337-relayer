@@ -111,13 +111,22 @@ export interface SponsorRules {
 }
 
 /**
- * Find the withdraw that pays for this userOp. It must be the *only* Tornado withdrawal
- * in the operation, performed as a `relayWithdraw` on the paymaster (so the DAO's Router
- * / RelayerRegistry sees the paymaster as the relayer and burns the stake once per
- * relayed withdrawal, as today), naming `rewardAccount` as relayer and the sender as
- * recipient. Direct `pool.withdraw` calls in the same operation are refused: they would
- * ride on the sponsored gas without going through the router. Nothing else may touch
- * the paymaster.
+ * Find the withdraw that pays for this userOp: the one `relayWithdraw` on the paymaster, naming
+ * `rewardAccount` as relayer and the sender as recipient, so the DAO's Router / RelayerRegistry sees
+ * the paymaster as the relayer and burns the stake once per relayed withdrawal, as today.
+ *
+ * What this guarantees, precisely: each sponsorship authorises exactly one withdrawal, that withdrawal
+ * goes through the Router, and it is charged by the Registry / FeeManager rules in force. A second
+ * Tornado withdrawal among the operation's own calls is refused, and nothing but `relayWithdraw` may
+ * touch the paymaster — a direct `pool.withdraw` would ride on the sponsored gas without the burn.
+ *
+ * What it does not guarantee: these are the account's *top-level* calls. A tail-call contract could
+ * reach Tornado again inside its own call tree, and this decoder does not walk it. That is not the risk
+ * it looks like — any such withdrawal pays its own way through the Router with its own relayer and fee,
+ * and the sponsorship still covers exactly the one withdrawal the relayer priced — but it means "one
+ * note per operation" is a statement about what this relayer sponsors, not a claim about everything
+ * that can happen inside an operation. Multi-note withdrawals are separate UserOperations (the Kohaku
+ * SDK issues one per note); atomicity holds within each operation, not across them.
  */
 export function findSponsoringWithdraw(calls: DecodedCall[], rules: SponsorRules): TornadoWithdrawCall {
   const withdraws = decodeTornadoWithdraws(calls, rules.paymaster);

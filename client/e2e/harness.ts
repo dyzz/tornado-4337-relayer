@@ -73,6 +73,8 @@ export interface Harness {
   forkBlock: bigint;
   deployer: ReturnType<typeof privateKeyToAccount>;
   relayerSigner: ReturnType<typeof privateKeyToAccount>;
+  /** The relayer's own key, for tests that re-run the setup step against other configurations. */
+  relayerSignerKey: Hex;
   instance: Address;
   denomination: bigint;
   instanceDeployBlock: bigint;
@@ -80,8 +82,6 @@ export interface Harness {
   erc20Instance: Address;
   erc20Denomination: bigint;
   paymaster: Address;
-  /** 7702 mode: the shared implementation the relayer EOA delegates to. */
-  paymasterImplementation?: Address;
   zap: Address;
   relayer: RelayerService;
   /** Address the proofs name as relayer: the paymaster, or the master EOA in worker mode. */
@@ -103,6 +103,8 @@ export interface Harness {
   /** Give `to` some of the demo ERC-20 (storage write on mainnet-style tokens, whale transfer otherwise). */
   dealErc20(to: Address, amount: bigint): Promise<void>;
   mine(blocks?: number): Promise<void>;
+  /** Send one transaction as `who` (anvil impersonation), e.g. the registry master. */
+  impersonated(who: Address, fn: (wallet: ReturnType<typeof createWalletClient>) => Promise<Hex>): Promise<void>;
   stop(): Promise<void>;
 }
 
@@ -150,13 +152,6 @@ export interface HarnessOptions {
   registry?: 'master' | 'worker';
   /** Worker mode: master EOA of the existing relayer (default: solid-relayer.eth's, registered 2026). */
   workerOf?: Address;
-  /**
-   * standalone (default): deploy a TornadoRelayerPaymaster contract.
-   * 7702: the relayer signer EOA *is* the paymaster — it is registered as the worker, delegated to a freshly
-   * deployed TornadoRelayerPaymaster7702 implementation, staked and funded by the relayer's own setup step.
-   * Implies `registry: 'worker'`.
-   */
-  paymasterMode?: 'standalone' | '7702';
   /** Protocol fee (burn) set on the fresh instances, in 1e-4 (default 30 = 0.30 %, the DAO's ETH-1 setting). */
   protocolFeePercentage?: number;
   anvilPort?: number;
@@ -272,22 +267,11 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
     const balance = await publicClient.readContract({ address: token, abi: erc20Abi, functionName: 'balanceOf', args: [to] });
     if (balance < amount) throw new Error(`dealErc20 failed: balance ${balance} < ${amount}`);
   };
-  const paymasterMode = opts.paymasterMode ?? 'standalone';
-  if (paymasterMode === '7702' && opts.registry !== 'worker') throw new Error('7702 mode is the worker of an existing relayer: use registry: "worker"');
   const router = opts.registry ? setup.dao.tornadoRouter : undefined;
   if (opts.registry && !router) throw new Error(`registry mode needs a TornadoRouter; ${setup.chain.name} has none`);
   let paymaster: Address;
-  let paymasterImplementation: Address | undefined;
   const setupLog = { info: (m: string, meta?: Record<string, unknown>) => log(`setup: ${m} ${meta ? JSON.stringify(meta) : ''}`), warn: (m: string) => log(`setup WARN: ${m}`) };
-  if (paymasterMode === '7702') {
-    paymasterImplementation = await deployPaymaster7702Implementation(wallet, publicClient, {
-      entryPoint: setup.entryPoint,
-      router: router!,
-      gasMarginBps: opts.gasMarginBps ?? 1_000n,
-      postOpGasOverhead: 45_000n,
-    });
-    paymaster = relayerSigner.address; // delegated below, after it is registered as a worker
-  } else if (opts.registry === 'worker') {
+  if (opts.registry === 'worker') {
     // The production path: the relayer software deploys its own worker contract from its key,
     // stakes and funds it; the master registers it afterwards (impersonated below).
     paymaster = await ensurePaymasterSetup(
@@ -321,15 +305,15 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
   // --- DAO router / registry wiring -------------------------------------------
   let rewardAccount: Address = paymaster;
   let registry: Harness['registry'];
+  const impersonated = async (who: Address, fn: (w: ReturnType<typeof createWalletClient>) => Promise<Hex>) => {
+    await testClient.impersonateAccount({ address: who });
+    await setBalance(who, parseEther('10'));
+    const hash = await fn(createWalletClient({ account: who, chain, transport: http(rpcUrl) }));
+    await publicClient.waitForTransactionReceipt({ hash });
+    await testClient.stopImpersonatingAccount({ address: who });
+  };
   if (opts.registry && router) {
     const { dao } = setup;
-    const impersonated = async (who: Address, fn: (w: ReturnType<typeof createWalletClient>) => Promise<Hex>) => {
-      await testClient.impersonateAccount({ address: who });
-      await setBalance(who, parseEther('10'));
-      const hash = await fn(createWalletClient({ account: who, chain, transport: http(rpcUrl) }));
-      await publicClient.waitForTransactionReceipt({ hash });
-      await testClient.stopImpersonatingAccount({ address: who });
-    };
     // The router only serves instances the InstanceRegistry knows: add the fresh ones as governance.
     if (!opts.canonicalInstances) {
       const protocolFeePercentage = opts.protocolFeePercentage ?? 30;
@@ -437,25 +421,7 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
     swapRouter: setup.uniswapSwapRouter02,
     aavePool: setup.aavePool,
   });
-  if (paymasterMode === '7702') {
-    // Exactly what the relayer software does on first start: delegate, stake, deposit — from its own key.
-    await ensurePaymasterSetup(
-      {
-        chainId: BigInt(chain.id),
-        rpcUrl,
-        entryPoint: setup.entryPoint,
-        signerKey: relayerKey,
-        mode: '7702',
-        implementation: paymasterImplementation,
-        autoSetup: true,
-        stakeWei: parseEther('0.1'),
-        unstakeDelaySec: 86_400,
-        depositWei: parseEther('2'),
-        requireRegistration: false,
-      },
-      setupLog,
-    );
-  } else if (opts.registry === 'worker') {
+  if (opts.registry === 'worker') {
     // already staked and funded by the setup step above
   } else {
     const depositHash = await wallet.writeContract({
@@ -466,7 +432,7 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
     });
     await publicClient.waitForTransactionReceipt({ hash: depositHash });
   }
-  log(`deployed tornado=${instance} tornado-${setup.demoErc20.symbol}=${erc20Instance} paymaster=${paymaster}${paymasterImplementation ? ` (7702 -> ${paymasterImplementation})` : ''} zap=${zap} hasher=${hasher}`);
+  log(`deployed tornado=${instance} tornado-${setup.demoErc20.symbol}=${erc20Instance} paymaster=${paymaster} zap=${zap} hasher=${hasher}`);
 
   // --- bundler ----------------------------------------------------------------
   const altoPort = opts.altoPort ?? (await freePort());
@@ -520,6 +486,8 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
       serviceFeeBps: opts.serviceFeeBps ?? 30n,
       signatureTtlSec: 300,
       simulateWithBundler: true,
+      // The harness's senders are Simple7702Account; the relayer refuses anything else.
+      allowedSenderImplementations: [setup.simple7702Implementation],
       gasPriceMarginBps: 11_000n,
       sponsorName: 'tornado-4337-relayer (e2e)',
     },
@@ -542,13 +510,13 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
     forkBlock,
     deployer,
     relayerSigner,
+    relayerSignerKey: relayerKey,
     instance,
     denomination,
     instanceDeployBlock,
     erc20Instance,
     erc20Denomination,
     paymaster,
-    paymasterImplementation,
     zap,
     relayer,
     rewardAccount,
@@ -557,6 +525,7 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
     newFundedAccount,
     dealErc20,
     mine,
+    impersonated,
     async stop() {
       await new Promise<void>((r) => server.close(() => r()));
       await altoInstance.stop();

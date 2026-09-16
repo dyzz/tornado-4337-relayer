@@ -104,10 +104,10 @@ index 77d4591..f633f42 100644
 \ No newline at end of file
 diff --git a/packages/tornado-cash/src/paymaster/relayer-paymaster-client.ts b/packages/tornado-cash/src/paymaster/relayer-paymaster-client.ts
 new file mode 100644
-index 0000000..dc549a4
+index 0000000..f63f8ce
 --- /dev/null
 +++ b/packages/tornado-cash/src/paymaster/relayer-paymaster-client.ts
-@@ -0,0 +1,158 @@
+@@ -0,0 +1,164 @@
 +import { hexToBigInt, parseAbi, toHex, type Address, type Hex } from 'viem';
 +
 +import { SerializedUserOperation, UserOpGasLimits } from '../interfaces/user-ops.interface';
@@ -117,9 +117,15 @@ index 0000000..dc549a4
 + *
 + * The relayer exposes ERC-7677 (`pm_getPaymasterStubData`, `pm_getPaymasterData`)
 + * plus `tornado_quote`, which returns the fee a withdrawal proof must bind so the
-+ * paymaster is reimbursed for the sponsored gas. The withdraw itself runs in the
-+ * userOp's callData (executed by the 7702 sender), not during paymaster
-+ * validation, so any account can be sponsored and the paymaster needs no stake.
++ * paymaster is reimbursed for the sponsored gas. The withdraw runs in the userOp's
++ * callData, executed by the 7702 sender, rather than during paymaster validation.
++ *
++ * That does not make the paymaster indifferent to which account executes it: the relayer
++ * sponsors only account implementations it knows (Simple7702Account by default), because
++ * an account that ignored the calldata would spend the sponsored gas without performing
++ * the withdrawal, and the sponsorship binds that implementation on-chain. The paymaster is
++ * also staked on the EntryPoint, which ERC-7562 requires of a paymaster that reads its own
++ * storage during validation.
 + */
 +/**
 + * `TornadoRelayerPaymaster.relayWithdraw`: the sponsoring withdraw is executed by the paymaster

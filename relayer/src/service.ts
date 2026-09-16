@@ -16,7 +16,7 @@ import {
 } from 'viem';
 import { privateKeyToAccount, type PrivateKeyAccount } from 'viem/accounts';
 
-import { erc20MetadataAbi, feeManagerAbi, paymasterAbi, relayerRegistryAbi, tornadoInstanceAbi, tornadoRouterAbi } from './abi.js';
+import { entryPointAbi, erc20MetadataAbi, feeManagerAbi, paymasterAbi, relayerRegistryAbi, tornadoInstanceAbi, tornadoRouterAbi } from './abi.js';
 import {
   BPS,
   DEFAULT_GAS,
@@ -34,6 +34,7 @@ import {
   paymasterHash,
   q,
   readGas,
+  totalGas,
   withdrawalHash,
   type FeeTerms,
   type RpcUserOperation,
@@ -45,8 +46,11 @@ import { decodeAccountCalls, findSponsoringWithdraw, ValidationError } from './v
 export interface RelayerConfig {
   chainId: bigint;
   rpcUrl: string;
-  /** Bundler RPC (Pimlico / alto). Used for gas prices and pre-signing simulation. */
-  bundlerUrl?: string;
+  /**
+   * Bundler RPC (Pimlico / alto). Required: every sponsorship is simulated there before it is signed,
+   * and the quote's gas price comes from it. A configuration without one is refused at start-up.
+   */
+  bundlerUrl: string;
   entryPoint: Address;
   paymaster: Address;
   /** Private key of the paymaster's `verifyingSigner`. */
@@ -63,11 +67,14 @@ export interface RelayerConfig {
   /** Where live sponsorships are kept (default: in memory). */
   sponsorshipStore?: SponsorshipStore;
   /**
-   * Optional defence in depth: only sponsor senders whose code (or pending EIP-7702 delegation) is one
-   * of these implementations, e.g. Simple7702Account v0.8. The sponsorship is bound on-chain to the exact
-   * withdrawal regardless; this only avoids paying gas for accounts that would revert anyway.
+   * The account implementations this relayer sponsors, e.g. Simple7702Account v0.8. Not optional and
+   * never empty: `senderImplementation` binds the sponsorship to whichever implementation executes it,
+   * but only an allowlist keeps a caller from asking for a sponsorship in the first place with an
+   * account whose `execute` ignores the calldata — that operation would consume the paymaster's gas
+   * without ever performing the withdrawal or paying the fee. `RelayerService.create` refuses an empty
+   * list. Defaults to the canonical Simple7702Account for the chain (see `config.ts`).
    */
-  allowedSenderImplementations?: Address[];
+  allowedSenderImplementations: Address[];
   /** Tornado instances this relayer sponsors (ETH or ERC-20; detected on boot). */
   instances: Address[];
   /** Token pricing for ERC-20 instances. Required when any instance is an ERC-20 pool. */
@@ -76,8 +83,28 @@ export interface RelayerConfig {
   serviceFeeBps: bigint;
   /** How long a signature stays valid. Keep short: the fee is quoted at signing time. */
   signatureTtlSec: number;
-  /** Run eth_estimateUserOperationGas on the bundler before signing. */
+  /**
+   * Run eth_estimateUserOperationGas on the bundler before signing. Leave on: it is the only check that
+   * exercises the *execution* phase (the withdrawal plus the caller's tail calls) before the relayer
+   * commits its signature. Turning it off is for tests with no bundler.
+   *
+   * It is not a guarantee of payment. ERC-4337 validation-phase simulation does not promise that
+   * execution succeeds at inclusion time, and a UserOperation that lands and then reverts in execution
+   * is still paid for by the paymaster. The bounded exposure comes from the short signature lifetime,
+   * the per-operation fee floor and the deposit budget, not from this call.
+   */
   simulateWithBundler: boolean;
+  /** Per-request timeout for bundler JSON-RPC calls (default 20 s). A timeout refuses the sponsorship. */
+  bundlerTimeoutMs?: number;
+  /**
+   * Gas budget, checked against the EntryPoint deposit before every signature.
+   *   minDepositWei   stop signing while the deposit (minus what outstanding sponsorships could still
+   *                   cost) would fall below this. Top the deposit up by hand; the service does not
+   *                   move funds while it is serving.
+   *   maxSponsorshipGasWei  refuse any single operation whose gas limits could cost more than this.
+   */
+  minDepositWei?: bigint;
+  maxSponsorshipGasWei?: bigint;
   /** Multiplier (bps) applied to the bundler's fast gas price when quoting. */
   gasPriceMarginBps: bigint;
   sponsorName: string;
@@ -191,6 +218,12 @@ export interface SponsoredNote {
   status: 'pending' | 'signed';
   /** Identifies the request that holds the entry; only it may release or commit it. */
   token: string;
+  /**
+   * The most the EntryPoint can charge the paymaster for this operation (its gas limits at its
+   * `maxFeePerGas`). Outstanding entries are summed when the next request is checked against the
+   * deposit, so a burst of concurrent requests cannot each treat the same balance as free.
+   */
+  maxGasCostWei?: bigint;
 }
 
 /**
@@ -211,6 +244,8 @@ export interface SponsorshipStore {
   /** Drop the reservation `token` holds if it is still pending (no-op otherwise). */
   release(nullifierHash: Hex, token: string): void;
   prune(now: number): void;
+  /** Every entry still live at `now`: pending and signed sponsorships the paymaster may still pay for. */
+  outstanding(now: number): SponsoredNote[];
 }
 
 export class MemorySponsorshipStore implements SponsorshipStore {
@@ -242,6 +277,9 @@ export class MemorySponsorshipStore implements SponsorshipStore {
   }
   prune(now: number) {
     for (const [k, v] of this.notes) if (v.validUntil < now) this.delete(k);
+  }
+  outstanding(now: number): SponsoredNote[] {
+    return [...this.notes.values()].filter((v) => v.validUntil >= now);
   }
 }
 
@@ -279,12 +317,27 @@ export class RelayerService {
     this.sponsored = config.sponsorshipStore ?? new MemorySponsorshipStore();
   }
 
+  /** The live sponsorship store (read-only use: which notes are reserved or signed right now). */
+  get sponsorships(): SponsorshipStore {
+    return this.sponsored;
+  }
+
   /** Worker mode: the fee is paid to the master EOA, so nothing can be refunded by the paymaster. */
   get refunds(): boolean {
     return isAddressEqual(this.rewardAccount, this.config.paymaster);
   }
 
   static async create(config: RelayerConfig, log: Logger = consoleLogger): Promise<RelayerService> {
+    // Refuse the two configurations that would silently widen what gets sponsored.
+    if (!config.allowedSenderImplementations || config.allowedSenderImplementations.length === 0) {
+      throw new Error(
+        'allowedSenderImplementations must list at least one account implementation: an unrestricted relayer ' +
+          'would sponsor an account whose execute() ignores the calldata, paying gas for no withdrawal',
+      );
+    }
+    if (config.simulateWithBundler && !config.bundlerUrl) {
+      throw new Error('BUNDLER_URL is required: sponsorships are simulated on the bundler before they are signed');
+    }
     const client = createPublicClient({ transport: http(config.rpcUrl) });
     const chainId = BigInt(await client.getChainId());
     if (chainId !== config.chainId) {
@@ -374,7 +427,16 @@ export class RelayerService {
 
   // ------------------------------------------------------------------ status
 
+  /**
+   * A live view, not the start-up snapshot: the deposit, the stake, the worker -> master relationship
+   * and the per-withdrawal burn are re-read on every call. Anything that cannot be read is reported as
+   * unavailable rather than served as a stale value, and `checkedAt` / `checkedAtBlock` say how fresh
+   * the numbers are.
+   */
   async status() {
+    const now = Math.floor(Date.now() / 1000);
+    this.sponsored.prune(now);
+    const live = await this.liveRegistryState();
     const ethPrices: Record<string, string> = {};
     for (const i of this.instances.values()) {
       if (i.token === zeroAddress) continue;
@@ -395,17 +457,31 @@ export class RelayerService {
       /** Whether postOp refunds `fee - gas - serviceFee` (master mode) or the fee is fixed (worker mode). */
       refunds: this.refunds,
       registry: {
-        mode: this.registry.mode,
+        mode: live.registry?.mode ?? this.registry.mode,
         router: this.registry.router,
         relayerRegistry: this.registry.relayerRegistry,
-        master: this.registry.master,
-        stake: toHex(this.registry.stake),
-        minStake: toHex(this.registry.minStake),
+        master: live.registry?.master ?? this.registry.master,
+        stake: live.registry ? toHex(live.registry.stake) : null,
+        minStake: live.registry ? toHex(live.registry.minStake) : null,
         ensHash: this.registry.ensHash,
-        burnPerWithdraw: Object.fromEntries(
-          Object.entries(this.registry.burnPerWithdraw).map(([k, v]) => [k, toHex(v)]),
-        ),
+        burnPerWithdraw: live.registry
+          ? Object.fromEntries(Object.entries(live.registry.burnPerWithdraw).map(([k, v]) => [k, toHex(v)]))
+          : null,
+        /** The master this worker resolved to at start-up; a change here means the registration moved. */
+        masterAtStartup: this.registry.master,
       },
+      /** EntryPoint balances and what is already promised out of them. */
+      deposit: {
+        wei: live.deposit === undefined ? null : toHex(live.deposit),
+        stakeWei: live.stake === undefined ? null : toHex(live.stake),
+        minWei: toHex(this.config.minDepositWei ?? 0n),
+        committedWei: toHex(live.committed),
+        /** false while the relayer refuses new sponsorships because the deposit cannot cover them. */
+        accepting: live.accepting,
+      },
+      /** When these numbers were read. Null values mean the node could not be reached for that field. */
+      checkedAt: now,
+      checkedAtBlock: live.blockNumber === undefined ? null : toHex(live.blockNumber),
       signer: this.signer.address,
       instances: [...this.instances.values()].map((i) => ({
         address: i.address,
@@ -600,7 +676,9 @@ export class RelayerService {
     this.sponsored.prune(now);
     const nonce = q(op.nonce, 'nonce');
     const validUntil = now + this.config.signatureTtlSec;
-    const reserved = this.sponsored.reserve(w.nullifierHash, { validUntil, sender: op.sender, nonce });
+    // What the EntryPoint can charge us for this operation at its own gas limits and price.
+    const maxGasCostWei = totalGas(gas) * maxFeePerGas;
+    const reserved = this.sponsored.reserve(w.nullifierHash, { validUntil, sender: op.sender, nonce, maxGasCostWei });
     if (!reserved.ok) {
       throw new ValidationError(
         `note already ${reserved.held.status === 'signed' ? 'sponsored' : 'being sponsored'}; valid until ${reserved.held.validUntil}`,
@@ -615,17 +693,21 @@ export class RelayerService {
       //    validation, so a client cannot swap authorizations after the signature. Optionally allowlisted.
       senderImplementation = await this.resolveSenderImplementation(op);
 
-      // 5. On-chain sanity: the proof must verify against the instance right now.
+      // 5. The deposit has to cover this operation *and* everything already promised. The reservation
+      //    is already held, so concurrent requests see each other's commitments here.
+      await this.assertDepositCovers(maxGasCostWei, now);
+
+      // 6. On-chain sanity: the proof must verify against the instance right now.
       await this.assertWithdrawSimulates(w);
 
-      // 6. Optional full simulation on the bundler (validation + execution incl. tail calls).
+      // 7. Full simulation on the bundler (validation + execution incl. tail calls).
       if (this.config.simulateWithBundler) await this.assertBundlerSimulates(op, context);
     } catch (err) {
       this.sponsored.release(w.nullifierHash, token);
       throw err;
     }
 
-    // 7. Sign.
+    // 8. Sign.
     const terms: FeeTerms = {
       validUntil,
       validAfter: 0,
@@ -680,6 +762,36 @@ export class RelayerService {
     };
   }
 
+  /**
+   * One read of everything `/status` reports about the chain. Every field is optional: a node that
+   * cannot be reached produces `undefined`, which the caller renders as "unavailable" instead of
+   * repeating a start-up value that may no longer be true.
+   */
+  private async liveRegistryState(): Promise<{
+    blockNumber?: bigint;
+    deposit?: bigint;
+    stake?: bigint;
+    committed: bigint;
+    accepting: boolean;
+    registry?: RegistryInfo;
+  }> {
+    const now = Math.floor(Date.now() / 1000);
+    const committed = this.sponsored.outstanding(now).reduce((sum, n) => sum + (n.maxGasCostWei ?? 0n), 0n);
+    const [blockNumber, deposit, depositInfo, registry] = await Promise.all([
+      this.client.getBlockNumber().catch(() => undefined),
+      this.depositWei().catch(() => undefined),
+      this.client
+        .readContract({ address: this.config.entryPoint, abi: entryPointAbi, functionName: 'getDepositInfo', args: [this.config.paymaster] })
+        .catch(() => undefined),
+      this.registry.mode === 'no-router'
+        ? Promise.resolve(undefined)
+        : probeRegistry(this.client, this.config.paymaster, this.registry.router, [...this.instances.keys()]).catch(() => undefined),
+    ]);
+    const floor = this.config.minDepositWei ?? 0n;
+    const accepting = deposit !== undefined && deposit >= committed + floor;
+    return { blockNumber, deposit, stake: depositInfo ? BigInt(depositInfo.stake) : undefined, committed, accepting, registry };
+  }
+
   // ------------------------------------------------------------------ internals
 
   private rules(sender: Address) {
@@ -689,6 +801,47 @@ export class RelayerService {
       allowedInstances: this.config.instances,
       sender,
     };
+  }
+
+  /**
+   * The paymaster's own EntryPoint deposit, read now (not at start-up).
+   */
+  async depositWei(): Promise<bigint> {
+    return this.client.readContract({ address: this.config.paymaster, abi: paymasterAbi, functionName: 'getDeposit' });
+  }
+
+  /**
+   * Refuse the sponsorship unless the deposit covers this operation on top of every sponsorship that is
+   * still live. The relayer does not move funds while it is serving: when this trips, top the deposit up
+   * and requests are accepted again.
+   */
+  private async assertDepositCovers(maxGasCostWei: bigint, now: number): Promise<void> {
+    const cap = this.config.maxSponsorshipGasWei;
+    if (cap !== undefined && maxGasCostWei > cap) {
+      throw new ValidationError(
+        `this operation could cost ${maxGasCostWei} wei of gas, above the per-operation limit ${cap}`,
+        -32004,
+      );
+    }
+    const floor = this.config.minDepositWei ?? 0n;
+    let deposit: bigint;
+    try {
+      deposit = await this.depositWei();
+    } catch (err) {
+      // An unreadable deposit is not a pass.
+      throw new ValidationError(`cannot read the paymaster's EntryPoint deposit: ${shortError(err)}`, -32004);
+    }
+    // Everything already promised and not yet expired, including this request's own reservation.
+    const committed = this.sponsored
+      .outstanding(now)
+      .reduce((sum, note) => sum + (note.maxGasCostWei ?? 0n), 0n);
+    if (deposit < committed + floor) {
+      throw new ValidationError(
+        `paymaster deposit ${deposit} wei cannot cover ${committed} wei of live sponsorships plus the ${floor} wei reserve: ` +
+          'the relayer is not accepting new sponsorships until the deposit is topped up',
+        -32004,
+      );
+    }
   }
 
   /**
@@ -740,7 +893,10 @@ export class RelayerService {
   }
 
   private async assertBundlerSimulates(op: RpcUserOperation, context: SponsorContext) {
-    if (!this.config.bundlerUrl) return;
+    // Never a silent skip: a missing bundler URL is refused by `create`.
+    if (!this.config.bundlerUrl) {
+      throw new ValidationError('no bundler configured: refusing to sign without a pre-signing simulation', -32007);
+    }
     const stub = this.stubData(op, context);
     const simulated: RpcUserOperation = {
       ...op,
@@ -768,21 +924,78 @@ export class RelayerService {
       authorized && ((await this.client.getCode({ address: op.sender })) ?? '0x') === '0x'
         ? { [op.sender]: { code: delegationCode(authorized) } }
         : undefined;
+    let result: unknown;
     try {
-      await this.bundlerRequest('eth_estimateUserOperationGas', [simulated, this.config.entryPoint, ...(stateOverride ? [stateOverride] : [])]);
+      result = await this.bundlerRequest('eth_estimateUserOperationGas', [
+        simulated,
+        this.config.entryPoint,
+        ...(stateOverride ? [stateOverride] : []),
+      ]);
     } catch (err) {
       throw new ValidationError(`bundler simulation failed: ${shortError(err)}`, -32007);
     }
+
+    // A transport that answers 200 with no usable estimate is a failed simulation, not a pass.
+    const estimate = asGasEstimate(result);
+    if (!estimate) {
+      throw new ValidationError(
+        `bundler simulation returned no usable gas estimate: ${JSON.stringify(result ?? null).slice(0, 200)}`,
+        -32007,
+      );
+    }
+    // The op is signed with the limits the caller sent, so the estimate has to fit inside them. If it
+    // does not, the caller re-quotes with the higher limits (and re-proves at the new fee) and asks
+    // again — the relayer never edits an operation it has signed.
+    const sent = readGas(op);
+    const tooSmall: string[] = [];
+    if (estimate.callGasLimit > sent.callGasLimit) tooSmall.push(`callGasLimit ${sent.callGasLimit} < ${estimate.callGasLimit}`);
+    if (estimate.verificationGasLimit > sent.verificationGasLimit) {
+      tooSmall.push(`verificationGasLimit ${sent.verificationGasLimit} < ${estimate.verificationGasLimit}`);
+    }
+    if (estimate.preVerificationGas > sent.preVerificationGas) {
+      tooSmall.push(`preVerificationGas ${sent.preVerificationGas} < ${estimate.preVerificationGas}`);
+    }
+    if (estimate.paymasterVerificationGasLimit !== undefined && estimate.paymasterVerificationGasLimit > sent.paymasterVerificationGasLimit) {
+      tooSmall.push(`paymasterVerificationGasLimit ${sent.paymasterVerificationGasLimit} < ${estimate.paymasterVerificationGasLimit}`);
+    }
+    if (tooSmall.length > 0) {
+      throw new ValidationError(
+        `the bundler's estimate does not fit the operation's gas limits (${tooSmall.join('; ')}): re-quote with these limits and ask again`,
+        -32008,
+      );
+    }
   }
 
+  /**
+   * One JSON-RPC call to the bundler. Every way it can fail — timeout, transport error, HTTP status,
+   * unparseable body, JSON-RPC error, or a body with neither result nor error — throws, so a caller
+   * that wraps this in a sponsorship check can never mistake a broken bundler for a passing simulation.
+   */
   private async bundlerRequest(method: string, params: unknown[]): Promise<unknown> {
-    const res = await fetch(this.config.bundlerUrl!, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
-    });
-    const body = (await res.json()) as { result?: unknown; error?: { message: string; data?: unknown } };
-    if (body.error) throw new Error(body.error.message + (body.error.data ? ` ${JSON.stringify(body.error.data)}` : ''));
+    const timeoutMs = this.config.bundlerTimeoutMs ?? 20_000;
+    let res: Response;
+    try {
+      res = await fetch(this.config.bundlerUrl, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+    } catch (err) {
+      const reason = (err as Error)?.name === 'TimeoutError' ? `timed out after ${timeoutMs} ms` : shortError(err);
+      throw new Error(`${method}: ${reason}`);
+    }
+    if (!res.ok) throw new Error(`${method}: bundler returned HTTP ${res.status}`);
+    let body: { result?: unknown; error?: { message?: string; data?: unknown } };
+    try {
+      body = (await res.json()) as typeof body;
+    } catch {
+      throw new Error(`${method}: bundler returned a body that is not JSON`);
+    }
+    if (body?.error) {
+      throw new Error((body.error.message ?? 'bundler error') + (body.error.data ? ` ${JSON.stringify(body.error.data)}` : ''));
+    }
+    if (!body || body.result === undefined || body.result === null) throw new Error(`${method}: bundler returned no result`);
     return body.result;
   }
 
@@ -802,9 +1015,12 @@ export class RelayerService {
       else throw new ValidationError('only EIP-7702 senders are sponsored (sender is a contract account)', -32009);
       source = 'delegation';
     }
-    const allowed = this.config.allowedSenderImplementations;
-    if (allowed && allowed.length > 0 && !allowed.some((a) => isAddressEqual(a, implementation!))) {
-      throw new ValidationError(`sender implementation ${implementation} (${source}) is not sponsored`, -32009);
+    // Mandatory: `create` refuses an empty list, so this is always a real check.
+    if (!this.config.allowedSenderImplementations.some((a) => isAddressEqual(a, implementation!))) {
+      throw new ValidationError(
+        `sender implementation ${implementation} (${source}) is not sponsored by this relayer`,
+        -32009,
+      );
     }
     return implementation;
   }
@@ -855,6 +1071,38 @@ export async function probeRegistry(
 
 function stripUndefined<T extends object>(obj: T): Partial<T> {
   return Object.fromEntries(Object.entries(obj).filter(([, v]) => v !== undefined)) as Partial<T>;
+}
+
+/**
+ * `eth_estimateUserOperationGas`'s result, when it really is one. Bundlers return hex quantities; a
+ * body missing any of the three required fields (or carrying something that is not a quantity) is not
+ * an estimate and must not be read as a successful simulation.
+ */
+function asGasEstimate(result: unknown):
+  | {
+      callGasLimit: bigint;
+      verificationGasLimit: bigint;
+      preVerificationGas: bigint;
+      paymasterVerificationGasLimit?: bigint;
+    }
+  | undefined {
+  if (!result || typeof result !== 'object') return undefined;
+  const r = result as Record<string, unknown>;
+  const quantity = (v: unknown): bigint | undefined => {
+    if (typeof v === 'number' && Number.isInteger(v) && v >= 0) return BigInt(v);
+    if (typeof v !== 'string' || !/^0x[0-9a-fA-F]+$/.test(v)) return undefined;
+    return hexToBigInt(v as Hex);
+  };
+  const callGasLimit = quantity(r.callGasLimit);
+  const verificationGasLimit = quantity(r.verificationGasLimit);
+  const preVerificationGas = quantity(r.preVerificationGas);
+  if (callGasLimit === undefined || verificationGasLimit === undefined || preVerificationGas === undefined) return undefined;
+  return {
+    callGasLimit,
+    verificationGasLimit,
+    preVerificationGas,
+    paymasterVerificationGasLimit: quantity(r.paymasterVerificationGasLimit),
+  };
 }
 
 /** Implementation named by the op's EIP-7702 authorization, if it carries one. */

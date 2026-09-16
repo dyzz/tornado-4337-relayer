@@ -7,6 +7,13 @@ import { DEFAULT_STAKE_WEI, DEFAULT_UNSTAKE_DELAY_SEC, type PaymasterSetupConfig
 const ENTRY_POINT_V08: Address = '0x4337084D9E255Ff0702461CF8895CE9E3b5Ff108';
 
 /**
+ * The canonical EntryPoint v0.8 Simple7702Account, deployed at the same address on every chain. This
+ * is the only account implementation sponsored by default: its `execute`/`executeBatch` really run the
+ * calls the relayer validated, so the sponsored gas buys the withdrawal the relayer signed for.
+ */
+export const SIMPLE_7702_ACCOUNT: Address = '0xe6Cae83BdE06E4c305530e199D7217f42808555B';
+
+/**
  * `tornado-relayer` (the classic relayer) environment names are accepted as aliases, so an
  * existing `.env` keeps working: PRIVATE_KEY (worker key), REWARD_ACCOUNT, HTTP_RPC_URL, NET_ID,
  * RELAYER_FEE (percent).
@@ -17,10 +24,13 @@ const ALIASES: Record<string, string> = {
   CHAIN_ID: 'NET_ID',
 };
 
-/** Per-chain deployments of TornadoRelayerPaymaster7702 (the shared, experimental 7702 implementation). */
-export const PAYMASTER_7702_IMPLEMENTATIONS: Record<string, Address> = {
-  '11155111': '0x9917840A8843aCE7F525BC24D518Ad059D86Eb31',
-};
+/**
+ * Per-chain deployments of TornadoRelayerPaymaster7702, the experimental variant where the relayer's own
+ * EOA is the paymaster. Empty on purpose: the supported deployment is the standalone worker contract, and
+ * the old Sepolia implementation predates the current sponsorship-terms layout. `PAYMASTER_MODE=7702` is
+ * refused by `setupConfigFromEnv`; the contract and its tests stay in the tree for future work.
+ */
+export const PAYMASTER_7702_IMPLEMENTATIONS: Record<string, Address> = {};
 
 /** Tornado DAO routers. Sepolia's is our sandbox copy (the DAO never deployed one there). */
 export const TORNADO_ROUTERS: Record<string, Address> = {
@@ -112,6 +122,28 @@ export function setupConfigFromEnv(): PaymasterSetupConfig {
   };
 }
 
+/**
+ * The sponsored account implementations. Default: the canonical Simple7702Account. Setting
+ * ALLOWED_SENDER_IMPLEMENTATIONS narrows or replaces that list; setting it to an empty value is an
+ * error, so there is no spelling of the configuration that means "sponsor any account".
+ */
+function allowedSenderImplementationsFromEnv(): Address[] {
+  const raw = process.env.ALLOWED_SENDER_IMPLEMENTATIONS;
+  if (raw === undefined) return [SIMPLE_7702_ACCOUNT];
+  const list = raw
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((s) => {
+      if (!isAddress(s)) throw new Error(`ALLOWED_SENDER_IMPLEMENTATIONS entry is not an address: ${s}`);
+      return getAddress(s);
+    });
+  if (list.length === 0) {
+    throw new Error('ALLOWED_SENDER_IMPLEMENTATIONS is empty: leave it unset for the default (Simple7702Account)');
+  }
+  return list;
+}
+
 /** Build a RelayerConfig from environment variables (see .env.example). `paymaster` comes from the setup step. */
 export function configFromEnv(paymaster: Address): RelayerConfig {
   const signerKey = env('RELAYER_PRIVATE_KEY');
@@ -127,7 +159,9 @@ export function configFromEnv(paymaster: Address): RelayerConfig {
   return {
     chainId,
     rpcUrl,
-    bundlerUrl: process.env.BUNDLER_URL || undefined,
+    // Required: `RelayerService.create` refuses to start without it, because every sponsorship is
+    // simulated on the bundler before it is signed.
+    bundlerUrl: env('BUNDLER_URL'),
     entryPoint: addr('ENTRY_POINT', ENTRY_POINT_V08),
     paymaster,
     signerKey: signerKey as Hex,
@@ -135,13 +169,10 @@ export function configFromEnv(paymaster: Address): RelayerConfig {
     allowUnregistered: env('ALLOW_UNREGISTERED', 'false') === 'true',
     // SPONSORSHIP_STORE=path keeps live sponsorships across restarts (single process).
     sponsorshipStore: process.env.SPONSORSHIP_STORE ? new FileSponsorshipStore(process.env.SPONSORSHIP_STORE) : undefined,
-    // ALLOWED_SENDER_IMPLEMENTATIONS=0x…,0x… restricts sponsorship to known account implementations.
-    allowedSenderImplementations: process.env.ALLOWED_SENDER_IMPLEMENTATIONS
-      ? process.env.ALLOWED_SENDER_IMPLEMENTATIONS.split(',').map((s) => s.trim()).filter(Boolean).map((s) => {
-          if (!isAddress(s)) throw new Error(`ALLOWED_SENDER_IMPLEMENTATIONS entry is not an address: ${s}`);
-          return getAddress(s);
-        })
-      : undefined,
+    // The account implementations this relayer sponsors. Defaults to the canonical Simple7702Account;
+    // ALLOWED_SENDER_IMPLEMENTATIONS=0x…,0x… replaces that list (it never widens to "anything"), and an
+    // empty value is refused rather than read as "no restriction".
+    allowedSenderImplementations: allowedSenderImplementationsFromEnv(),
     instances: env('TORNADO_INSTANCES')
       .split(',')
       .map((s) => s.trim())
@@ -154,6 +185,11 @@ export function configFromEnv(paymaster: Address): RelayerConfig {
     serviceFeeBps,
     signatureTtlSec: Number(env('SIGNATURE_TTL_SEC', '300')),
     simulateWithBundler: env('SIMULATE_WITH_BUNDLER', 'true') === 'true',
+    bundlerTimeoutMs: Number(env('BUNDLER_TIMEOUT_MS', '20000')),
+    // Gas budget. The service never moves funds while it is serving: when the deposit cannot cover the
+    // live sponsorships plus this reserve, it stops signing until someone tops it up.
+    minDepositWei: BigInt(env('MIN_DEPOSIT_WEI', '0')),
+    maxSponsorshipGasWei: process.env.MAX_SPONSORSHIP_GAS_WEI ? BigInt(process.env.MAX_SPONSORSHIP_GAS_WEI) : undefined,
     gasPriceMarginBps: BigInt(env('GAS_PRICE_MARGIN_BPS', '11000')),
     sponsorName: env('SPONSOR_NAME', 'tornado-4337-relayer'),
   };

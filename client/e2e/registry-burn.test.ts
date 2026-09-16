@@ -21,7 +21,7 @@ import {
 } from 'viem';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 
-import { delegationCode, RelayerService } from '@tornado-4337/relayer';
+import { RelayerService } from '@tornado-4337/relayer';
 import { aavePoolAbi, erc20Abi, feeManagerAbi, paymasterAdminAbi, relayerRegistryAbi, tornadoAbi, zapAbi } from '../src/abi.js';
 import { loadArtifacts } from '../src/artifacts.js';
 import { deployPaymaster } from '../src/deploy.js';
@@ -306,54 +306,6 @@ describe('worker mode: an existing relayer adds the paymaster as a worker', () =
     expect(gasPaid).toBeLessThan((sponsored.actualGasCost * 11n) / 10n);
     log(`paymaster deposit -${gasPaid} (gas incl. postOp), master keeps fee - gas = ${result.fee - gasPaid}`);
 
-    expect(await aTokenBalance(h, finalRecipient)).toBeGreaterThan(0n);
-  });
-});
-
-describe('7702 worker: the existing relayer\'s worker EOA is the paymaster', () => {
-  let h: Harness;
-  let prover: TornadoProver;
-
-  beforeAll(async () => {
-    h = await startHarness({ chainKey: CHAIN, registry: 'worker', paymasterMode: '7702', erc20: false, log });
-    const { circuit, provingKey } = await loadArtifacts();
-    prover = await createTornadoProver(circuit, provingKey);
-  });
-  afterAll(async () => {
-    await h?.stop();
-  });
-
-  it('delegated worker EOA sponsors, master gets the fee, master stake is burned, tail runs', async () => {
-    const { publicClient } = h;
-    const reg = h.registry!;
-    expect(h.paymaster.toLowerCase()).toBe(h.relayerSigner.address.toLowerCase());
-    expect(((await publicClient.getCode({ address: h.paymaster })) ?? '0x').toLowerCase()).toBe(delegationCode(h.paymasterImplementation!));
-    const status = await new RelayerRpc(h.relayerUrl).status();
-    expect(status.registry.mode).toBe('worker');
-    expect(status.rewardAccount.toLowerCase()).toBe(reg.master.toLowerCase());
-    expect(status.signer.toLowerCase()).toBe(h.paymaster.toLowerCase());
-
-    const finalRecipient = privateKeyToAccount(generatePrivateKey()).address;
-    const masterEthBefore = await publicClient.getBalance({ address: reg.master });
-    const masterStakeBefore = await publicClient.readContract({ address: reg.relayerRegistry, abi: relayerRegistryAbi, functionName: 'getRelayerBalance', args: [reg.master] });
-    const workerEthBefore = await publicClient.getBalance({ address: h.paymaster });
-    const depositBefore = await publicClient.readContract({ address: h.paymaster, abi: paymasterAdminAbi, functionName: 'getDeposit' });
-
-    const { result, receipt } = await withdrawIntoAave(h, prover, finalRecipient);
-
-    expect(await publicClient.getBalance({ address: reg.master })).toBe(masterEthBefore + result.fee);
-    const burned = registryEvents(receipt, reg.relayerRegistry).find((e) => e.eventName === 'StakeBurned');
-    const burnedAmount = (burned!.args as { amountBurned: bigint }).amountBurned;
-    expect(burnedAmount).toBeGreaterThan(0n);
-    expect(await publicClient.readContract({ address: reg.relayerRegistry, abi: relayerRegistryAbi, functionName: 'getRelayerBalance', args: [reg.master] })).toBe(masterStakeBefore - burnedAmount);
-
-    // The worker's own ETH is untouched: only the EntryPoint deposit paid the gas.
-    expect(await publicClient.getBalance({ address: h.paymaster })).toBe(workerEthBefore);
-    const depositAfter = await publicClient.readContract({ address: h.paymaster, abi: paymasterAdminAbi, functionName: 'getDeposit' });
-    const sponsored = paymasterEvents(receipt, h.paymaster).find((e) => e.eventName === 'Sponsored')!.args as { refund: bigint; actualGasCost: bigint };
-    expect(sponsored.refund).toBe(0n);
-    expect(depositBefore - depositAfter).toBeGreaterThanOrEqual(sponsored.actualGasCost);
-    log(`7702 worker ${h.paymaster}: master +${result.fee} wei, -${burnedAmount} TORN; deposit -${depositBefore - depositAfter}`);
     expect(await aTokenBalance(h, finalRecipient)).toBeGreaterThan(0n);
   });
 });

@@ -59,6 +59,11 @@ export interface SponsoredWithdrawParams {
   implementation?: Address;
   /** Skip the bundler estimation round-trip and send with the quoted ceilings. */
   skipEstimation?: boolean;
+  /**
+   * Called after the relayer has signed the sponsorship and before the operation is sent. Tests use it
+   * to move chain state in the window the relayer cannot cover; production callers have no reason to.
+   */
+  afterSponsorship?: () => Promise<void>;
   log?: (msg: string) => void;
 }
 
@@ -239,12 +244,23 @@ export async function sponsoredWithdraw(p: SponsoredWithdrawParams): Promise<Spo
       });
 
   // 6. Send. viem: pm_getPaymasterStubData -> pm_getPaymasterData (relayer signs) -> sender signs -> bundler.
+  // The hook fires once the paymaster data exists, i.e. inside the window between signature and inclusion.
+  const paymasterClientWithHook = p.afterSponsorship
+    ? {
+        ...paymasterClient,
+        getPaymasterData: async (args: Parameters<typeof paymasterClient.getPaymasterData>[0]) => {
+          const data = await paymasterClient.getPaymasterData(args);
+          await p.afterSponsorship!();
+          return data;
+        },
+      }
+    : paymasterClient;
   const userOpHash = await bundler.sendUserOperation({
     calls: buildCalls(proof, quote.fee, asset, quote.paymaster),
     ...quote.gas,
     maxFeePerGas: quote.maxFeePerGas,
     maxPriorityFeePerGas: quote.maxPriorityFeePerGas,
-    paymaster: paymasterClient,
+    paymaster: paymasterClientWithHook,
     ...(authorization ? { authorization } : {}),
     // viem re-estimates inside prepareUserOperation when the paymaster stub leaves a gas field open;
     // give that estimate the same delegated-sender view (see step 3-4).
