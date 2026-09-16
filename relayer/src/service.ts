@@ -185,29 +185,35 @@ export interface SponsoredNote {
   validUntil: number;
   sender: Address;
   nonce: bigint;
+  /** `pending` while the request is being checked, `signed` once a signature went out. */
+  status: 'pending' | 'signed';
+  /** Identifies the request that holds the entry; only it may release or commit it. */
+  token: string;
 }
 
 /**
  * Live sponsorships by nullifier: one signature per note at a time. `reserve` is the check-and-set
  * that guards the whole signing path (it runs before any await, so concurrent requests for the same
- * note cannot both pass); `release` undoes a reservation whose signing failed. The default is
- * in-memory; the file store survives restarts. Several relayer instances sharing a key need a shared
- * store whose `reserve` is atomic on the backend (SETNX-style), not these.
+ * note cannot both pass); the reservation is `pending` until `commit` marks it `signed`, and
+ * `release` only removes the pending entry of the request that made it — a signed, still-valid
+ * sponsorship is never dropped by a later failed request. The default is in-memory; the file store
+ * survives restarts. Several relayer instances sharing a key need a shared store whose `reserve` is
+ * atomic on the backend (SETNX-style), not these.
  */
 export interface SponsorshipStore {
   get(nullifierHash: Hex): SponsoredNote | undefined;
-  /**
-   * Atomically claim the note for `note.sender`/`note.nonce`. Succeeds when nothing live is held, or
-   * when the live entry belongs to the same sender and nonce (a client retrying the same operation).
-   */
-  reserve(nullifierHash: Hex, note: SponsoredNote): { ok: true } | { ok: false; held: SponsoredNote };
-  /** Drop the reservation `note` made (no-op if someone else holds the note now). */
-  release(nullifierHash: Hex, note: SponsoredNote): void;
+  /** Atomically claim the note as `pending`; refused while any unexpired entry exists. */
+  reserve(nullifierHash: Hex, note: Omit<SponsoredNote, 'status' | 'token'>): { ok: true; token: string } | { ok: false; held: SponsoredNote };
+  /** Mark the reservation `token` holds as signed. */
+  commit(nullifierHash: Hex, token: string): void;
+  /** Drop the reservation `token` holds if it is still pending (no-op otherwise). */
+  release(nullifierHash: Hex, token: string): void;
   prune(now: number): void;
 }
 
 export class MemorySponsorshipStore implements SponsorshipStore {
   protected readonly notes = new Map<Hex, SponsoredNote>();
+  private seq = 0;
   get(k: Hex) {
     return this.notes.get(k);
   }
@@ -217,15 +223,20 @@ export class MemorySponsorshipStore implements SponsorshipStore {
   protected delete(k: Hex) {
     this.notes.delete(k);
   }
-  reserve(k: Hex, note: SponsoredNote): { ok: true } | { ok: false; held: SponsoredNote } {
+  reserve(k: Hex, note: Omit<SponsoredNote, 'status' | 'token'>): { ok: true; token: string } | { ok: false; held: SponsoredNote } {
     const held = this.notes.get(k);
-    if (held && !(isAddressEqual(held.sender, note.sender) && held.nonce === note.nonce)) return { ok: false, held };
-    this.set(k, note);
-    return { ok: true };
+    if (held) return { ok: false, held };
+    const token = `${Date.now()}-${++this.seq}`;
+    this.set(k, { ...note, status: 'pending', token });
+    return { ok: true, token };
   }
-  release(k: Hex, note: SponsoredNote) {
+  commit(k: Hex, token: string) {
     const held = this.notes.get(k);
-    if (held && isAddressEqual(held.sender, note.sender) && held.nonce === note.nonce) this.delete(k);
+    if (held && held.token === token) this.set(k, { ...held, status: 'signed' });
+  }
+  release(k: Hex, token: string) {
+    const held = this.notes.get(k);
+    if (held && held.token === token && held.status === 'pending') this.delete(k);
   }
   prune(now: number) {
     for (const [k, v] of this.notes) if (v.validUntil < now) this.delete(k);
@@ -585,11 +596,15 @@ export class RelayerService {
     const now = Math.floor(Date.now() / 1000);
     this.sponsored.prune(now);
     const nonce = q(op.nonce, 'nonce');
-    const reservation: SponsoredNote = { validUntil: now + this.config.signatureTtlSec, sender: op.sender, nonce };
-    const reserved = this.sponsored.reserve(w.nullifierHash, reservation);
+    const validUntil = now + this.config.signatureTtlSec;
+    const reserved = this.sponsored.reserve(w.nullifierHash, { validUntil, sender: op.sender, nonce });
     if (!reserved.ok) {
-      throw new ValidationError(`note already sponsored; signature valid until ${reserved.held.validUntil}`, -32003);
+      throw new ValidationError(
+        `note already ${reserved.held.status === 'signed' ? 'sponsored' : 'being sponsored'}; valid until ${reserved.held.validUntil}`,
+        -32003,
+      );
     }
+    const token = reserved.token;
     try {
       // 4. Optional sender allowlist (defence in depth; the on-chain binding does not depend on it).
       await this.assertSenderAllowed(op);
@@ -600,13 +615,13 @@ export class RelayerService {
       // 6. Optional full simulation on the bundler (validation + execution incl. tail calls).
       if (this.config.simulateWithBundler) await this.assertBundlerSimulates(op, context);
     } catch (err) {
-      this.sponsored.release(w.nullifierHash, reservation);
+      this.sponsored.release(w.nullifierHash, token);
       throw err;
     }
 
     // 7. Sign.
     const terms: FeeTerms = {
-      validUntil: reservation.validUntil,
+      validUntil,
       validAfter: 0,
       fee: w.fee,
       serviceFee,
@@ -622,9 +637,10 @@ export class RelayerService {
     try {
       signature = await this.signer.signMessage({ message: { raw: hash } });
     } catch (err) {
-      this.sponsored.release(w.nullifierHash, reservation);
+      this.sponsored.release(w.nullifierHash, token);
       throw err;
     }
+    this.sponsored.commit(w.nullifierHash, token);
     this.log.info('sponsored', {
       instance: w.instance,
       symbol: info.symbol,
@@ -754,20 +770,26 @@ export class RelayerService {
     return body.result;
   }
 
-  /** Sender code must be one of the allowed implementations (deployed code or the op's pending 7702 delegation). */
+  /**
+   * The implementation that will execute the op must be allowed: the op's own EIP-7702 authorization
+   * when it carries one (it is applied before validation and replaces whatever code the sender has),
+   * otherwise the sender's current delegation.
+   */
   private async assertSenderAllowed(op: RpcUserOperation) {
     const allowed = this.config.allowedSenderImplementations;
     if (!allowed || allowed.length === 0) return;
-    const code = ((await this.client.getCode({ address: op.sender })) ?? '0x').toLowerCase();
-    let implementation: Address | undefined;
-    if (code.startsWith('0xef0100') && code.length === 2 + 46) implementation = getAddress(`0x${code.slice(8)}`);
-    else if (code === '0x') {
-      const auth = (op as { eip7702Auth?: { address?: Address; contractAddress?: Address } }).eip7702Auth;
-      implementation = auth?.address ?? auth?.contractAddress;
-      if (!implementation) throw new ValidationError('sender has no code and the op carries no EIP-7702 authorization', -32009);
+    const auth = (op as { eip7702Auth?: { address?: Address; contractAddress?: Address } }).eip7702Auth;
+    let implementation: Address | undefined = auth?.address ?? auth?.contractAddress;
+    let source = 'eip7702Auth';
+    if (!implementation) {
+      const code = ((await this.client.getCode({ address: op.sender })) ?? '0x').toLowerCase();
+      if (code.startsWith('0xef0100') && code.length === 2 + 46) implementation = getAddress(`0x${code.slice(8)}`);
+      else if (code === '0x') throw new ValidationError('sender has no code and the op carries no EIP-7702 authorization', -32009);
+      else throw new ValidationError('sender is a contract account whose implementation cannot be checked', -32009);
+      source = 'delegation';
     }
-    if (!implementation || !allowed.some((a) => isAddressEqual(a, implementation!))) {
-      throw new ValidationError(`sender implementation ${implementation ?? code.slice(0, 20)} is not sponsored`, -32009);
+    if (!allowed.some((a) => isAddressEqual(a, implementation!))) {
+      throw new ValidationError(`sender implementation ${implementation} (${source}) is not sponsored`, -32009);
     }
   }
 }

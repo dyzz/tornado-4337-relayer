@@ -19,6 +19,50 @@ index d443534..4faab2b 100644
  }
  
  export type TxFeatureMap<
+diff --git a/packages/tornado-cash/src/data/data.service.ts b/packages/tornado-cash/src/data/data.service.ts
+index 0f9738a..fb0eeda 100644
+--- a/packages/tornado-cash/src/data/data.service.ts
++++ b/packages/tornado-cash/src/data/data.service.ts
+@@ -245,6 +245,11 @@ export class DataService implements IDataService {
+     return this.ethClient.getDeploymentBlock(address, fromBlock);
+   }
+ 
++  /** ERC-4337 sequence nonce (key 0) of `sender` on `entryPoint`: 0 for a fresh account. */
++  async getEntryPointNonce(entryPoint: Address, sender: Address): Promise<bigint> {
++    return this.ethClient.makeContractRequest(entryPoint, "entryPoint", "getNonce", toHex(sender, { size: 20 }), 0n);
++  }
++
+   async getPoolStateRoot(poolAddress: Address): Promise<bigint> {
+     return this.ethClient.makeContractRequest(poolAddress, "pool", "getLastRoot").then(hexToBigInt);
+   }
+diff --git a/packages/tornado-cash/src/data/eth-client.ts b/packages/tornado-cash/src/data/eth-client.ts
+index a1734d9..6024fdc 100644
+--- a/packages/tornado-cash/src/data/eth-client.ts
++++ b/packages/tornado-cash/src/data/eth-client.ts
+@@ -19,6 +19,11 @@ const abis = {
+     instanceRegistry: instanceRegistryAbi,
+     aggregator: aggregatorAbi,
+     paymaster: paymasterAbi,
++    entryPoint: [{
++        type: 'function', name: 'getNonce', stateMutability: 'view',
++        inputs: [{ name: 'sender', type: 'address' }, { name: 'key', type: 'uint192' }],
++        outputs: [{ name: 'nonce', type: 'uint256' }],
++    }],
+ } as const;
+ 
+ interface IGetLogsResult {
+diff --git a/packages/tornado-cash/src/data/interfaces/data.service.interface.ts b/packages/tornado-cash/src/data/interfaces/data.service.interface.ts
+index 5aa0f5c..4333c77 100644
+--- a/packages/tornado-cash/src/data/interfaces/data.service.interface.ts
++++ b/packages/tornado-cash/src/data/interfaces/data.service.interface.ts
+@@ -92,6 +92,7 @@ export interface IDataService {
+   getPoolAsset(poolAddress: Address): Promise<Address>;
+   getPoolConfig(registryAddress: Address, poolAddress: Address): Promise<IPoolConfig>;
+   getChainId(): Promise<ChainId>;
++  getEntryPointNonce(entryPoint: Address, sender: Address): Promise<bigint>;
+   getGasPrice(): Promise<bigint>;
+ 
+   getContractDeploymentBlock(address: Address, fromBlock?: bigint): Promise<bigint>;
 diff --git a/packages/tornado-cash/src/index.ts b/packages/tornado-cash/src/index.ts
 index 50cad1c..fc2029e 100644
 --- a/packages/tornado-cash/src/index.ts
@@ -280,10 +324,10 @@ index c6f9806..8eb0fc1 100644
  
 diff --git a/packages/tornado-cash/src/state/thunks/relayerPaymasterWithdrawThunk.ts b/packages/tornado-cash/src/state/thunks/relayerPaymasterWithdrawThunk.ts
 new file mode 100644
-index 0000000..d2fa236
+index 0000000..b8db6c2
 --- /dev/null
 +++ b/packages/tornado-cash/src/state/thunks/relayerPaymasterWithdrawThunk.ts
-@@ -0,0 +1,254 @@
+@@ -0,0 +1,258 @@
 +/* eslint-disable max-lines */
 +import { createAsyncThunk, unwrapResult } from "@reduxjs/toolkit";
 +
@@ -438,6 +482,10 @@ index 0000000..d2fa236
 +    const signer = await resolveIndependentSigner(deposit);
 +    const senderAddress = BigInt(signer.address) as Address;
 +    const recipient = senderAddress;
++    // A retry of the same note reuses the same deterministic sender: if an earlier operation already
++    // landed (even one whose execution reverted), the EntryPoint nonce and the EOA nonce both moved on.
++    // `buildSignedTornadoUserOp` derives the EIP-7702 authorization nonce from this value.
++    const senderNonce = await dataService.getEntryPointNonce(BigInt(entryPointAddress) as Address, senderAddress);
 +
 +    const forwardCalls = (fee: bigint): TxData[] => {
 +      const forwardAmount = depositPool.denomination - fee;
@@ -474,7 +522,7 @@ index 0000000..d2fa236
 +      maxFeePerGas,
 +      maxPriorityFeePerGas,
 +      tailCalls: async () => calls,
-+      nonce: 0n,
++      nonce: senderNonce,
 +    });
 +
 +    // 1. Baseline quote and proof.

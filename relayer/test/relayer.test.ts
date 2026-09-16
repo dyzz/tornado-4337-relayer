@@ -214,26 +214,44 @@ describe('sponsorship store', () => {
   const a = { validUntil: 2_000_000_000, sender: SENDER, nonce: 0n };
   const b = { validUntil: 2_000_000_000, sender: MASTER, nonce: 0n };
 
-  it('reserve is check-and-set: a second sender is refused until release or expiry', () => {
+  it('reserve is check-and-set; a failed request releases only its own pending entry', () => {
     const store = new MemorySponsorshipStore();
-    expect(store.reserve(NH, a).ok).toBe(true);
-    expect(store.reserve(NH, b).ok).toBe(false);
-    expect(store.reserve(NH, a).ok).toBe(true); // same sender + nonce may retry
-    expect(store.reserve(NH, { ...a, nonce: 1n }).ok).toBe(false);
-    store.release(NH, b); // not the holder: no-op
-    expect(store.get(NH)).toEqual(a);
-    store.release(NH, a);
-    expect(store.reserve(NH, b).ok).toBe(true);
-    store.prune(2_000_000_001);
+    const r1 = store.reserve(NH, a);
+    expect(r1.ok).toBe(true);
+    expect(store.reserve(NH, b).ok).toBe(false); // concurrent request for the same note
+    expect(store.reserve(NH, a).ok).toBe(false); // even the same sender: one request at a time
+    store.release(NH, 'someone-else');
+    expect(store.get(NH)?.status).toBe('pending');
+    store.release(NH, (r1 as { token: string }).token);
     expect(store.get(NH)).toBeUndefined();
   });
 
-  it('file store persists reservations across instances', () => {
+  it('a signed sponsorship survives a later failed retry of the same sender and nonce', () => {
+    const store = new MemorySponsorshipStore();
+    const first = store.reserve(NH, a) as { ok: true; token: string };
+    store.commit(NH, first.token);
+    expect(store.get(NH)?.status).toBe('signed');
+    // Retry of the same sender/nonce: refused (the client already holds a valid signature) …
+    const retry = store.reserve(NH, a);
+    expect(retry.ok).toBe(false);
+    expect((retry as { held: { status: string } }).held.status).toBe('signed');
+    // … and even a mistaken release with a foreign or stale token cannot drop the signed entry.
+    store.release(NH, first.token);
+    store.release(NH, 'stale');
+    expect(store.get(NH)?.status).toBe('signed');
+    expect(store.reserve(NH, b).ok).toBe(false);
+    store.prune(2_000_000_001);
+    expect(store.reserve(NH, b).ok).toBe(true);
+  });
+
+  it('file store persists signed sponsorships across instances, drops pending ones', () => {
     const file = join(mkdtempSync(join(tmpdir(), 'sponsor-')), 'sponsorships.json');
     const first = new FileSponsorshipStore(file);
-    expect(first.reserve(NH, a).ok).toBe(true);
+    const r = first.reserve(NH, a) as { ok: true; token: string };
+    expect(new FileSponsorshipStore(file).get(NH)).toBeUndefined(); // pending: not carried over
+    first.commit(NH, r.token);
     const second = new FileSponsorshipStore(file);
     expect(second.reserve(NH, b).ok).toBe(false);
-    expect(second.get(NH)).toEqual(a);
+    expect(second.get(NH)?.status).toBe('signed');
   });
 });

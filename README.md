@@ -146,7 +146,9 @@ The PoC currently demonstrates:
 - worker mode where an existing relayer receives the fee and its stake is charged;
 - a mainnet acceptance run on a fork: canonical ETH 100 pool, the DAO's live router / registry / FeeManager
   untouched, a really registered relayer as master, the worker contract deployed by the relayer software,
-  116 TORN burned from the master's stake per withdrawal.
+  116 TORN burned from the master's stake per withdrawal;
+- strict ERC-7562 mempool rules: the reference bundler's own tracer and rule engine accept the validation
+  phase (and reject it when the paymaster is unstaked).
 
 Review findings addressed in the current code:
 
@@ -162,7 +164,7 @@ Review findings addressed in the current code:
   known account implementations (`ALLOWED_SENDER_IMPLEMENTATIONS`), every on-chain setup action is logged and
   can be disabled (`AUTO_SETUP=false`). A multi-instance relayer still needs a shared sponsorship store.
 
-Still experimental and unaudited; production use needs an audit and a strict-mempool bundler run.
+Still experimental and unaudited; production use needs an audit.
 
 ## Running the tests
 
@@ -171,26 +173,41 @@ Needs pnpm, Foundry and the Tornado proving artifacts from `tornado-cli` (`TORNA
 ```bash
 pnpm install && (cd contracts && forge install && forge build) && (cd contracts-tornado && forge build)
 (cd contracts && forge test)                                     # paymaster (both variants) + sandbox DAO, 31 tests
-pnpm --filter @tornado-4337/relayer test                         # relayer, 10 tests
-MAINNET_RPC_URL=… pnpm --filter @tornado-4337/client e2e          # mainnet fork; ~2 min per suite with a local node
-MAINNET_RPC_URL=… TORNADO_CLI_DIR=…/tornado-cli pnpm --filter @tornado-4337/client e2e -- e2e/acceptance-mainnet.test.ts
-E2E_CHAIN=sepolia pnpm --filter @tornado-4337/client e2e          # same suites on a Sepolia fork (sandbox DAO)
+pnpm --filter @tornado-4337/relayer test                         # relayer, 13 tests
+
+# mainnet acceptance: a Foundry fork test against the live DAO contracts (~1 min, pinned block)
+(cd contracts && MAINNET_RPC_URL=… TORNADO_ARTIFACTS_DIR=…/tornado-cli/circuits forge test --match-contract MainnetAcceptance -vv)
+
+# strict ERC-7562 (bundler mempool rules) with the reference bundler's tracer + rule engine, no deployment needed
+MAINNET_RPC_URL=… AA_BUNDLER_DIR=…/eth-infinitism-bundler pnpm --filter @tornado-4337/client exec tsx scripts/erc7562-check.ts
+
+# the off-chain stack end to end (relayer service, alto bundler, Kohaku SDK) on forks
+MAINNET_RPC_URL=… pnpm --filter @tornado-4337/client e2e          # ~1–2 min per suite from the committed fork cache
 pnpm --filter @tornado-4337/kohaku-integration setup && pnpm --filter @tornado-4337/kohaku-integration e2e   # real Kohaku SDK, Sepolia fork
 ```
 
-Forks are pinned to a fixed block (`client/e2e/harness.ts`, `E2E_FORK_BLOCK=latest` to override) and anvil's
-RPC cache for that block ships in `client/e2e/fork-cache/`, so the mainnet suites need no archive node: every
-upstream read the suites make is replayed from the fixture. After moving the pin, warm the caches once and
+The Foundry acceptance test (`contracts/test/fork/MainnetAcceptance.t.sol`) is the main line: the canonical
+ETH 100 pool with its real deposit tree (proof via ffi from the client prover, leaves from the committed
+fixture), the DAO's live `TornadoRouter` / `RelayerRegistry` / FeeManager and the real EntryPoint v0.8 and
+Simple7702Account at their mainnet addresses, a really registered relayer master (solid-relayer.eth), the
+worker contract deployed from the relayer key as the software does — nothing governance-owned touched, the
+only `vm.prank` is the master registering its worker. It also asserts, with the state-diff recorder, that
+validation touches no storage but the paymaster's own.
+
+`scripts/erc7562-check.ts` runs the eth-infinitism reference bundler's `bundlerCollectorTracer` and
+`tracerResultParser` — its actual mempool rule engine — over a `debug_traceCall` of `handleOps` on a live
+archive node, with the worker contract, its storage, its EntryPoint stake and the sender's EIP-7702
+authorization supplied as state overrides. `--unstaked` is the negative control (rejected under STO-031).
+
+Forks are pinned to a fixed block (block 25 981 000 for mainnet; `E2E_FORK_BLOCK=latest` to override) and
+the RPC cache for that block ships in `client/e2e/fork-cache/` (shared by Foundry and anvil), so a fresh clone
+runs everything without an archive node. After moving the pin, warm the caches once and
 `pnpm --filter @tornado-4337/client fork-cache:save`.
 
-The mainnet fork (anvil + alto bundler + the relayer in-process) runs against the real contracts: ETH pool →
-swap → Aave; DAI pool → Aave with the fee priced by the 1inch oracle; and the DAO path through the real
-`TornadoRouter` / `RelayerRegistry` / FeeManager — the paymaster as a fresh master (~0.116 TORN burned per
-withdrawal, refund still paid), as a worker contract of a really registered relayer deployed by the relayer
-software itself (fee to the master, its stake burned), and the experimental 7702 variant. The acceptance
-suite adds the canonical ETH 100 pool with its real deposit tree (seeded from tornado-cli's event cache) and
-no governance-owned state touched at all; the bundler is alto without strict mempool rules, which is the one
-production condition a fork cannot reproduce.
+The vitest suites (anvil + alto bundler + the relayer in-process) cover what Foundry cannot: the relayer
+service's validation, simulation and signing, bundler acceptance, and the Kohaku SDK — ETH pool → swap → Aave;
+DAI pool → Aave with the fee priced by the 1inch oracle; the paymaster as a fresh master, as the worker contract
+the software deploys, and as the experimental 7702 variant.
 
 ## What we did on Sepolia
 
@@ -364,7 +381,8 @@ Tornado-specific 的逻辑继续留在 relayer；bundler 只是通用基础设�
 - Sepolia DAO sandbox 中的 TORN stake 扣费；
 - 基于真实 Tornado DAO router / registry 的 mainnet-fork 测试；
 - worker mode：现有 relayer 收 fee，同时从它的 stake 中扣 TORN；
-- 主网 fork 上的验收跑：主网真实的 ETH 100 池、DAO 现有的 router / registry / FeeManager 一个字不动、一个真实已注册的 relayer 当 master、relayer 软件自己部署的 worker 合约，每笔从 master 质押里烧 116 TORN。
+- 主网 fork 上的验收跑：主网真实的 ETH 100 池、DAO 现有的 router / registry / FeeManager 一个字不动、一个真实已注册的 relayer 当 master、relayer 软件自己部署的 worker 合约，每笔从 master 质押里烧 116 TORN；
+- 严格 ERC-7562 mempool 规则：参考 bundler 自己的 tracer 和规则引擎接受验证阶段（paymaster 未质押时则拒绝）。
 
 评审提出的问题已在当前代码里处理：
 
@@ -373,7 +391,7 @@ Tornado-specific 的逻辑继续留在 relayer；bundler 只是通用基础设�
 - **ERC-7562。** paymaster 在验证阶段读自身存储，所以要质押（设置步骤质押 0.1 ETH）。
 - **加固。** 进行中的 sponsorship 可持久化（`SPONSORSHIP_STORE`），可限制只赞助已知的账户实现（`ALLOWED_SENDER_IMPLEMENTATIONS`），所有链上设置动作都有日志且可关闭（`AUTO_SETUP=false`）。多实例 relayer 仍需共享的 sponsorship 存储。
 
-仍然是实验性实现，未经审计；上生产前需要审计，以及在严格 mempool 规则的 bundler 上跑一遍。
+仍然是实验性实现，未经审计；上生产前需要审计。
 
 ## 怎么跑测试
 
@@ -382,16 +400,26 @@ Tornado-specific 的逻辑继续留在 relayer；bundler 只是通用基础设�
 ```bash
 pnpm install && (cd contracts && forge install && forge build) && (cd contracts-tornado && forge build)
 (cd contracts && forge test)                                     # paymaster 两个版本 + 沙盒 DAO，31 个
-pnpm --filter @tornado-4337/relayer test                         # relayer，10 个
-MAINNET_RPC_URL=… pnpm --filter @tornado-4337/client e2e          # 主网 fork；用本地节点每套约 2 分钟
-MAINNET_RPC_URL=… TORNADO_CLI_DIR=…/tornado-cli pnpm --filter @tornado-4337/client e2e -- e2e/acceptance-mainnet.test.ts
-E2E_CHAIN=sepolia pnpm --filter @tornado-4337/client e2e          # 同一套跑 Sepolia fork（沙盒 DAO）
+pnpm --filter @tornado-4337/relayer test                         # relayer，13 个
+
+# 主网验收：Foundry fork 测试，对着 DAO 现有合约（固定高度，约 1 分钟）
+(cd contracts && MAINNET_RPC_URL=… TORNADO_ARTIFACTS_DIR=…/tornado-cli/circuits forge test --match-contract MainnetAcceptance -vv)
+
+# 严格 ERC-7562（bundler mempool 规则）：参考 bundler 的 tracer + 规则引擎，不用部署
+MAINNET_RPC_URL=… AA_BUNDLER_DIR=…/eth-infinitism-bundler pnpm --filter @tornado-4337/client exec tsx scripts/erc7562-check.ts
+
+# 链下栈端到端（relayer 服务、alto bundler、Kohaku SDK），跑在 fork 上
+MAINNET_RPC_URL=… pnpm --filter @tornado-4337/client e2e          # 有提交的 fork 缓存，每套约 1–2 分钟
 pnpm --filter @tornado-4337/kohaku-integration setup && pnpm --filter @tornado-4337/kohaku-integration e2e   # 真实 Kohaku SDK，Sepolia fork
 ```
 
-fork 固定在一个区块高度（`client/e2e/harness.ts`，`E2E_FORK_BLOCK=latest` 可覆盖），anvil 在该高度的 RPC 缓存随仓库一起提交在 `client/e2e/fork-cache/`，所以主网套件不需要归档节点：测试碰到的所有上游读取都从 fixture 回放。改了高度后先热跑一遍，再 `pnpm --filter @tornado-4337/client fork-cache:save`。
+主线是 Foundry 验收测试（`contracts/test/fork/MainnetAcceptance.t.sol`）：主网真实的 ETH 100 池及其完整存款树（证明由 client 的 prover 经 ffi 生成，叶子来自提交的 fixture）、DAO 现有的 `TornadoRouter` / `RelayerRegistry` / FeeManager、主网地址上的真实 EntryPoint v0.8 和 Simple7702Account、一个真实已注册的 relayer master（solid-relayer.eth）、按软件的方式从 relayer key 部署的 worker 合约——不碰任何 governance 持有的状态，唯一的 `vm.prank` 是 master 登记自己的 worker。它还用 state-diff 记录器断言验证阶段只碰 paymaster 自己的存储。
 
-主网 fork（anvil + alto bundler + 进程内 relayer）对着真实合约跑：ETH 池 → swap → Aave；DAI 池 → Aave，fee 用 1inch 预言机定价；以及走真实 `TornadoRouter` / `RelayerRegistry` / FeeManager 的 DAO 路径——paymaster 作为新注册的 master（每笔烧约 0.116 TORN，退款照常）、作为一个真实已注册 relayer 的 worker 合约（由 relayer 软件自己部署；fee 到 master、烧它的质押）、以及实验性的 7702 变体。验收套件再加上主网真实的 ETH 100 池及其完整存款树（从 tornado-cli 的事件缓存起步）、且不碰任何 governance 持有的状态；bundler 是关闭严格 mempool 规则的 alto——这是 fork 唯一复现不了的生产条件。
+`scripts/erc7562-check.ts` 把 eth-infinitism 参考 bundler 自己的 `bundlerCollectorTracer` 和 `tracerResultParser`（它真正的 mempool 规则引擎）跑在归档节点的 `debug_traceCall(handleOps)` 上，worker 合约代码、存储、EntryPoint 质押和 sender 的 EIP-7702 授权都通过 state override 提供。`--unstaked` 是反例（按 STO-031 被拒）。
+
+fork 固定在一个区块高度（主网 25 981 000；`E2E_FORK_BLOCK=latest` 可覆盖），该高度的 RPC 缓存随仓库提交在 `client/e2e/fork-cache/`（Foundry 和 anvil 共用），所以新克隆下来不需要归档节点也能全部跑。改了高度后先热跑一遍，再 `pnpm --filter @tornado-4337/client fork-cache:save`。
+
+vitest 套件（anvil + alto bundler + 进程内 relayer）覆盖 Foundry 覆盖不了的部分：relayer 服务的校验、模拟、签名，bundler 是否接受，以及 Kohaku SDK——ETH 池 → swap → Aave；DAI 池 → Aave，fee 用 1inch 预言机定价；paymaster 作为新注册的 master、作为软件自部署的 worker 合约、以及实验性的 7702 变体。
 
 ## 我们在 Sepolia 做了什么
 

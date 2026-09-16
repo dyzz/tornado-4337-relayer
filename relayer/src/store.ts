@@ -11,8 +11,14 @@ export class FileSponsorshipStore extends MemorySponsorshipStore {
   constructor(private readonly path: string) {
     super();
     if (existsSync(path)) {
-      const raw = JSON.parse(readFileSync(path, 'utf8')) as Record<string, { validUntil: number; sender: `0x${string}`; nonce: string }>;
-      for (const [k, v] of Object.entries(raw)) this.notes.set(k as Hex, { ...v, nonce: BigInt(v.nonce) });
+      const raw = JSON.parse(readFileSync(path, 'utf8')) as Record<
+        string,
+        { validUntil: number; sender: `0x${string}`; nonce: string; status?: 'pending' | 'signed'; token?: string }
+      >;
+      // Only signed sponsorships matter across a restart; a pending one died with the process.
+      for (const [k, v] of Object.entries(raw)) {
+        if (v.status === 'signed') this.notes.set(k as Hex, { ...v, nonce: BigInt(v.nonce), status: 'signed', token: v.token ?? 'restored' });
+      }
     }
   }
 
