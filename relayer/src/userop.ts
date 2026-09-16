@@ -67,10 +67,12 @@ export interface FeeTerms {
   tokenPerEth: bigint;
   /** `withdrawalHash(...)` of the one relayWithdraw call this sponsorship approves. */
   withdrawalHash: Hex;
+  /** EIP-7702 implementation the sender must be delegated to when the op is validated (zero = not enforced). */
+  senderImplementation: Address;
 }
 
 export const PAYMASTER_DATA_OFFSET = 52;
-export const PAYMASTER_AND_DATA_LENGTH = 297;
+export const PAYMASTER_AND_DATA_LENGTH = 317;
 export const SIGNATURE_LENGTH = 65;
 export const RATE_SCALE = 10n ** 18n;
 
@@ -90,12 +92,38 @@ export function packHighLow(high: bigint, low: bigint): Hex {
   return concatHex([pad(toHex(high), { size: 16 }), pad(toHex(low), { size: 16 })]);
 }
 
-/** viem-compatible initCode packing (factory `0x7702` marks an EIP-7702 sender). */
+/** The EntryPoint's EIP-7702 initCode marker: `0x7702` in the first 20 bytes (padded with zeros). */
+export const EIP7702_INITCODE_MARKER: Hex = `0x7702${'00'.repeat(18)}`;
+
+/** initCode packing per EntryPoint v0.8 (factory `0x7702` marks an EIP-7702 sender: 20-byte marker ‖ factoryData). */
 export function packInitCode(op: RpcUserOperation): Hex {
   if (op.initCode !== undefined) return op.initCode;
   if (!op.factory) return '0x';
-  if (op.factory === '0x7702') return concatHex(['0x7702', op.factoryData ?? '0x']);
+  if (op.factory === '0x7702') return concatHex([EIP7702_INITCODE_MARKER, op.factoryData ?? '0x']);
   return concatHex([op.factory, op.factoryData ?? '0x']);
+}
+
+/** True for the EntryPoint's EIP-7702 marker, padded (`0x7702` + 18 zero bytes) or bare `0x7702`. */
+export function isEip7702InitCode(initCode: Hex): boolean {
+  const hex = initCode.toLowerCase();
+  if (!hex.startsWith('0x7702')) return false;
+  const head = hex.slice(2, 42).padEnd(40, '0');
+  return head === EIP7702_INITCODE_MARKER.slice(2);
+}
+
+/**
+ * `keccak256(initCode)` as the paymaster hashes it: for an EIP-7702 sender the EntryPoint hashes
+ * `delegate ‖ initCode[20:]` instead of the marker bytes, and so do we — the relayer's signature must not
+ * depend on how a bundler pads the marker.
+ */
+export function initCodeHash(op: RpcUserOperation, senderImplementation: Address | undefined): Hex {
+  const initCode = packInitCode(op);
+  if (!isEip7702InitCode(initCode)) return keccak256(initCode);
+  if (!senderImplementation || senderImplementation === zeroAddress) {
+    throw new Error('EIP-7702 initCode: the sender implementation is needed to hash the op');
+  }
+  const tail: Hex = initCode.length > 42 ? `0x${initCode.slice(42)}` : '0x';
+  return keccak256(concatHex([senderImplementation, tail]));
 }
 
 export function readGas(op: RpcUserOperation): UserOpGas {
@@ -119,14 +147,14 @@ export function totalGas(gas: UserOpGas): bigint {
 }
 
 /**
- * The 245-byte suffix of paymasterAndData understood by TornadoRelayerPaymaster:
+ * The 265-byte suffix of paymasterAndData understood by TornadoRelayerPaymaster:
  * validUntil(6) | validAfter(6) | fee(32) | serviceFee(32) | refundTo(20) | feeToken(20) | tokenPerEth(32) |
- * withdrawalHash(32) | signature(65).
+ * withdrawalHash(32) | senderImplementation(20) | signature(65).
  */
 export function encodePaymasterData(terms: FeeTerms, signature: Hex): Hex {
   if ((signature.length - 2) / 2 !== SIGNATURE_LENGTH) throw new Error('signature must be 65 bytes');
   return encodePacked(
-    ['uint48', 'uint48', 'uint256', 'uint256', 'address', 'address', 'uint256', 'bytes32', 'bytes'],
+    ['uint48', 'uint48', 'uint256', 'uint256', 'address', 'address', 'uint256', 'bytes32', 'address', 'bytes'],
     [
       terms.validUntil,
       terms.validAfter,
@@ -136,6 +164,7 @@ export function encodePaymasterData(terms: FeeTerms, signature: Hex): Hex {
       terms.feeToken ?? zeroAddress,
       terms.tokenPerEth ?? 0n,
       terms.withdrawalHash,
+      terms.senderImplementation ?? zeroAddress,
       signature,
     ],
   );
@@ -198,7 +227,7 @@ export function paymasterHash(params: {
       [
         op.sender,
         q(op.nonce, 'nonce'),
-        keccak256(packInitCode(op)),
+        initCodeHash(op, terms.senderImplementation),
         keccak256(op.callData),
         accountGasLimits,
         paymasterGasWord,
@@ -222,6 +251,7 @@ export function paymasterHash(params: {
         { type: 'address' },
         { type: 'uint256' },
         { type: 'bytes32' },
+        { type: 'address' },
       ],
       [
         fieldsHash,
@@ -235,6 +265,7 @@ export function paymasterHash(params: {
         terms.feeToken ?? zeroAddress,
         terms.tokenPerEth ?? 0n,
         terms.withdrawalHash,
+        terms.senderImplementation ?? zeroAddress,
       ],
     ),
   );

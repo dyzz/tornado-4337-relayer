@@ -2,6 +2,7 @@
 pragma solidity ^0.8.28;
 
 import {Test, Vm} from "forge-std/Test.sol";
+import {VmSafe} from "forge-std/Vm.sol";
 import {IEntryPoint} from "@account-abstraction/interfaces/IEntryPoint.sol";
 import {PackedUserOperation} from "@account-abstraction/interfaces/PackedUserOperation.sol";
 import {BaseAccount} from "@account-abstraction/core/BaseAccount.sol";
@@ -184,7 +185,18 @@ contract MainnetAcceptanceTest is Test {
                 assertEq(accesses[i].storageAccesses[j].account, address(paymaster), "validation touched foreign storage");
             }
             // No calls to anything but the paymaster itself (precompiles and the forge cheatcode VM excluded).
+            // The one other account touched is the sender, whose code (the EIP-7702 delegation designator)
+            // the paymaster reads to enforce the sponsored implementation — an EXTCODE read, never a call.
             if (accesses[i].account > address(0x100) && accesses[i].account != address(vm)) {
+                if (accesses[i].account == user) {
+                    assertTrue(
+                        accesses[i].kind == VmSafe.AccountAccessKind.Extcodesize
+                            || accesses[i].kind == VmSafe.AccountAccessKind.Extcodecopy
+                            || accesses[i].kind == VmSafe.AccountAccessKind.Extcodehash,
+                        "validation may only read the sender's code"
+                    );
+                    continue;
+                }
                 assertEq(accesses[i].account, address(paymaster), "validation called a foreign contract");
             }
         }
@@ -197,6 +209,45 @@ contract MainnetAcceptanceTest is Test {
         vm.prank(user);
         vm.expectRevert(abi.encodeWithSelector(TornadoRelayerPaymasterCore.NotSponsored.selector, user, wh));
         paymaster.relayWithdraw(POOL, hex"", bytes32(0), keccak256("x"), payable(user), payable(MASTER), 0);
+    }
+
+    /// The sponsorship binds the implementation that executes the op. The relayer signed for a sender
+    /// running the canonical Simple7702Account; if the user then re-delegates the same EOA to another
+    /// implementation (same code at another address, i.e. a valid authorization that only swaps the
+    /// implementation), validation rejects the op and nothing is burned.
+    function test_liveDao_reDelegationAfterSponsorshipRejected() public {
+        (commitment, root, nullifierHash, proof) = _prove(POOL.nextIndex(), user, MASTER, fee);
+        address depositor = makeAddr("depositor");
+        vm.deal(depositor, 101 ether);
+        vm.prank(depositor);
+        POOL.deposit{value: 100 ether}(commitment);
+        PackedUserOperation memory op = _sponsoredOp(); // relayer-signed with senderImplementation = SIMPLE_7702
+        uint256 masterStakeBefore = REGISTRY.getRelayerBalance(MASTER);
+
+        address otherImplementation = makeAddr("other Simple7702Account deployment");
+        vm.etch(otherImplementation, SIMPLE_7702.code);
+        vm.signAndAttachDelegation(otherImplementation, userKey);
+        assertEq(user.code, abi.encodePacked(hex"ef0100", otherImplementation), "sender now runs the other implementation");
+
+        bytes memory reason =
+            abi.encodeWithSelector(TornadoRelayerPaymasterCore.SenderImplementationMismatch.selector, user, SIMPLE_7702);
+        bytes32 userOpHash = ENTRY_POINT.getUserOpHash(op);
+        vm.prank(address(ENTRY_POINT));
+        vm.expectRevert(reason);
+        paymaster.validatePaymasterUserOp(op, userOpHash, 0);
+
+        // Through the EntryPoint: the op fails validation ("AA33 reverted"), the stake is untouched.
+        PackedUserOperation[] memory ops = new PackedUserOperation[](1);
+        ops[0] = op;
+        vm.expectRevert(abi.encodeWithSelector(IEntryPoint.FailedOpWithRevert.selector, 0, "AA33 reverted", reason));
+        ENTRY_POINT.handleOps(ops, beneficiary);
+        assertEq(REGISTRY.getRelayerBalance(MASTER), masterStakeBefore, "no burn");
+        assertFalse(POOL.isSpent(nullifierHash), "note not spent");
+
+        // Back on the canonical implementation the very same signed op goes through.
+        vm.signAndAttachDelegation(SIMPLE_7702, userKey);
+        ENTRY_POINT.handleOps(ops, beneficiary);
+        assertTrue(POOL.isSpent(nullifierHash), "note spent once re-delegated to the sponsored implementation");
     }
 
     // ------------------------------------------------------------ helpers
@@ -243,7 +294,8 @@ contract MainnetAcceptanceTest is Test {
             refundTo: address(0),
             feeToken: address(0),
             tokenPerEth: 0,
-            withdrawalHash: paymaster.withdrawalHash(POOL, proof, root, nullifierHash, user, MASTER, fee)
+            withdrawalHash: paymaster.withdrawalHash(POOL, proof, root, nullifierHash, user, MASTER, fee),
+            senderImplementation: SIMPLE_7702 // the sender must run the canonical Simple7702Account
         });
     }
 
@@ -268,7 +320,7 @@ contract MainnetAcceptanceTest is Test {
     function _encode(TornadoRelayerPaymasterCore.Terms memory t, bytes memory sig) internal view returns (bytes memory) {
         bytes memory head =
             abi.encodePacked(address(paymaster), uint128(100_000), uint128(90_000), t.validUntil, t.validAfter, t.fee, t.serviceFee);
-        bytes memory tail = abi.encodePacked(t.refundTo, t.feeToken, t.tokenPerEth, t.withdrawalHash);
+        bytes memory tail = abi.encodePacked(t.refundTo, t.feeToken, t.tokenPerEth, t.withdrawalHash, t.senderImplementation);
         return bytes.concat(head, tail, sig);
     }
 

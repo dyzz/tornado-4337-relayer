@@ -5,6 +5,7 @@ import {IEntryPoint} from "@account-abstraction/interfaces/IEntryPoint.sol";
 import {IPaymaster} from "@account-abstraction/interfaces/IPaymaster.sol";
 import {PackedUserOperation} from "@account-abstraction/interfaces/PackedUserOperation.sol";
 import {UserOperationLib} from "@account-abstraction/core/UserOperationLib.sol";
+import {Eip7702Support} from "@account-abstraction/core/Eip7702Support.sol";
 import {_packValidationData} from "@account-abstraction/core/Helpers.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -51,7 +52,8 @@ import {ITornadoRouter, IRelayerRegistry} from "./interfaces/ITornadoRouter.sol"
 ///   [148:168] address feeToken     (address(0) = ETH instance)
 ///   [168:200] uint256 tokenPerEth  (feeToken units per 1e18 wei; ignored for ETH)
 ///   [200:232] bytes32 withdrawalHash  (withdrawalHash(...) of the one relayWithdraw the relayer approved)
-///   [232:297] bytes   signature    (65 bytes, EIP-191 over getHash(...))
+///   [232:252] address senderImplementation (EIP-7702 delegation the sender must have at validation; 0 = not enforced)
+///   [252:317] bytes   signature    (65 bytes, EIP-191 over getHash(...))
 abstract contract TornadoRelayerPaymasterCore is IPaymaster {
     using SafeERC20 for IERC20;
     using UserOperationLib for PackedUserOperation;
@@ -66,6 +68,10 @@ abstract contract TornadoRelayerPaymasterCore is IPaymaster {
         uint256 tokenPerEth;
         /// @dev `withdrawalHash(...)` of the exact relayWithdraw call this sponsorship is for.
         bytes32 withdrawalHash;
+        /// @dev The account implementation the sender must be delegated to when the op runs (EIP-7702
+        /// designator `0xef0100 || impl`). Binds the code that will interpret `callData`; a client cannot
+        /// swap in another authorization after the relayer signed. address(0) disables the check.
+        address senderImplementation;
     }
 
     uint256 private constant PAYMASTER_VALIDATION_GAS_OFFSET = UserOperationLib.PAYMASTER_VALIDATION_GAS_OFFSET; // 20
@@ -78,8 +84,9 @@ abstract contract TornadoRelayerPaymasterCore is IPaymaster {
     uint256 private constant FEE_TOKEN_OFFSET = REFUND_TO_OFFSET + 20; // 148
     uint256 private constant TOKEN_PER_ETH_OFFSET = FEE_TOKEN_OFFSET + 20; // 168
     uint256 private constant WITHDRAWAL_HASH_OFFSET = TOKEN_PER_ETH_OFFSET + 32; // 200
-    uint256 private constant SIGNATURE_OFFSET = WITHDRAWAL_HASH_OFFSET + 32; // 232
-    uint256 public constant PAYMASTER_AND_DATA_LENGTH = SIGNATURE_OFFSET + 65; // 297
+    uint256 private constant SENDER_IMPL_OFFSET = WITHDRAWAL_HASH_OFFSET + 32; // 232
+    uint256 private constant SIGNATURE_OFFSET = SENDER_IMPL_OFFSET + 20; // 252
+    uint256 public constant PAYMASTER_AND_DATA_LENGTH = SIGNATURE_OFFSET + 65; // 317
 
     uint256 public constant BPS = 10_000;
     uint256 public constant RATE_SCALE = 1e18;
@@ -122,6 +129,8 @@ abstract contract TornadoRelayerPaymasterCore is IPaymaster {
     error AdminCallFailed(bytes result);
     /// @dev Always thrown by `simulateRelayWithdraw`: `success` and the inner return / revert data.
     error SimulationResult(bool success, bytes result);
+    /// @dev The sender is not delegated to the implementation the relayer approved.
+    error SenderImplementationMismatch(address sender, address expected);
 
     constructor(IEntryPoint _entryPoint) {
         entryPoint = _entryPoint;
@@ -390,18 +399,24 @@ abstract contract TornadoRelayerPaymasterCore is IPaymaster {
                 terms.refundTo,
                 terms.feeToken,
                 terms.tokenPerEth,
-                terms.withdrawalHash
+                terms.withdrawalHash,
+                terms.senderImplementation
             )
         );
     }
 
     /// @dev Hash of every userOp field except paymasterData/signature (same set as VerifyingPaymaster).
-    function _userOpFieldsHash(PackedUserOperation calldata userOp) internal pure returns (bytes32) {
+    /// An EIP-7702 initCode (the `0x7702` marker) is hashed the way the EntryPoint hashes it —
+    /// `keccak256(delegate ‖ initCode[20:])` — so the relayer's signature does not depend on how a
+    /// particular bundler pads the marker (`0x7702` vs `0x7702` + 18 zero bytes are the same op).
+    function _userOpFieldsHash(PackedUserOperation calldata userOp) internal view returns (bytes32) {
+        bytes32 initCodeHash = Eip7702Support._getEip7702InitCodeHashOverride(userOp);
+        if (initCodeHash == bytes32(0)) initCodeHash = keccak256(userOp.initCode);
         return keccak256(
             abi.encode(
                 userOp.sender,
                 userOp.nonce,
-                keccak256(userOp.initCode),
+                initCodeHash,
                 keccak256(userOp.callData),
                 userOp.accountGasLimits,
                 uint256(bytes32(userOp.paymasterAndData[PAYMASTER_VALIDATION_GAS_OFFSET:PAYMASTER_DATA_OFFSET])),
@@ -426,7 +441,8 @@ abstract contract TornadoRelayerPaymasterCore is IPaymaster {
         terms.refundTo = address(bytes20(paymasterAndData[REFUND_TO_OFFSET:FEE_TOKEN_OFFSET]));
         terms.feeToken = address(bytes20(paymasterAndData[FEE_TOKEN_OFFSET:TOKEN_PER_ETH_OFFSET]));
         terms.tokenPerEth = uint256(bytes32(paymasterAndData[TOKEN_PER_ETH_OFFSET:WITHDRAWAL_HASH_OFFSET]));
-        terms.withdrawalHash = bytes32(paymasterAndData[WITHDRAWAL_HASH_OFFSET:SIGNATURE_OFFSET]);
+        terms.withdrawalHash = bytes32(paymasterAndData[WITHDRAWAL_HASH_OFFSET:SENDER_IMPL_OFFSET]);
+        terms.senderImplementation = address(bytes20(paymasterAndData[SENDER_IMPL_OFFSET:SIGNATURE_OFFSET]));
         signature = paymasterAndData[SIGNATURE_OFFSET:];
     }
 
@@ -440,6 +456,12 @@ abstract contract TornadoRelayerPaymasterCore is IPaymaster {
     {
         (Terms memory terms, bytes calldata sig) = parsePaymasterAndData(userOp.paymasterAndData);
 
+        // The code that will interpret callData must be the one the relayer approved: the sender's
+        // EIP-7702 delegation (already applied when validation runs) has to point at it.
+        if (terms.senderImplementation != address(0) && !_delegatedTo(userOp.sender, terms.senderImplementation)) {
+            revert SenderImplementationMismatch(userOp.sender, terms.senderImplementation);
+        }
+
         bytes32 digest = MessageHashUtils.toEthSignedMessageHash(getHash(userOp, terms));
         (address recovered, ECDSA.RecoverError err,) = ECDSA.tryRecover(digest, sig);
         bool sigFailed = err != ECDSA.RecoverError.NoError || recovered != verifyingSigner();
@@ -452,6 +474,12 @@ abstract contract TornadoRelayerPaymasterCore is IPaymaster {
         // The context is returned even when the signature is invalid so estimation exercises postOp.
         context = abi.encode(userOpHash, userOp.sender, terms);
         validationData = _packValidationData(sigFailed, terms.validUntil, terms.validAfter);
+    }
+
+    /// @dev True when `account`'s code is the EIP-7702 delegation designator for `implementation`.
+    function _delegatedTo(address account, address implementation) internal view returns (bool) {
+        bytes memory code = account.code;
+        return code.length == 23 && keccak256(code) == keccak256(abi.encodePacked(hex"ef0100", implementation));
     }
 
     /// @inheritdoc IPaymaster

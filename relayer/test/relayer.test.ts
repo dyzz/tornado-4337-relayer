@@ -1,10 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { encodeFunctionData, parseEther, zeroAddress, type Address, type Hex } from 'viem';
+import { encodeFunctionData, keccak256, parseEther, zeroAddress, type Address, type Hex } from 'viem';
 
 import { baseAccountAbi, paymasterAbi, tornadoInstanceAbi } from '../src/abi.js';
 import { DEFAULT_GAS, minimumFee, serviceFeeFor } from '../src/fee.js';
 import { FixedPriceSource, parseDecimal, weiPerTokenFrom } from '../src/price.js';
-import { encodePaymasterData, DUMMY_SIGNATURE, packInitCode, readGas, totalGas } from '../src/userop.js';
+import { encodePaymasterData, DUMMY_SIGNATURE, EIP7702_INITCODE_MARKER, initCodeHash, isEip7702InitCode, packInitCode, paymasterHash, readGas, totalGas } from '../src/userop.js';
 import { decodeAccountCalls, findSponsoringWithdraw, ValidationError } from '../src/validate.js';
 import { MemorySponsorshipStore } from '../src/service.js';
 import { FileSponsorshipStore } from '../src/store.js';
@@ -171,20 +171,54 @@ describe('price', () => {
 });
 
 describe('userop', () => {
-  it('packs initCode like viem (0x7702 marker for EIP-7702 senders)', () => {
+  it('packs initCode per EntryPoint v0.8 (20-byte 0x7702 marker for EIP-7702 senders)', () => {
     expect(packInitCode({ sender: SENDER, callData: '0x' } as never)).toBe('0x');
-    expect(packInitCode({ sender: SENDER, callData: '0x', factory: '0x7702', factoryData: '0x' } as never)).toBe('0x7702');
+    expect(packInitCode({ sender: SENDER, callData: '0x', factory: '0x7702', factoryData: '0x' } as never)).toBe(EIP7702_INITCODE_MARKER);
     expect(
       packInitCode({ sender: SENDER, callData: '0x', factory: SENDER, factoryData: '0xabcd' } as never),
     ).toBe(`${SENDER.toLowerCase()}abcd`);
+    expect(isEip7702InitCode('0x7702')).toBe(true);
+    expect(isEip7702InitCode(EIP7702_INITCODE_MARKER)).toBe(true);
+    expect(isEip7702InitCode(`${EIP7702_INITCODE_MARKER}abcd`)).toBe(true);
+    expect(isEip7702InitCode('0x77020001')).toBe(false);
+    expect(isEip7702InitCode(SENDER)).toBe(false);
   });
 
-  it('encodes 245 bytes of paymasterData (297 with the EntryPoint prefix)', () => {
+  it('hashes an EIP-7702 op identically however the bundler spells the marker (delegate ‖ factoryData, like the EntryPoint)', () => {
+    const base = {
+      sender: SENDER,
+      nonce: '0x5',
+      callData: '0xdeadbeef',
+      callGasLimit: '0x186a0',
+      verificationGasLimit: '0x30d40',
+      preVerificationGas: '0x7530',
+      maxFeePerGas: '0x3b9aca00',
+      maxPriorityFeePerGas: '0x1',
+      paymasterVerificationGasLimit: '0xea60',
+      paymasterPostOpGasLimit: '0x15f90',
+    } as const;
+    const terms = {
+      validUntil: 1, validAfter: 0, fee: 1n, serviceFee: 1n, refundTo: SENDER, feeToken: DAI, tokenPerEth: 5n,
+      withdrawalHash: `0x${'ab'.repeat(32)}` as Hex, senderImplementation: MASTER,
+    };
+    const hashOf = (extra: object) => paymasterHash({ op: { ...base, ...extra } as never, chainId: 1n, paymaster: PAYMASTER, terms });
+    const viemForm = hashOf({ factory: '0x7702', factoryData: '0x' });
+    expect(hashOf({ initCode: '0x7702' })).toBe(viemForm);
+    expect(hashOf({ initCode: EIP7702_INITCODE_MARKER })).toBe(viemForm);
+    expect(initCodeHash({ ...base, initCode: '0x7702' } as never, MASTER)).toBe(keccak256(MASTER));
+    expect(initCodeHash({ ...base, initCode: `${EIP7702_INITCODE_MARKER}abcd` } as never, MASTER)).toBe(keccak256(`${MASTER}abcd`));
+    // Not an EIP-7702 op: plain keccak of the (empty) initCode, whatever the terms say.
+    expect(hashOf({})).not.toBe(viemForm);
+    expect(initCodeHash({ ...base } as never, undefined)).toBe(keccak256('0x'));
+    expect(() => initCodeHash({ ...base, initCode: '0x7702' } as never, undefined)).toThrow(/sender implementation/);
+  });
+
+  it('encodes 265 bytes of paymasterData (317 with the EntryPoint prefix)', () => {
     const data = encodePaymasterData(
-      { validUntil: 1, validAfter: 0, fee: 1n, serviceFee: 1n, refundTo: SENDER, feeToken: DAI, tokenPerEth: 5n, withdrawalHash: `0x${'ab'.repeat(32)}` },
+      { validUntil: 1, validAfter: 0, fee: 1n, serviceFee: 1n, refundTo: SENDER, feeToken: DAI, tokenPerEth: 5n, withdrawalHash: `0x${'ab'.repeat(32)}`, senderImplementation: MASTER },
       DUMMY_SIGNATURE,
     );
-    expect((data.length - 2) / 2).toBe(6 + 6 + 32 + 32 + 20 + 20 + 32 + 32 + 65);
+    expect((data.length - 2) / 2).toBe(6 + 6 + 32 + 32 + 20 + 20 + 32 + 32 + 20 + 65);
     expect(data.slice(2 + 2 * (6 + 6 + 32 + 32 + 20), 2 + 2 * (6 + 6 + 32 + 32 + 20 + 20))).toBe(DAI.slice(2).toLowerCase());
   });
 

@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
+  createTestClient,
   createWalletClient,
   decodeEventLog,
   encodeFunctionData,
@@ -16,7 +17,7 @@ import { sponsoredWithdraw } from '../src/flow.js';
 import { syncLeaves } from '../src/merkle.js';
 import { commitmentHex, createNote, nullifierHashHex, toNoteString } from '../src/note.js';
 import { createTornadoProver, type TornadoProver } from '../src/prover.js';
-import { paymasterHash, encodePaymasterData, DUMMY_SIGNATURE } from '@tornado-4337/relayer';
+import { paymasterHash, encodePaymasterData, delegationCode, DUMMY_SIGNATURE } from '@tornado-4337/relayer';
 import { startHarness, type Harness } from './harness.js';
 
 const log = (m: string) => console.log(`[e2e] ${m}`);
@@ -249,19 +250,27 @@ describe('withdraw -> swap -> Aave supply, atomically over ERC-4337 with the thi
       feeToken: h.setup.demoErc20.address,
       tokenPerEth: 3000n * 10n ** 18n,
       withdrawalHash: `0x${'ab'.repeat(32)}` as Hex,
+      senderImplementation: h.setup.simple7702Implementation,
     };
     const local = paymasterHash({ op, chainId: BigInt(h.setup.chain.id), paymaster: h.paymaster, terms });
+    // On-chain, an EIP-7702 initCode is hashed with the sender's *actual* delegate (as the EntryPoint
+    // does), so the sender has to carry the delegation designator for the comparison to be meaningful.
+    await createTestClient({ chain: h.setup.chain, mode: 'anvil', transport: http(h.rpcUrl) }).setCode({
+      address: op.sender,
+      bytecode: delegationCode(h.setup.simple7702Implementation),
+    });
 
     const paymasterAndData = ('0x' +
       h.paymaster.slice(2) +
       (0xea60).toString(16).padStart(32, '0') +
       (0x15f90).toString(16).padStart(32, '0') +
       encodePaymasterData(terms, DUMMY_SIGNATURE).slice(2)) as Hex;
-    expect((paymasterAndData.length - 2) / 2).toBe(297);
+    expect((paymasterAndData.length - 2) / 2).toBe(317);
     const packed = {
       sender: op.sender,
       nonce: 5n,
-      initCode: '0x7702' as Hex,
+      // The 20-byte marker, as eth-infinitism packs it (viem/alto send the bare `0x7702`): same hash.
+      initCode: `0x7702${'00'.repeat(18)}` as Hex,
       callData: op.callData,
       accountGasLimits: ('0x' + (0x30d40).toString(16).padStart(32, '0') + (0x186a0).toString(16).padStart(32, '0')) as Hex,
       preVerificationGas: 0x7530n,
@@ -304,6 +313,7 @@ describe('withdraw -> swap -> Aave supply, atomically over ERC-4337 with the thi
                 { name: 'feeToken', type: 'address' },
                 { name: 'tokenPerEth', type: 'uint256' },
                 { name: 'withdrawalHash', type: 'bytes32' },
+                { name: 'senderImplementation', type: 'address' },
               ],
             },
           ],

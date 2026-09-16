@@ -17,6 +17,7 @@
  */
 import { createRequire } from 'node:module';
 import {
+  encodeDeployData,
   concatHex,
   createPublicClient,
   encodeAbiParameters,
@@ -32,13 +33,14 @@ import {
 } from 'viem';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 
-import { encodePaymasterData, paymasterHash, withdrawalHash, type FeeTerms } from '@tornado-4337/relayer';
+import { encodePaymasterData, paymasterArtifact, paymasterHash, withdrawalHash, type FeeTerms } from '@tornado-4337/relayer';
 import { paymasterAdminAbi } from '../src/abi.js';
 import { CHAINS } from '../src/chains.js';
+import { AA_BUNDLER_COMMIT, resolveBundlerDir } from '../src/aa-bundler.js';
 
 const rpc = process.env.MAINNET_RPC_URL ?? 'http://10.200.200.1:8545';
-const bundlerDir = process.env.AA_BUNDLER_DIR;
-if (!bundlerDir) throw new Error('AA_BUNDLER_DIR must point at a built eth-infinitism/bundler checkout');
+// Pinned checkout (see src/aa-bundler.ts): the rule set these results refer to is one specific commit.
+const bundlerDir = resolveBundlerDir();
 const require = createRequire(import.meta.url);
 const { bundlerCollectorTracer } = require(`${bundlerDir}/packages/validation-manager/dist/src/BundlerCollectorTracer.js`);
 const { getTracerBodyString } = require(`${bundlerDir}/packages/validation-manager/dist/src/GethTracer.js`);
@@ -47,8 +49,6 @@ const { tracerResultParser } = require(`${bundlerDir}/packages/validation-manage
 const setup = CHAINS.mainnet;
 const ENTRY_POINT = setup.entryPoint;
 const SIMPLE_7702 = setup.simple7702Implementation;
-/** The worker contract deployed by the relayer software on Sepolia: same bytecode + immutables as a mainnet deployment. */
-const CODE_SOURCE = { rpc: 'https://rpc.sepolia.ethpandaops.io', address: '0xAeF5257102B5A5b3Ba80a7fD60eA36653D337D0A' as Address };
 const POOL = setup.tornadoEth['100']!;
 const MASTER: Address = '0xb69e1e65142d293035323470d2B3c0c5d4E03F8e';
 
@@ -64,14 +64,18 @@ const accountAbi = parseAbi([
 ]);
 
 const client = createPublicClient({ chain: setup.chain, transport: http(rpc, { timeout: 120_000 }) });
-const sepolia = createPublicClient({ transport: http(CODE_SOURCE.rpc) });
 
 // --- entities -------------------------------------------------------------------------------
 const relayer = privateKeyToAccount(generatePrivateKey());
 const user = privateKeyToAccount(generatePrivateKey());
 const paymaster: Address = '0x00000000000000000000000000000000000ca7e5'; // any empty address; code + storage are overridden
-const code = await sepolia.getCode({ address: CODE_SOURCE.address });
-if (!code || code === '0x') throw new Error('could not fetch the worker paymaster runtime code');
+// Runtime code of the worker contract the relayer software deploys (the embedded artifact), with its
+// immutables set exactly as a mainnet deployment would: an eth_call of the creation code returns it.
+const { data: code } = await client.call({
+  account: relayer.address,
+  data: encodeDeployData({ abi: paymasterArtifact.abi, bytecode: paymasterArtifact.bytecode as Hex, args: [ENTRY_POINT, relayer.address, 1_000n, 45_000n] }),
+});
+if (!code || code === '0x') throw new Error('could not derive the worker paymaster runtime code');
 
 // --- the operation (worker mode: relayer = master, refundTo = 0) -----------------------------
 const fee = parseEther('0.3015');
@@ -97,6 +101,7 @@ const terms: FeeTerms = {
   feeToken: '0x0000000000000000000000000000000000000000',
   tokenPerEth: 0n,
   withdrawalHash: withdrawalHash({ instance: POOL, proof, root, nullifierHash, recipient: user.address, relayer: MASTER, fee }),
+  senderImplementation: SIMPLE_7702,
 };
 const rpcOp = {
   sender: user.address,
@@ -183,6 +188,9 @@ const trace = (await client.request({
   method: 'debug_traceCall' as never,
   params: [tx, 'latest', { tracer: getTracerBodyString(bundlerCollectorTracer), stateOverrides }] as never,
 })) as { calls: { type: string; data?: Hex; to?: string; method?: string }[]; callsFromEntryPoint: unknown[] };
+if (process.env.DUMP_TRACE) {
+  console.log(JSON.stringify(trace.calls.map((c) => ({ ...c, data: c.data?.slice(0, 10), return: (c as { return?: string }).return?.slice(0, 20) }))));
+}
 const last = trace.calls[trace.calls.length - 1];
 if (last?.type === 'REVERT') throw new Error(`handleOps reverted in the trace: ${last.data?.slice(0, 200)}`);
 
@@ -198,8 +206,14 @@ try {
 } catch (err) {
   const message = (err as Error).message;
   if (unstaked) {
-    console.log(`ERC-7562 negative control: unstaked paymaster rejected as expected — ${message}`);
-    process.exit(0);
+    // The negative control must fail for exactly the expected reason (ERC-7562 STO-031: an unstaked
+    // paymaster reading/writing its own storage), not for any incidental error.
+    if (/unstaked paymaster accessed/i.test(message) && /slot/i.test(message)) {
+      console.log(`ERC-7562 negative control (bundler ${AA_BUNDLER_COMMIT.slice(0, 7)}): unstaked paymaster rejected for the expected reason — ${message}`);
+      process.exit(0);
+    }
+    console.error(`ERC-7562 negative control FAILED: rejected for an unexpected reason — ${message}`);
+    process.exit(1);
   }
   console.error(`ERC-7562 violation: ${message}`);
   process.exit(1);
@@ -208,7 +222,7 @@ if (unstaked) {
   console.error('ERC-7562 negative control FAILED: an unstaked paymaster touching its own storage was not rejected');
   process.exit(1);
 }
-console.log('ERC-7562: validation of the sponsored operation passes the reference bundler rules');
+console.log(`ERC-7562: validation of the sponsored operation passes the reference bundler rules (bundler ${AA_BUNDLER_COMMIT.slice(0, 7)})`);
 console.log('  entities: sender (Simple7702Account, EIP-7702 in-op authorization), paymaster (worker contract, staked)');
 console.log('  contracts referenced during validation:', contracts);
 console.log('  top-level calls from the EntryPoint:', Object.keys(trace.callsFromEntryPoint as object).length);

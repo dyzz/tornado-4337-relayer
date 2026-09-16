@@ -18,7 +18,7 @@ import {
   type Hex,
   type PublicClient,
 } from 'viem';
-import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
+import { english, generateMnemonic, generatePrivateKey, mnemonicToAccount, privateKeyToAccount } from 'viem/accounts';
 
 import {
   createRelayerApp,
@@ -30,6 +30,7 @@ import {
 } from '@tornado-4337/relayer';
 import { CHAINS, type ChainSetup } from '../src/chains.js';
 import { restoreForkCache } from './fork-cache.js';
+import { resolveBundlerDir, startReferenceBundler } from '../src/aa-bundler.js';
 import {
   deployErc20Tornado,
   deployEthTornado,
@@ -66,6 +67,10 @@ export interface Harness {
   setup: ChainSetup;
   rpcUrl: string;
   bundlerUrl: string;
+  /** Which bundler serves `bundlerUrl`. */
+  bundler: 'alto' | 'alto-safe' | 'reference';
+  /** Reference bundler only: its stdout/stderr so far. */
+  bundlerOutput(): string;
   relayerUrl: string;
   publicClient: PublicClient;
   /** Upstream RPC the fork was taken from, and the block it was taken at. */
@@ -159,6 +164,16 @@ export interface HarnessOptions {
   paymasterMode?: 'standalone' | '7702';
   /** Protocol fee (burn) set on the fresh instances, in 1e-4 (default 30 = 0.30 %, the DAO's ETH-1 setting). */
   protocolFeePercentage?: number;
+  /**
+   * alto (default): pimlico's bundler in-process with `safeMode: false` (fast, no ERC-7562 tracing).
+   * alto-safe: the same bundler in safe mode — every op is traced (`debug_traceCall` + its ERC-7562
+   *   collector tracer) and checked against the ERC-7562 rules before it enters the mempool; the
+   *   paymaster stakes alto's default entity minimum (1 ETH).
+   * reference: the eth-infinitism bundler at `AA_BUNDLER_DIR` (pinned commit) as a child process in
+   *   safe mode. NOTE: at the pinned commit its safe mode only works with geth's native `erc7562Tracer`
+   *   (its JS-tracer path no longer decodes validation results), which anvil does not have.
+   */
+  bundler?: 'alto' | 'alto-safe' | 'reference';
   anvilPort?: number;
   altoPort?: number;
   relayerPort?: number;
@@ -207,6 +222,7 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
 
   // Fresh keys, not the well-known anvil ones: on public testnets those EOAs are frequently
   // EIP-7702-delegated by tutorials, which breaks the bundler's beneficiary accounting.
+  const bundlerKind = opts.bundler ?? 'alto';
   const deployerKey = generatePrivateKey();
   const relayerKey = generatePrivateKey();
   const executorKey = generatePrivateKey();
@@ -298,7 +314,7 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
         signerKey: relayerKey,
         mode: 'standalone',
         autoSetup: true,
-        stakeWei: parseEther('0.1'),
+        stakeWei: parseEther(bundlerKind === 'alto' ? '0.1' : '1'),
         unstakeDelaySec: 86_400,
         depositWei: parseEther('2'),
         router,
@@ -468,24 +484,52 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
   }
   log(`deployed tornado=${instance} tornado-${setup.demoErc20.symbol}=${erc20Instance} paymaster=${paymaster}${paymasterImplementation ? ` (7702 -> ${paymasterImplementation})` : ''} zap=${zap} hasher=${hasher}`);
 
-  // --- alto -----------------------------------------------------------------
-  const altoPort = opts.altoPort ?? (await freePort());
-  const altoInstance = Instance.alto({
-    rpcUrl,
-    entrypoints: [setup.entryPoint],
-    executorPrivateKeys: [executorKey],
-    utilityPrivateKey: utilityKey,
-    safeMode: false,
-    port: altoPort,
-  });
-  if (process.env.ALTO_LOG_FILE) {
-    // Raw bundler log for debugging (every message alto prints).
-    const { appendFileSync } = await import('node:fs');
-    altoInstance.on('message', (m: string) => appendFileSync(process.env.ALTO_LOG_FILE!, m + '\n'));
+  // --- bundler ----------------------------------------------------------------
+  let bundlerUrl: string;
+  let stopBundler: () => Promise<void>;
+  let bundlerOutput = () => '';
+  if (bundlerKind === 'reference') {
+    const dir = resolveBundlerDir();
+    const mnemonic = generateMnemonic(english);
+    const bundlerSigner = mnemonicToAccount(mnemonic);
+    await setBalance(bundlerSigner.address, parseEther('1000'));
+    const [port, privateApiPort] = [opts.altoPort ?? (await freePort()), await freePort()];
+    const ref = await startReferenceBundler({
+      dir,
+      rpcUrl,
+      chainId: chain.id,
+      entryPoint: setup.entryPoint,
+      mnemonic,
+      beneficiary: bundlerSigner.address,
+      port,
+      privateApiPort,
+      tracer: 'js', // anvil has no native erc7562Tracer
+      log: process.env.BUNDLER_LOG ? log : undefined,
+    });
+    bundlerUrl = ref.url;
+    stopBundler = ref.stop;
+    bundlerOutput = ref.output;
+    log(`reference bundler (safe mode, ${dir}) on ${bundlerUrl}, signer ${bundlerSigner.address}`);
+  } else {
+    const altoPort = opts.altoPort ?? (await freePort());
+    const altoInstance = Instance.alto({
+      rpcUrl,
+      entrypoints: [setup.entryPoint],
+      executorPrivateKeys: [executorKey],
+      utilityPrivateKey: utilityKey,
+      safeMode: bundlerKind === 'alto-safe',
+      port: altoPort,
+    });
+    if (process.env.ALTO_LOG_FILE) {
+      // Raw bundler log for debugging (every message alto prints).
+      const { appendFileSync } = await import('node:fs');
+      altoInstance.on('message', (m: string) => appendFileSync(process.env.ALTO_LOG_FILE!, m + '\n'));
+    }
+    await altoInstance.start();
+    bundlerUrl = `http://127.0.0.1:${altoPort}`;
+    stopBundler = () => altoInstance.stop();
+    log(`alto bundler (${bundlerKind === 'alto-safe' ? 'safe mode: ERC-7562 tracing on' : 'unsafe mode'}) on ${bundlerUrl}`);
   }
-  await altoInstance.start();
-  const bundlerUrl = `http://127.0.0.1:${altoPort}`;
-  log(`alto bundler on ${bundlerUrl}`);
 
   // --- relayer (in-process) ---------------------------------------------------
   // Mainnet forks price tokens with the real 1inch oracle (as tornado-relayer does);
@@ -517,7 +561,11 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
       priceSource,
       serviceFeeBps: opts.serviceFeeBps ?? 30n,
       signatureTtlSec: 300,
-      simulateWithBundler: true,
+      // The reference bundler's eth_estimateUserOperationGas runs callData standalone (eth_estimateGas
+      // from the EntryPoint, "todo: use simulateHandleOp for this too" in its source), which cannot
+      // work for a withdrawal whose sponsorship is granted during validation; the on-chain
+      // simulateRelayWithdraw dry run stays on. Production bundlers estimate through simulateHandleOp.
+      simulateWithBundler: bundlerKind !== 'reference',
       gasPriceMarginBps: 11_000n,
       sponsorName: 'tornado-4337-relayer (e2e)',
     },
@@ -534,6 +582,8 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
     setup,
     rpcUrl,
     bundlerUrl,
+    bundler: bundlerKind,
+    bundlerOutput,
     relayerUrl,
     publicClient,
     forkUrl,
@@ -557,7 +607,7 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
     mine,
     async stop() {
       await new Promise<void>((r) => server.close(() => r()));
-      await altoInstance.stop();
+      await stopBundler();
       await anvilInstance.stop();
     },
   };

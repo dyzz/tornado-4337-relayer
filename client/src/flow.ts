@@ -1,6 +1,9 @@
 import {
+  custom,
   encodeFunctionData,
   http,
+  RpcRequestError,
+  toHex,
   type Address,
   type Chain,
   type Hex,
@@ -14,6 +17,7 @@ import {
   type UserOperationReceipt,
 } from 'viem/account-abstraction';
 
+import { delegationCode } from '@tornado-4337/relayer';
 import { paymasterAdminAbi, tornadoAbi } from './abi.js';
 import { merklePath } from './merkle.js';
 import type { Note } from './note.js';
@@ -58,6 +62,40 @@ export interface SponsoredWithdrawParams {
   log?: (msg: string) => void;
 }
 
+/**
+ * A bundler transport that sends the ERC-4337 request in its canonical shape:
+ *  - viem formats the EIP-7702 authorization's `yParity` as a zero-padded byte (`0x00`/`0x01`); bundlers
+ *    that hand the tuple straight to the node (eth-infinitism) then trip geth's strict QUANTITY parsing
+ *    ("hex number with leading zero digits"). Quantities go out minimal.
+ *  - viem sends `factory: "0x7702", factoryData: "0x"` for a not-yet-delegated sender; an empty
+ *    factoryData is omitted (the reference bundler reads any present factoryData as an
+ *    `initEip7702Sender` call and then mis-indexes the validation frames of the trace).
+ */
+function strictHexTransport(url: string) {
+  const quantity = (v: unknown) => (typeof v === 'string' && /^0x[0-9a-fA-F]+$/.test(v) ? toHex(BigInt(v)) : v);
+  const canonical = (params: unknown): unknown => {
+    if (!Array.isArray(params)) return params;
+    return params.map((param) => {
+      if (!param || typeof param !== 'object') return param;
+      const op = { ...(param as Record<string, unknown>) };
+      if (op.factory === '0x7702' && (op.factoryData === '0x' || op.factoryData === undefined)) delete op.factoryData;
+      const auth = op.eip7702Auth as Record<string, unknown> | undefined;
+      if (auth) op.eip7702Auth = { ...auth, chainId: quantity(auth.chainId), nonce: quantity(auth.nonce), yParity: quantity(auth.yParity) };
+      return op;
+    });
+  };
+  let id = 0;
+  return custom({
+    async request({ method, params }: { method: string; params?: unknown }) {
+      const body = { jsonrpc: '2.0', id: ++id, method, params: canonical(params) };
+      const res = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+      const json = (await res.json()) as { result?: unknown; error?: { code: number; message: string; data?: unknown } };
+      if (json.error) throw new RpcRequestError({ body, error: json.error, url });
+      return json.result;
+    },
+  });
+}
+
 export interface SponsoredWithdrawResult {
   userOpHash: Hex;
   receipt: UserOperationReceipt;
@@ -97,7 +135,7 @@ export async function sponsoredWithdraw(p: SponsoredWithdrawParams): Promise<Spo
     account,
     client: p.publicClient,
     chain: p.chain,
-    transport: http(p.bundlerUrl),
+    transport: strictHexTransport(p.bundlerUrl),
     paymasterContext: { refundTo: p.refundTo },
   });
 
@@ -157,13 +195,22 @@ export async function sponsoredWithdraw(p: SponsoredWithdrawParams): Promise<Spo
   let proof = await prove(quote.relayer, quote.fee);
   log(`proof ready, sender=${account.address}`);
 
+  const implementation = p.implementation ?? account.authorization!.address;
+  const delegated = await account.isDeployed();
+
   // 3-4. Let the bundler size the op. Only the stub role is wired so nothing is signed yet.
   if (!p.skipEstimation) {
     const est = await bundler.estimateUserOperationGas({
       calls: buildCalls(proof, quote.fee, asset, quote.paymaster),
+      // The quoted ceilings as the starting point: strict bundlers (eth-infinitism) require every gas
+      // field to be present in eth_estimateUserOperationGas; alto ignores them.
+      ...quote.gas,
       maxFeePerGas: quote.maxFeePerGas,
       maxPriorityFeePerGas: quote.maxPriorityFeePerGas,
       paymaster: { getPaymasterData: (args) => paymasterClient.getPaymasterStubData(args) },
+      // A not-yet-delegated sender has no code for the estimation call: simulate it as already
+      // delegated (the in-op authorization is only applied when the bundle is mined).
+      ...(delegated ? {} : { stateOverride: [{ address: p.owner.address, code: delegationCode(implementation) }] }),
     });
     const gas = {
       callGasLimit: bump(est.callGasLimit, 1_500n),
@@ -182,10 +229,10 @@ export async function sponsoredWithdraw(p: SponsoredWithdrawParams): Promise<Spo
   }
 
   // 5. Sign the EIP-7702 delegation (fresh EOA -> Simple7702Account) unless already delegated.
-  const authorization = (await account.isDeployed())
+  const authorization = delegated
     ? undefined
     : await p.owner.signAuthorization({
-        address: p.implementation ?? account.authorization!.address,
+        address: implementation,
         chainId: p.chain.id,
         nonce: await p.publicClient.getTransactionCount({ address: p.owner.address }),
       });
@@ -198,7 +245,10 @@ export async function sponsoredWithdraw(p: SponsoredWithdrawParams): Promise<Spo
     maxPriorityFeePerGas: quote.maxPriorityFeePerGas,
     paymaster: paymasterClient,
     ...(authorization ? { authorization } : {}),
-  });
+    // viem re-estimates inside prepareUserOperation when the paymaster stub leaves a gas field open;
+    // give that estimate the same delegated-sender view (see step 3-4).
+    ...(delegated ? {} : { stateOverride: [{ address: p.owner.address, code: delegationCode(implementation) }] }),
+  } as Parameters<typeof bundler.sendUserOperation>[0]);
   log(`userOp sent: ${userOpHash}`);
   const receipt = await bundler.waitForUserOperationReceipt({ hash: userOpHash, timeout: 180_000 });
   log(`userOp mined in tx ${receipt.receipt.transactionHash}, success=${receipt.success}`);

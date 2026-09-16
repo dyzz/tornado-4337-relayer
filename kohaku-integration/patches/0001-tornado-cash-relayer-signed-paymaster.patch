@@ -20,16 +20,20 @@ index d443534..4faab2b 100644
  
  export type TxFeatureMap<
 diff --git a/packages/tornado-cash/src/data/data.service.ts b/packages/tornado-cash/src/data/data.service.ts
-index 0f9738a..fb0eeda 100644
+index 0f9738a..d53df35 100644
 --- a/packages/tornado-cash/src/data/data.service.ts
 +++ b/packages/tornado-cash/src/data/data.service.ts
-@@ -245,6 +245,11 @@ export class DataService implements IDataService {
+@@ -245,6 +245,15 @@ export class DataService implements IDataService {
      return this.ethClient.getDeploymentBlock(address, fromBlock);
    }
  
 +  /** ERC-4337 sequence nonce (key 0) of `sender` on `entryPoint`: 0 for a fresh account. */
 +  async getEntryPointNonce(entryPoint: Address, sender: Address): Promise<bigint> {
 +    return this.ethClient.makeContractRequest(entryPoint, "entryPoint", "getNonce", toHex(sender, { size: 20 }), 0n);
++  }
++
++  async getCode(account: Address): Promise<string> {
++    return this.ethClient.getCode(toHex(account, { size: 20 }));
 +  }
 +
    async getPoolStateRoot(poolAddress: Address): Promise<bigint> {
@@ -52,14 +56,16 @@ index a1734d9..6024fdc 100644
  
  interface IGetLogsResult {
 diff --git a/packages/tornado-cash/src/data/interfaces/data.service.interface.ts b/packages/tornado-cash/src/data/interfaces/data.service.interface.ts
-index 5aa0f5c..4333c77 100644
+index 5aa0f5c..7b39803 100644
 --- a/packages/tornado-cash/src/data/interfaces/data.service.interface.ts
 +++ b/packages/tornado-cash/src/data/interfaces/data.service.interface.ts
-@@ -92,6 +92,7 @@ export interface IDataService {
+@@ -92,6 +92,9 @@ export interface IDataService {
    getPoolAsset(poolAddress: Address): Promise<Address>;
    getPoolConfig(registryAddress: Address, poolAddress: Address): Promise<IPoolConfig>;
    getChainId(): Promise<ChainId>;
 +  getEntryPointNonce(entryPoint: Address, sender: Address): Promise<bigint>;
++  /** Runtime code of `account` (`0x` for a plain EOA, `0xef0100||impl` when EIP-7702-delegated). */
++  getCode(account: Address): Promise<string>;
    getGasPrice(): Promise<bigint>;
  
    getContractDeploymentBlock(address: Address, fromBlock?: bigint): Promise<bigint>;
@@ -76,6 +82,26 @@ index 50cad1c..fc2029e 100644
 +export { RelayerPaymasterClient, RelayerPaymasterError } from './paymaster/relayer-paymaster-client';
 +export type { RelayerQuote, RelayerPaymasterFields, RelayerSponsorContext } from './paymaster/relayer-paymaster-client';
 +export type { IRelayerPaymasterConfig, IPaymasterConfig } from './plugin/interfaces/protocol-params.interface';
+diff --git a/packages/tornado-cash/src/interfaces/user-ops.interface.ts b/packages/tornado-cash/src/interfaces/user-ops.interface.ts
+index 77d4591..f633f42 100644
+--- a/packages/tornado-cash/src/interfaces/user-ops.interface.ts
++++ b/packages/tornado-cash/src/interfaces/user-ops.interface.ts
+@@ -57,7 +57,12 @@ export interface BuildSignedTornadoUserOpParams {
+   maxFeePerGas: bigint;
+   maxPriorityFeePerGas: bigint;
+   tailCalls?: (address: Address) => Promise<TxData[]>;
+-  /** EntryPoint nonce for this sender. Defaults to 0 (fresh EOA). Set to the
+-   *  deposit index when multiple userOps share the same ephemeral sender. */
++  /** EntryPoint sequence nonce (key 0) of the sender: `EntryPoint.getNonce(sender, 0)`. Defaults to 0 (fresh EOA). */
+   nonce?: bigint;
++  /**
++   * EIP-7702 authorization to attach. `{ nonce }` signs a fresh delegation to Simple7702Account with the
++   * sender's *EOA* nonce (`eth_getTransactionCount`, which the EntryPoint nonce does not track);
++   * `'delegated'` attaches none because the sender already runs Simple7702Account. Defaults to `{ nonce: 0 }`.
++   */
++  authorization?: { nonce: number } | 'delegated';
+ }
+\ No newline at end of file
 diff --git a/packages/tornado-cash/src/paymaster/relayer-paymaster-client.ts b/packages/tornado-cash/src/paymaster/relayer-paymaster-client.ts
 new file mode 100644
 index 0000000..dc549a4
@@ -240,6 +266,64 @@ index 0000000..dc549a4
 +    return this.request('pm_getPaymasterData', [op, entryPoint, toHex(chainId), context]);
 +  }
 +}
+diff --git a/packages/tornado-cash/src/paymaster/utils.ts b/packages/tornado-cash/src/paymaster/utils.ts
+index 34d64b0..ad8f1bd 100644
+--- a/packages/tornado-cash/src/paymaster/utils.ts
++++ b/packages/tornado-cash/src/paymaster/utils.ts
+@@ -139,6 +139,7 @@ export async function buildSignedTornadoUserOp({
+   maxPriorityFeePerGas,
+   tailCalls = async () => [],
+   nonce = 0n,
++  authorization: authorizationRequest = { nonce: 0 },
+ }: BuildSignedTornadoUserOpParams): Promise<SerializedUserOperation> {
+ 
+   const owner = signer;
+@@ -162,15 +163,19 @@ export async function buildSignedTornadoUserOp({
+     });
+   }
+ 
+-  // The EIP-7702 authorization nonce must equal the sender's EOA nonce at the
+-  // time the bundle tx is processed. Each time a 7702 auth is consumed the EOA
+-  // nonce increments, so for the k-th userOp from the same shared sender we
+-  // need nonce = k (matching the userOp's EntryPoint sequence number).
+-  const authorization = await owner.signAuthorization({
+-    address: SIMPLE_7702_IMPLEMENTATION,
+-    chainId,
+-    nonce: Number(nonce),
+-  });
++  // The EIP-7702 authorization nonce must equal the sender's EOA nonce when the bundle transaction is
++  // processed. That is the account's transaction count (each consumed authorization increments it),
++  // not the EntryPoint nonce: the two diverge as soon as the sender is already delegated (no
++  // authorization consumed) or sent a plain transaction. Callers pass the EOA nonce explicitly, or
++  // `'delegated'` when the sender already runs Simple7702Account and needs no authorization.
++  const authorization =
++    authorizationRequest === 'delegated'
++      ? undefined
++      : await owner.signAuthorization({
++          address: SIMPLE_7702_IMPLEMENTATION,
++          chainId,
++          nonce: authorizationRequest.nonce,
++        });
+ 
+   const userOperation = {
+     sender: owner.address,
+@@ -212,10 +217,15 @@ export async function buildSignedTornadoUserOp({
+     paymasterPostOpGasLimit: toHex(userOperation.paymasterPostOpGasLimit),
+     paymasterData: userOperation.paymasterData,
+     signature,
+-    eip7702Auth: serializeAuth(authorization),
++    ...(authorization ? { eip7702Auth: serializeAuth(authorization) } : {}),
+   };
+ }
+ 
++/** True when `code` is the EIP-7702 delegation designator for Simple7702Account (`0xef0100 || impl`). */
++export function isDelegatedToSimple7702(code: string | null | undefined): boolean {
++  return (code ?? '0x').toLowerCase() === `0xef0100${SIMPLE_7702_IMPLEMENTATION.slice(2).toLowerCase()}`;
++}
++
+ function serializeAuth(auth: SignedAuthorization): SerializedAuth {
+   return {
+     address: (auth as any).address ?? (auth as any).contractAddress,
 diff --git a/packages/tornado-cash/src/plugin/interfaces/protocol-params.interface.ts b/packages/tornado-cash/src/plugin/interfaces/protocol-params.interface.ts
 index 6d6009c..5647c52 100644
 --- a/packages/tornado-cash/src/plugin/interfaces/protocol-params.interface.ts
@@ -324,10 +408,10 @@ index c6f9806..8eb0fc1 100644
  
 diff --git a/packages/tornado-cash/src/state/thunks/relayerPaymasterWithdrawThunk.ts b/packages/tornado-cash/src/state/thunks/relayerPaymasterWithdrawThunk.ts
 new file mode 100644
-index 0000000..b8db6c2
+index 0000000..558668f
 --- /dev/null
 +++ b/packages/tornado-cash/src/state/thunks/relayerPaymasterWithdrawThunk.ts
-@@ -0,0 +1,258 @@
+@@ -0,0 +1,265 @@
 +/* eslint-disable max-lines */
 +import { createAsyncThunk, unwrapResult } from "@reduxjs/toolkit";
 +
@@ -338,7 +422,7 @@ index 0000000..b8db6c2
 +
 +import { reasonableGasUnitsForBatch } from "../../paymaster/fee";
 +import { RelayerPaymasterClient, relayerPaymasterAbi } from "../../paymaster/relayer-paymaster-client";
-+import { buildSignedTornadoUserOp, createPaymasterBundlerClient, estimateUserOperationGas } from "../../paymaster/utils";
++import { buildSignedTornadoUserOp, createPaymasterBundlerClient, estimateUserOperationGas, isDelegatedToSimple7702 } from "../../paymaster/utils";
 +import { addressToHex } from "../../utils";
 +import { UserOpGasLimits } from "../../interfaces/user-ops.interface";
 +import { Address } from "../../interfaces/types.interface";
@@ -482,10 +566,16 @@ index 0000000..b8db6c2
 +    const signer = await resolveIndependentSigner(deposit);
 +    const senderAddress = BigInt(signer.address) as Address;
 +    const recipient = senderAddress;
-+    // A retry of the same note reuses the same deterministic sender: if an earlier operation already
-+    // landed (even one whose execution reverted), the EntryPoint nonce and the EOA nonce both moved on.
-+    // `buildSignedTornadoUserOp` derives the EIP-7702 authorization nonce from this value.
-+    const senderNonce = await dataService.getEntryPointNonce(BigInt(entryPointAddress) as Address, senderAddress);
++    // A retry of the same note reuses the same deterministic sender, so nothing is assumed about its
++    // state: the EntryPoint nonce (userOp sequence) and the EOA nonce (transaction count, consumed by
++    // EIP-7702 authorizations) are read separately, and a sender that already delegates to
++    // Simple7702Account gets no new authorization at all.
++    const [senderNonce, senderTxCount, senderCode] = await Promise.all([
++      dataService.getEntryPointNonce(BigInt(entryPointAddress) as Address, senderAddress),
++      dataService.getAccountNonce(senderAddress),
++      dataService.getCode(senderAddress),
++    ]);
++    const authorization = isDelegatedToSimple7702(senderCode) ? ('delegated' as const) : { nonce: senderTxCount };
 +
 +    const forwardCalls = (fee: bigint): TxData[] => {
 +      const forwardAmount = depositPool.denomination - fee;
@@ -523,6 +613,7 @@ index 0000000..b8db6c2
 +      maxPriorityFeePerGas,
 +      tailCalls: async () => calls,
 +      nonce: senderNonce,
++      authorization,
 +    });
 +
 +    // 1. Baseline quote and proof.

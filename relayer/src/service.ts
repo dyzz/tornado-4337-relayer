@@ -39,6 +39,7 @@ import {
   type RpcUserOperation,
   type UserOpGas,
 } from './userop.js';
+import { delegationCode } from './setup.js';
 import { decodeAccountCalls, findSponsoringWithdraw, ValidationError } from './validate.js';
 
 export interface RelayerConfig {
@@ -154,6 +155,7 @@ export interface PaymasterDataResult {
     feeToken: Address;
     tokenPerEth: Hex;
     withdrawalHash: Hex;
+    senderImplementation: Address;
     minFee: Hex;
   };
 }
@@ -544,6 +546,7 @@ export class RelayerService {
       feeToken,
       tokenPerEth: 0n,
       withdrawalHash: approved,
+      senderImplementation: senderImplementationFromOp(op) ?? zeroAddress,
     };
     return {
       paymaster: this.config.paymaster,
@@ -605,9 +608,12 @@ export class RelayerService {
       );
     }
     const token = reserved.token;
+    let senderImplementation: Address;
     try {
-      // 4. Optional sender allowlist (defence in depth; the on-chain binding does not depend on it).
-      await this.assertSenderAllowed(op);
+      // 4. The implementation that will run the op: the op's own EIP-7702 authorization, else the
+      //    sender's current delegation. It is signed into the terms and re-checked by the paymaster at
+      //    validation, so a client cannot swap authorizations after the signature. Optionally allowlisted.
+      senderImplementation = await this.resolveSenderImplementation(op);
 
       // 5. On-chain sanity: the proof must verify against the instance right now.
       await this.assertWithdrawSimulates(w);
@@ -631,6 +637,8 @@ export class RelayerService {
       tokenPerEth,
       // Binds the sponsorship to exactly this relayWithdraw call, whatever the sender account executes.
       withdrawalHash: withdrawalHash(w),
+      // … and to the account implementation that will execute it.
+      senderImplementation,
     };
     const hash = paymasterHash({ op, chainId: this.config.chainId, paymaster: this.config.paymaster, terms });
     let signature: Hex;
@@ -666,6 +674,7 @@ export class RelayerService {
         feeToken: terms.feeToken,
         tokenPerEth: toHex(terms.tokenPerEth),
         withdrawalHash: terms.withdrawalHash,
+        senderImplementation: terms.senderImplementation,
         minFee: toHex(minFee),
       },
     };
@@ -752,8 +761,15 @@ export class RelayerService {
           : (`0x${initCode.slice(42)}` as Hex);
       }
     }
+    // A sender that is only delegated by the op's own EIP-7702 authorization has no code yet; strict
+    // bundlers (eth-infinitism) estimate exactly what the node sees, so show them the delegated sender.
+    const authorized = senderImplementationFromOp(op);
+    const stateOverride =
+      authorized && ((await this.client.getCode({ address: op.sender })) ?? '0x') === '0x'
+        ? { [op.sender]: { code: delegationCode(authorized) } }
+        : undefined;
     try {
-      await this.bundlerRequest('eth_estimateUserOperationGas', [simulated, this.config.entryPoint]);
+      await this.bundlerRequest('eth_estimateUserOperationGas', [simulated, this.config.entryPoint, ...(stateOverride ? [stateOverride] : [])]);
     } catch (err) {
       throw new ValidationError(`bundler simulation failed: ${shortError(err)}`, -32007);
     }
@@ -771,26 +787,26 @@ export class RelayerService {
   }
 
   /**
-   * The implementation that will execute the op must be allowed: the op's own EIP-7702 authorization
-   * when it carries one (it is applied before validation and replaces whatever code the sender has),
-   * otherwise the sender's current delegation.
+   * The implementation that will execute the op: the op's own EIP-7702 authorization when it carries
+   * one (it is applied before validation and replaces whatever code the sender has), otherwise the
+   * sender's current delegation. Only EIP-7702 senders are sponsored: the paymaster re-checks the
+   * delegation designator on-chain, which is what makes the binding hold after signing.
    */
-  private async assertSenderAllowed(op: RpcUserOperation) {
-    const allowed = this.config.allowedSenderImplementations;
-    if (!allowed || allowed.length === 0) return;
-    const auth = (op as { eip7702Auth?: { address?: Address; contractAddress?: Address } }).eip7702Auth;
-    let implementation: Address | undefined = auth?.address ?? auth?.contractAddress;
+  private async resolveSenderImplementation(op: RpcUserOperation): Promise<Address> {
+    let implementation = senderImplementationFromOp(op);
     let source = 'eip7702Auth';
     if (!implementation) {
       const code = ((await this.client.getCode({ address: op.sender })) ?? '0x').toLowerCase();
       if (code.startsWith('0xef0100') && code.length === 2 + 46) implementation = getAddress(`0x${code.slice(8)}`);
       else if (code === '0x') throw new ValidationError('sender has no code and the op carries no EIP-7702 authorization', -32009);
-      else throw new ValidationError('sender is a contract account whose implementation cannot be checked', -32009);
+      else throw new ValidationError('only EIP-7702 senders are sponsored (sender is a contract account)', -32009);
       source = 'delegation';
     }
-    if (!allowed.some((a) => isAddressEqual(a, implementation!))) {
+    const allowed = this.config.allowedSenderImplementations;
+    if (allowed && allowed.length > 0 && !allowed.some((a) => isAddressEqual(a, implementation!))) {
       throw new ValidationError(`sender implementation ${implementation} (${source}) is not sponsored`, -32009);
     }
+    return implementation;
   }
 }
 
@@ -839,6 +855,13 @@ export async function probeRegistry(
 
 function stripUndefined<T extends object>(obj: T): Partial<T> {
   return Object.fromEntries(Object.entries(obj).filter(([, v]) => v !== undefined)) as Partial<T>;
+}
+
+/** Implementation named by the op's EIP-7702 authorization, if it carries one. */
+function senderImplementationFromOp(op: RpcUserOperation): Address | undefined {
+  const auth = (op as { eip7702Auth?: { address?: Address; contractAddress?: Address } }).eip7702Auth;
+  const a = auth?.address ?? auth?.contractAddress;
+  return a && isAddress(a) ? getAddress(a) : undefined;
 }
 
 /** Human-readable form of inner revert data (Error(string), Panic, or a raw selector). */

@@ -104,7 +104,7 @@ contract DaoSandboxTest is Test {
         bytes32 wh = keccak256(abi.encode(ITornadoInstance(pool), keccak256(hex""), bytes32(0), nullifierHash, sender, relayer, fee));
         PackedUserOperation memory op;
         op.sender = sender;
-        op.paymasterAndData = abi.encodePacked(address(paymaster), uint128(0), uint128(0), new bytes(148), wh, new bytes(65));
+        op.paymasterAndData = abi.encodePacked(address(paymaster), uint128(0), uint128(0), new bytes(148), wh, new bytes(20), new bytes(65));
         vm.prank(address(entryPoint));
         paymaster.validatePaymasterUserOp(op, bytes32(0), 0);
     }

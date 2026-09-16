@@ -20,3 +20,4 @@ export * from './userop.js';
 export * from './fee.js';
 export * from './validate.js';
 export * from './abi.js';
+export { paymasterArtifact } from './generated/paymaster-artifact.js';

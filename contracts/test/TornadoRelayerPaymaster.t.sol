@@ -139,6 +139,37 @@ contract TornadoRelayerPaymasterTest is Test {
         return abi.encodePacked(address(paymaster), uint128(100_000), uint128(80_000));
     }
 
+    /// An EIP-7702 initCode is hashed like the EntryPoint hashes it (delegate ‖ initCode[20:]), so the
+    /// relayer's signature holds whether a bundler sends the bare `0x7702` marker or the 20-byte form.
+    function test_getHash_eip7702InitCode_independentOfMarkerPadding() public {
+        address sender7702 = makeAddr("eip7702 sender");
+        address impl = makeAddr("implementation");
+        vm.etch(sender7702, abi.encodePacked(hex"ef0100", impl));
+        TornadoRelayerPaymasterCore.Terms memory t = _terms(1 ether, 0, address(0), address(0), 0);
+        t.senderImplementation = impl;
+        PackedUserOperation memory op;
+        op.sender = sender7702;
+        op.nonce = 5;
+        op.callData = hex"deadbeef";
+        op.accountGasLimits = bytes32((uint256(1) << 128) | 2);
+        op.preVerificationGas = 3;
+        op.gasFees = bytes32((uint256(4) << 128) | 5);
+        op.paymasterAndData = _encode(t, new bytes(65));
+
+        op.initCode = hex"7702";
+        bytes32 bare = paymaster.getHash(op, t);
+        op.initCode = abi.encodePacked(bytes20(hex"7702"));
+        assertEq(paymaster.getHash(op, t), bare, "padded marker hashes like the bare one");
+        op.initCode = abi.encodePacked(bytes20(hex"7702"), hex"abcd");
+        assertTrue(paymaster.getHash(op, t) != bare, "factoryData is part of the hash");
+        op.initCode = hex"";
+        assertTrue(paymaster.getHash(op, t) != bare, "a non-7702 op hashes its raw initCode");
+        // The delegate is what gets hashed: another implementation at the sender changes the hash.
+        op.initCode = hex"7702";
+        vm.etch(sender7702, abi.encodePacked(hex"ef0100", makeAddr("other")));
+        assertTrue(paymaster.getHash(op, t) != bare, "delegate is part of the hash");
+    }
+
     function _encode(TornadoRelayerPaymasterCore.Terms memory t, bytes memory sig) internal view returns (bytes memory) {
         return _encodeFor(address(paymaster), t, sig);
     }
@@ -150,7 +181,7 @@ contract TornadoRelayerPaymasterTest is Test {
         returns (bytes memory)
     {
         bytes memory head = abi.encodePacked(pm, uint128(100_000), uint128(80_000), t.validUntil, t.validAfter, t.fee, t.serviceFee);
-        bytes memory tail = abi.encodePacked(t.refundTo, t.feeToken, t.tokenPerEth, t.withdrawalHash);
+        bytes memory tail = abi.encodePacked(t.refundTo, t.feeToken, t.tokenPerEth, t.withdrawalHash, t.senderImplementation);
         return bytes.concat(head, tail, sig);
     }
 
@@ -190,7 +221,8 @@ contract TornadoRelayerPaymasterTest is Test {
             refundTo: refundTo,
             feeToken: feeToken,
             tokenPerEth: rate,
-            withdrawalHash: wh
+            withdrawalHash: wh,
+            senderImplementation: address(0)
         });
     }
 
@@ -245,7 +277,7 @@ contract TornadoRelayerPaymasterTest is Test {
     // ------------------------------------------------------------ tests
 
     function test_layoutConstants() public view {
-        assertEq(paymaster.PAYMASTER_AND_DATA_LENGTH(), 297);
+        assertEq(paymaster.PAYMASTER_AND_DATA_LENGTH(), 317);
     }
 
     function test_parsePaymasterAndData_roundTrip() public view {
@@ -263,13 +295,14 @@ contract TornadoRelayerPaymasterTest is Test {
         assertEq(p.feeToken, address(dai));
         assertEq(p.tokenPerEth, 123456);
         assertEq(p.withdrawalHash, keccak256("wh"));
+        assertEq(p.senderImplementation, address(0));
         assertEq(s.length, 65);
         assertEq(uint8(s[0]), 0xAA);
     }
 
     function test_parsePaymasterAndData_rejectsWrongLength() public {
         bytes memory data = abi.encodePacked(_pmPrefix(), uint48(1), uint48(0));
-        vm.expectRevert(abi.encodeWithSelector(TornadoRelayerPaymasterCore.InvalidPaymasterDataLength.selector, 64, 297));
+        vm.expectRevert(abi.encodeWithSelector(TornadoRelayerPaymasterCore.InvalidPaymasterDataLength.selector, 64, 317));
         paymaster.parsePaymasterAndData(data);
     }
 
@@ -544,7 +577,7 @@ contract TornadoRelayerPaymasterTest is Test {
     function _sponsor(address sender, bytes32 wh) internal {
         PackedUserOperation memory op;
         op.sender = sender;
-        op.paymasterAndData = abi.encodePacked(_pmPrefix(), new bytes(148), wh, new bytes(65));
+        op.paymasterAndData = abi.encodePacked(_pmPrefix(), new bytes(148), wh, new bytes(20), new bytes(65));
         vm.prank(address(entryPoint));
         paymaster.validatePaymasterUserOp(op, bytes32(0), 0);
     }
@@ -616,6 +649,48 @@ contract TornadoRelayerPaymasterTest is Test {
             ITornadoInstance(address(tornado)), hex"", bytes32(0), keccak256("sim3"), payable(address(account)),
             payable(address(paymaster)), 0.01 ether
         );
+    }
+
+    /// The sponsorship names the account implementation the sender must run. A client that obtains a
+    /// signature while delegated to A and then re-authorizes to its own B (re-signing the userOp with
+    /// the same key) is refused at validation: the paymaster reads the sender's delegation designator.
+    function test_senderImplementation_boundAtValidation() public {
+        _registerPaymasterAsMaster();
+        uint256 eoaKey = 0xACC0;
+        address eoa = vm.addr(eoaKey);
+        address implA = address(new SimpleAccount(entryPoint)); // stands in for Simple7702Account
+        address implB = address(new SimpleAccount(entryPoint)); // the attacker's own implementation
+
+        vm.signAndAttachDelegation(implA, eoaKey);
+        assertEq(eoa.code.length, 23);
+        bytes32 wh = keccak256(abi.encode(ITornadoInstance(address(tornado)), keccak256(hex""), bytes32(0), keccak256("d"), eoa, address(paymaster), uint256(0.01 ether)));
+        TornadoRelayerPaymasterCore.Terms memory t = _termsFor(0.01 ether, 0, eoa, address(0), 0, wh);
+        t.senderImplementation = implA;
+
+        PackedUserOperation memory op;
+        op.sender = eoa;
+        op.paymasterAndData = _encode(t, new bytes(65));
+        bytes32 h = paymaster.getHash(op, t);
+        (uint8 v, bytes32 r, bytes32 s_) = vm.sign(relayerKey, MessageHashUtils.toEthSignedMessageHash(h));
+        op.paymasterAndData = _encode(t, abi.encodePacked(r, s_, v));
+
+        // Delegated to A: validation accepts (signature valid).
+        vm.prank(address(entryPoint));
+        (, uint256 validationData) = paymaster.validatePaymasterUserOp(op, bytes32(0), 0);
+        assertEq(uint160(validationData), 0, "sig ok while delegated to the approved implementation");
+
+        // Same signed op, sender re-delegated to B before submission: refused.
+        vm.signAndAttachDelegation(implB, eoaKey);
+        vm.prank(address(entryPoint));
+        vm.expectRevert(abi.encodeWithSelector(TornadoRelayerPaymasterCore.SenderImplementationMismatch.selector, eoa, implA));
+        paymaster.validatePaymasterUserOp(op, bytes32(0), 0);
+
+        // And the terms cannot be edited to B without breaking the relayer's signature.
+        t.senderImplementation = implB;
+        op.paymasterAndData = _encode(t, abi.encodePacked(r, s_, v));
+        vm.prank(address(entryPoint));
+        (, validationData) = paymaster.validatePaymasterUserOp(op, bytes32(0), 0);
+        assertEq(uint160(validationData), 1, "tampered terms -> sig failed");
     }
 
     /// EIP-7702: an existing relayer's worker EOA delegates to the shared implementation and *is* the
