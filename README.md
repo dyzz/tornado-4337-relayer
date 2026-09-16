@@ -235,21 +235,23 @@ in `client/src/chains.ts`.
 Then we played an existing relayer: an EOA registered as master `existing-relayer.sandbox.eth` with 5000 TORN,
 exactly like a `tornado-relayer` deployment, and ran the new relayer software with a relayer key and
 `REWARD_ACCOUNT` = the master. On boot the software deployed its worker contract
-[`0xAeF52571…7D0A`](https://sepolia.etherscan.io/address/0xAeF5257102B5A5b3Ba80a7fD60eA36653D337D0A)
-([deploy](https://sepolia.etherscan.io/tx/0xfc7210a6fa6aea040c439c40b4810f1ad531a26f57875f791243a9e244764589)),
-staked and funded it, and waited; the master registered it with one
-[`registerWorker`](https://sepolia.etherscan.io/tx/0x2c06aab2127662e4fe7709b7de9cfcb5b8ceea3b270c9d1b9885a2d9d1b8e38c)
-and the service came up. From a Kohaku CLI wallet: `kohaku shield` 0.1 ETH, then one `kohaku unshield` with
-an Aave tail call. That withdrawal is a single transaction:
+[`0x12319951…488D`](https://sepolia.etherscan.io/address/0x12319951c1E1A8de07aa7363BECA8d20Bb54488D), staked
+and funded it, and waited; the master registered it with one
+[`registerWorker`](https://sepolia.etherscan.io/tx/0x5c123f803ae324b78a467ee3993f24da60f0b74121c7e85da8161e5d6cf177e3)
+and the service came up. Then, through the Kohaku SDK: shield 0.1 ETH, then one unshield with an Aave tail
+call. That withdrawal is a single transaction:
 
+[`0x5b488530…06f9`](https://sepolia.etherscan.io/tx/0x5b4885302db74fe3b9e01615a4bc56169a03dfb1a39e8271340f1b644e6206f9)
+— EntryPoint → worker contract `relayWithdraw` (only with the arguments the relayer signed, and only because
+the sender ran the implementation the relayer signed for) → `TornadoRouter` → `RelayerRegistry.burn`
+(0.1137 TORN from the master's stake) → pool → wrap → Aave. Fee bound in the proof 0.002348 ETH, paid to the
+master; actual gas 0.000867 ETH, paid from the worker's EntryPoint deposit, so the master keeps 0.001481 ETH;
+0.097652 aWETH (exactly denomination − fee) landed on the recipient. Earlier runs on the previous worker
+contract, before the sponsorship terms gained the bound implementation, are
 [`0x30fca6f5…d059`](https://sepolia.etherscan.io/tx/0x30fca6f5e1a6b8a05ea0b1b3099e05c3add5055238e8d425b09d43f5a47ed059)
-— EntryPoint → worker contract `relayWithdraw` (only with the arguments the relayer signed) → `TornadoRouter`
-→ `RelayerRegistry.burn` (0.1137 TORN from the master's stake) → pool → wrap → Aave. Fee bound in the proof
-0.002212 ETH, paid to the master; actual gas 0.000787 ETH, paid from the worker's EntryPoint deposit;
-0.097788 aWETH landed in the wallet. A plain `kohaku unshield` without tail calls goes the same way, the
-sender forwarding the note to the wallet's fresh address:
+(the same flow from the Kohaku CLI), a plain unshield without tail calls
 [`0xd4e04a7e…26c6`](https://sepolia.etherscan.io/tx/0xd4e04a7e88f5e3bf96bebabf4a24c431c474d1f8a1f6218b55a5e936743026c6)
-(0.098270 ETH received, 0.1137 TORN burned). An earlier run through the experimental 7702 variant is
+and the experimental 7702 variant
 [`0x0411a50f…e7df`](https://sepolia.etherscan.io/tx/0x0411a50f9b54e642382c28c1b13df74ca763583f33dc566af1687e80e181e7df).
 
 ## Repository
@@ -442,10 +444,10 @@ vitest 套件（anvil + alto bundler + 进程内 relayer）覆盖 Foundry 覆盖
 
 DAO 自己的 Sepolia registry 没有 router、没有启用的池子、费用为 0，所以我们部署了一套 relayer 栈的沙盒副本（`contracts/src/dao-sandbox`：ABI 一致，governance 是我们，TORN 是我们 mint 的测试币，价格由 governance 设定），按 0.30 % 启用了 ETH 0.1 / ETH 1 / DAI 100 三个池。router [`0xF2DafFd7…a04D`](https://sepolia.etherscan.io/address/0xF2DafFd789ec02211a8f1be1034165cFf759a04D)，registry [`0x30318086…a58e`](https://sepolia.etherscan.io/address/0x30318086d99E3cbf3D7378Fbd55BcF3EBDC1a58e)，其余地址见 `client/src/chains.ts`。
 
-然后我们扮演一个现有 relayer：一个 EOA 注册为 master `existing-relayer.sandbox.eth`，质押 5000 TORN——和一套 `tornado-relayer` 部署完全一样；用一个 relayer key 启动新软件，`REWARD_ACCOUNT` 填 master。软件启动时自己部署了 worker 合约 [`0xAeF52571…7D0A`](https://sepolia.etherscan.io/address/0xAeF5257102B5A5b3Ba80a7fD60eA36653D337D0A)（[部署](https://sepolia.etherscan.io/tx/0xfc7210a6fa6aea040c439c40b4810f1ad531a26f57875f791243a9e244764589)），质押、入金后等待；master 用一笔 [`registerWorker`](https://sepolia.etherscan.io/tx/0x2c06aab2127662e4fe7709b7de9cfcb5b8ceea3b270c9d1b9885a2d9d1b8e38c) 登记它，服务随即上线。再用 Kohaku CLI 钱包 `kohaku shield` 0.1 ETH，`kohaku unshield` 一次并带上存 Aave 的尾调用。这笔提现是一笔交易：
+然后我们扮演一个现有 relayer：一个 EOA 注册为 master `existing-relayer.sandbox.eth`，质押 5000 TORN——和一套 `tornado-relayer` 部署完全一样；用一个 relayer key 启动新软件，`REWARD_ACCOUNT` 填 master。软件启动时自己部署了 worker 合约 [`0x12319951…488D`](https://sepolia.etherscan.io/address/0x12319951c1E1A8de07aa7363BECA8d20Bb54488D)，质押、入金后等待；master 用一笔 [`registerWorker`](https://sepolia.etherscan.io/tx/0x5c123f803ae324b78a467ee3993f24da60f0b74121c7e85da8161e5d6cf177e3) 登记它，服务随即上线。再通过 Kohaku SDK：shield 0.1 ETH，然后一次 unshield 并带上存 Aave 的尾调用。这笔提现是一笔交易：
 
-[`0x30fca6f5…d059`](https://sepolia.etherscan.io/tx/0x30fca6f5e1a6b8a05ea0b1b3099e05c3add5055238e8d425b09d43f5a47ed059)
-——EntryPoint → worker 合约 `relayWithdraw`（只接受 relayer 签过的那组参数）→ `TornadoRouter` → `RelayerRegistry.burn`（从 master 的质押里烧 0.1137 TORN）→ 池子 → wrap → 存 Aave。证明里绑定的 fee 0.002212 ETH 付给 master；实际 gas 0.000787 ETH 从 worker 的 EntryPoint 押金里出；钱包到账 0.097788 aWETH。不带尾调用的普通 `kohaku unshield` 走同一条路，由 sender 把 note 转给钱包的新地址：[`0xd4e04a7e…26c6`](https://sepolia.etherscan.io/tx/0xd4e04a7e88f5e3bf96bebabf4a24c431c474d1f8a1f6218b55a5e936743026c6)（收到 0.098270 ETH，烧 0.1137 TORN）。更早一笔走实验性 7702 变体的记录：[`0x0411a50f…e7df`](https://sepolia.etherscan.io/tx/0x0411a50f9b54e642382c28c1b13df74ca763583f33dc566af1687e80e181e7df)。
+[`0x5b488530…06f9`](https://sepolia.etherscan.io/tx/0x5b4885302db74fe3b9e01615a4bc56169a03dfb1a39e8271340f1b644e6206f9)
+——EntryPoint → worker 合约 `relayWithdraw`（只接受 relayer 签过的那组参数，而且只在 sender 运行的正是 relayer 签名时绑定的那个实现时才放行）→ `TornadoRouter` → `RelayerRegistry.burn`（从 master 质押里烧 0.1137 TORN）→ 池子 → wrap → Aave。证明里绑定的 fee 是 0.002348 ETH，进 master 口袋；实际 gas 0.000867 ETH 从 worker 的 EntryPoint 存款里出，master 净得 0.001481 ETH；收款地址拿到 0.097652 aWETH（正好是面额减 fee）。在 sponsorship 条款加入绑定实现之前、跑在上一个 worker 合约上的几笔分别是 [`0x30fca6f5…d059`](https://sepolia.etherscan.io/tx/0x30fca6f5e1a6b8a05ea0b1b3099e05c3add5055238e8d425b09d43f5a47ed059)（同样的流程，从 Kohaku CLI 发起）、不带尾调用的普通 unshield [`0xd4e04a7e…26c6`](https://sepolia.etherscan.io/tx/0xd4e04a7e88f5e3bf96bebabf4a24c431c474d1f8a1f6218b55a5e936743026c6)，以及实验性的 7702 变体 [`0x0411a50f…e7df`](https://sepolia.etherscan.io/tx/0x0411a50f9b54e642382c28c1b13df74ca763583f33dc566af1687e80e181e7df)。
 
 ## 目录
 
