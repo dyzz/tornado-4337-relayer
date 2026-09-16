@@ -63,13 +63,14 @@ export interface SponsoredWithdrawParams {
 }
 
 /**
- * A bundler transport that sends the ERC-4337 request in its canonical shape:
- *  - viem formats the EIP-7702 authorization's `yParity` as a zero-padded byte (`0x00`/`0x01`); bundlers
- *    that hand the tuple straight to the node (eth-infinitism) then trip geth's strict QUANTITY parsing
- *    ("hex number with leading zero digits"). Quantities go out minimal.
+ * A bundler transport that sends the ERC-4337 request in its canonical shape. Both quirks below are
+ * accepted by alto and by anvil, and rejected by stricter stacks, so the client normalises them:
+ *  - viem formats the EIP-7702 authorization's `yParity` as a zero-padded byte (`0x00`/`0x01`); a bundler
+ *    that hands the tuple straight to the node trips geth's strict QUANTITY parsing ("hex number with
+ *    leading zero digits"). Quantities go out minimal.
  *  - viem sends `factory: "0x7702", factoryData: "0x"` for a not-yet-delegated sender; an empty
- *    factoryData is omitted (the reference bundler reads any present factoryData as an
- *    `initEip7702Sender` call and then mis-indexes the validation frames of the trace).
+ *    factoryData is omitted, because a bundler may read any present factoryData as an
+ *    `initEip7702Sender` call and then mis-index the validation frames of its trace.
  */
 function strictHexTransport(url: string) {
   const quantity = (v: unknown) => (typeof v === 'string' && /^0x[0-9a-fA-F]+$/.test(v) ? toHex(BigInt(v)) : v);

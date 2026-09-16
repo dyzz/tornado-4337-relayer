@@ -148,11 +148,7 @@ The PoC currently demonstrates:
   untouched, a really registered relayer as master, the worker contract deployed by the relayer software,
   116 TORN burned from the master's stake per withdrawal;
 - strict ERC-7562 mempool rules: the reference bundler's own tracer and rule engine accept the validation
-  phase (and reject it when the paymaster is unstaked);
-- a full strict-bundler acceptance run: the eth-infinitism reference bundler in safe mode (every operation
-  traced and checked against the mempool rules before it is accepted) takes the operation the relayer and SDK
-  produce through `eth_sendUserOperation`, bundles it, includes it and reports the receipt — on a throwaway
-  geth chain carrying the canonical EntryPoint v0.8 and Simple7702Account and the sandbox DAO.
+  phase (and reject it when the paymaster is unstaked).
 
 Review findings addressed in the current code:
 
@@ -167,13 +163,14 @@ Review findings addressed in the current code:
   implementation the sender will run (the operation's own authorization, else its current delegation), and the
   paymaster re-checks the sender's delegation designator on-chain during validation. Swapping the authorization
   to another implementation after the signature is refused (`SenderImplementationMismatch`), so the approved
-  withdrawal cannot be executed by code the relayer never saw. Tested adversarially on a mainnet fork and end
-  to end through the strict bundler.
+  withdrawal cannot be executed by code the relayer never saw. Tested adversarially on the mainnet fork: after
+  the sponsorship is signed, re-delegating the sender to another byte-identical account implementation makes
+  validation reject the operation, so nothing is burned and the note stays unspent.
 - **EntryPoint nonce and EOA nonce are separate.** The SDK reads `EntryPoint.getNonce` for the operation and
   the sender's transaction count for the EIP-7702 authorization, and attaches no authorization at all when the
   sender already delegates to Simple7702Account — the two counters diverge as soon as either happens.
 - **ERC-7562.** The paymaster reads its own storage during validation, so it is staked (0.1 ETH by the setup;
-  1 ETH under a strict bundler's default entity minimum).
+  raise `PAYMASTER_STAKE_WEI` to whatever entity minimum the bundler you use enforces, typically 1 ETH).
 - **Hardening.** Live sponsorships can be persisted (`SPONSORSHIP_STORE`), sponsorship can be limited to
   known account implementations (`ALLOWED_SENDER_IMPLEMENTATIONS`), every on-chain setup action is logged and
   can be disabled (`AUTO_SETUP=false`). A multi-instance relayer still needs a shared sponsorship store.
@@ -195,8 +192,6 @@ pnpm --filter @tornado-4337/relayer test                         # relayer, 14 t
 # strict ERC-7562 (bundler mempool rules) with the reference bundler's tracer + rule engine, no deployment needed
 MAINNET_RPC_URL=… AA_BUNDLER_DIR=…/eth-infinitism-bundler pnpm --filter @tornado-4337/client exec tsx scripts/erc7562-check.ts
 
-# strict bundler acceptance: the reference bundler in safe mode, on a geth chain (needs geth >= 1.15 on PATH)
-AA_BUNDLER_DIR=…/eth-infinitism-bundler pnpm --filter @tornado-4337/client exec vitest run e2e/strict-bundler.test.ts
 
 # the off-chain stack end to end (relayer service, alto bundler, Kohaku SDK) on forks
 MAINNET_RPC_URL=… pnpm --filter @tornado-4337/client e2e          # ~1–2 min per suite from the committed fork cache
@@ -217,19 +212,6 @@ archive node, with the worker contract, its storage, its EntryPoint stake and th
 authorization supplied as state overrides. `--unstaked` is the negative control and has to be rejected for the
 expected reason (an unstaked paymaster touching its own storage, STO-031). The bundler checkout is pinned to
 one commit (`client/src/aa-bundler.ts`), so "passes the reference rules" always means one known rule set.
-
-`e2e/strict-bundler.test.ts` is the end-to-end version of the same claim: a throwaway `geth --dev` chain with a
-Prague genesis, on which the canonical EntryPoint v0.8 and Simple7702Account are recreated at their mainnet
-addresses by replaying their deployment calldata through the deterministic deployment proxy, a fresh Tornado
-pool is deployed, the sandbox DAO is wired up, a master relayer registers and the relayer software deploys,
-stakes and registers its worker contract — all as ordinary transactions. The reference bundler then runs in
-safe mode (no `--unsafe`: every operation is traced with geth's native `erc7562Tracer` and checked against the
-mempool rules before entering the mempool) and the run asserts, in order: the same relayer-signed operation with
-only its EIP-7702 authorization swapped to another byte-identical Simple7702Account deployment is rejected with
-`SenderImplementationMismatch`; the original is accepted, bundled, included and reported through
-`eth_getUserOperationReceipt`; the note is spent, the recipient paid and the master's TORN stake burned through
-the router. geth is used because both strict validators are written against it; alto's safe mode can be added
-with `STRICT_BUNDLERS=reference,alto-safe` once it decodes the EntryPoint v0.8 `DelegateAndRevert` wrapper.
 
 Forks are pinned to a fixed block (block 25 981 000 for mainnet; `E2E_FORK_BLOCK=latest` to override) and
 the RPC cache for that block ships in `client/e2e/fork-cache/` (shared by Foundry and anvil), so a fresh clone
@@ -414,16 +396,15 @@ Tornado-specific 的逻辑继续留在 relayer；bundler 只是通用基础设�
 - 基于真实 Tornado DAO router / registry 的 mainnet-fork 测试；
 - worker mode：现有 relayer 收 fee，同时从它的 stake 中扣 TORN；
 - 主网 fork 上的验收跑：主网真实的 ETH 100 池、DAO 现有的 router / registry / FeeManager 一个字不动、一个真实已注册的 relayer 当 master、relayer 软件自己部署的 worker 合约，每笔从 master 质押里烧 116 TORN；
-- 严格 ERC-7562 mempool 规则：参考 bundler 自己的 tracer 和规则引擎接受验证阶段（paymaster 未质押时则拒绝）；
-- 完整的严格 bundler 验收：eth-infinitism 参考 bundler 以 safe mode 运行（每个 operation 先 trace、按 mempool 规则检查再接收），把 relayer 和 SDK 生成的那笔 operation 走 `eth_sendUserOperation` 收下、打包、上链并返回 receipt——跑在一条临时 geth 链上，链上有主网地址的 EntryPoint v0.8、Simple7702Account 和沙盒 DAO。
+- 严格 ERC-7562 mempool 规则：参考 bundler 自己的 tracer 和规则引擎接受验证阶段（paymaster 未质押时则拒绝）。
 
 评审提出的问题已在当前代码里处理：
 
 - **sponsorship 绑定到具体那笔提现。** relayer 签的是它批准的那一次 `relayWithdraw` 的哈希；验证阶段记进 transient storage，`relayWithdraw` 只对完全相同的参数放行。执行语义奇怪的 sender 账户、note 持有人、第三方都不能让 paymaster 转发（并烧质押）别的东西。
 - **每个 operation 一张 note。** 同一操作里多余的 Tornado 提现会被拒绝，所以每一笔被转发的 note 都经过 router、按经典 relayer 的方式烧一次 TORN；Kohaku 补丁改为每张 note 一个 operation。
-- **sponsorship 绑定执行它的账户实现。** relayer 把 sender 将要运行的 EIP-7702 implementation（operation 自带的 authorization，没有就用当前 delegation）一起签进条款，paymaster 在验证阶段再链上核对 sender 的 delegation designator。签完之后把 authorization 换成别的 implementation 会被拒（`SenderImplementationMismatch`），已批准的提现不可能由 relayer 没见过的代码执行。主网 fork 上有对抗测试，严格 bundler 端到端也覆盖。
+- **sponsorship 绑定执行它的账户实现。** relayer 把 sender 将要运行的 EIP-7702 implementation（operation 自带的 authorization，没有就用当前 delegation）一起签进条款，paymaster 在验证阶段再链上核对 sender 的 delegation designator。签完之后把 authorization 换成别的 implementation 会被拒（`SenderImplementationMismatch`），已批准的提现不可能由 relayer 没见过的代码执行。主网 fork 上有对抗测试：签完 sponsorship 之后把 sender 重新委托到另一份字节码完全相同的账户实现，验证阶段会拒绝这笔 operation，于是不烧质押、note 也没被花掉。
 - **EntryPoint nonce 与 EOA nonce 分开。** SDK 用 `EntryPoint.getNonce` 取 operation 的 nonce，用 sender 的交易计数取 EIP-7702 authorization 的 nonce；sender 已经委托到 Simple7702Account 时干脆不带 authorization——这两种情况下两个计数就会错开。
-- **ERC-7562。** paymaster 在验证阶段读自身存储，所以要质押（设置步骤质押 0.1 ETH；严格 bundler 默认的实体门槛是 1 ETH）。
+- **ERC-7562。** paymaster 在验证阶段读自身存储，所以要质押（设置步骤质押 0.1 ETH；实际用哪个 bundler 就把 `PAYMASTER_STAKE_WEI` 提到它要求的实体门槛，一般是 1 ETH）。
 - **加固。** 进行中的 sponsorship 可持久化（`SPONSORSHIP_STORE`），可限制只赞助已知的账户实现（`ALLOWED_SENDER_IMPLEMENTATIONS`），所有链上设置动作都有日志且可关闭（`AUTO_SETUP=false`）。多实例 relayer 仍需共享的 sponsorship 存储。
 
 仍然是实验性实现，未经审计；上生产前需要审计。
@@ -443,8 +424,6 @@ pnpm --filter @tornado-4337/relayer test                         # relayer，14 
 # 严格 ERC-7562（bundler mempool 规则）：参考 bundler 的 tracer + 规则引擎，不用部署
 MAINNET_RPC_URL=… AA_BUNDLER_DIR=…/eth-infinitism-bundler pnpm --filter @tornado-4337/client exec tsx scripts/erc7562-check.ts
 
-# 严格 bundler 验收：参考 bundler 的 safe mode，跑在 geth 链上（需要 PATH 上有 geth >= 1.15）
-AA_BUNDLER_DIR=…/eth-infinitism-bundler pnpm --filter @tornado-4337/client exec vitest run e2e/strict-bundler.test.ts
 
 # 链下栈端到端（relayer 服务、alto bundler、Kohaku SDK），跑在 fork 上
 MAINNET_RPC_URL=… pnpm --filter @tornado-4337/client e2e          # 有提交的 fork 缓存，每套约 1–2 分钟
@@ -454,8 +433,6 @@ pnpm --filter @tornado-4337/kohaku-integration setup && pnpm --filter @tornado-4
 主线是 Foundry 验收测试（`contracts/test/fork/MainnetAcceptance.t.sol`）：主网真实的 ETH 100 池及其完整存款树（证明由 client 的 prover 经 ffi 生成，叶子来自提交的 fixture）、DAO 现有的 `TornadoRouter` / `RelayerRegistry` / FeeManager、主网地址上的真实 EntryPoint v0.8 和 Simple7702Account、一个真实已注册的 relayer master（solid-relayer.eth）、按软件的方式从 relayer key 部署的 worker 合约——不碰任何 governance 持有的状态，唯一的 `vm.prank` 是 master 登记自己的 worker。它还用 state-diff 记录器断言验证阶段只碰 paymaster 自己的存储。
 
 `scripts/erc7562-check.ts` 把 eth-infinitism 参考 bundler 自己的 `bundlerCollectorTracer` 和 `tracerResultParser`（它真正的 mempool 规则引擎）跑在归档节点的 `debug_traceCall(handleOps)` 上，worker 合约代码、存储、EntryPoint 质押和 sender 的 EIP-7702 授权都通过 state override 提供。`--unstaked` 是反例，而且必须是按预期的那条理由被拒（未质押的 paymaster 读自身存储，STO-031）。参考 bundler 的 checkout 固定在一个 commit（`client/src/aa-bundler.ts`），所以"通过参考规则"永远指同一套规则。
-
-`e2e/strict-bundler.test.ts` 是同一件事的端到端版本：起一条临时 `geth --dev` 链（Prague genesis），把主网上 EntryPoint v0.8 和 Simple7702Account 的部署 calldata 通过确定性部署代理原样重放，于是它们落在主网同样的地址上；再部署一个全新的 Tornado 池、接好沙盒 DAO、注册一个 master relayer，由 relayer 软件自己部署、质押并注册 worker 合约——全都是普通交易。然后参考 bundler 以 safe mode 运行（不带 `--unsafe`：每个 operation 都用 geth 原生 `erc7562Tracer` trace 并按 mempool 规则检查后才进 mempool），测试依次断言：同一笔 relayer 已签名的 operation，只把 EIP-7702 authorization 换成另一份字节完全相同的 Simple7702Account 部署，会以 `SenderImplementationMismatch` 被拒；原来那笔被接收、打包、上链，并能通过 `eth_getUserOperationReceipt` 查到；note 被花掉、收款人拿到钱、master 的 TORN 质押经 router 被烧。之所以用 geth，是因为两个严格校验器都是照着它写的；等 alto 能解 EntryPoint v0.8 的 `DelegateAndRevert` 包装之后，用 `STRICT_BUNDLERS=reference,alto-safe` 就能把它也加进来。
 
 fork 固定在一个区块高度（主网 25 981 000；`E2E_FORK_BLOCK=latest` 可覆盖），该高度的 RPC 缓存随仓库提交在 `client/e2e/fork-cache/`（Foundry 和 anvil 共用），所以新克隆下来不需要归档节点也能全部跑。改了高度后先热跑一遍，再 `pnpm --filter @tornado-4337/client fork-cache:save`。
 
