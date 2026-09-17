@@ -17,8 +17,10 @@
  *   STATE_FILE       where the SDK's sync state is kept (default ../.cache/tornado-state.json). The
  *                    first run seeds from the snapshot below; later runs resume from here.
  *   SAGA=off         skip Kohaku's snapshot CDN and scan the pool from the chain instead (slow)
+ *   OP_OUT           write the sponsored UserOperation to this file after the relayer signed it
  *   ZAP              optional SwapAndSupplyZap address: wrap + supply to Aave instead of a plain forward
  */
+import { writeFileSync } from 'node:fs';
 import { createPublicClient, encodeFunctionData, getAddress, http, parseEther, type Address, type Hex } from 'viem';
 import { mainnet, sepolia } from 'viem/chains';
 
@@ -117,6 +119,11 @@ const op = await protocol.prepareUnshield({ asset: nativeAsset, amount: parseEth
 const w = op.withdrawals[0]!;
 if (w.mode !== 'paymaster') throw new Error('expected a paymaster withdrawal');
 console.log(`userOp prepared: sender=${w.userOperation.sender} fee=${BigInt(w.proof.args[4])} wei`);
+// OP_OUT=path keeps the sponsored operation (public once broadcast), e.g. to check that the relayer still
+// refuses a second sponsorship for the same note after a restart.
+if (process.env.OP_OUT) {
+  writeFileSync(process.env.OP_OUT, JSON.stringify(w.userOperation, (_k, v) => (typeof v === 'bigint' ? `0x${v.toString(16)}` : v), 2));
+}
 
 const [result] = await broadcaster.broadcast(op);
 console.log(`userOp hash: ${result!.id}`);
