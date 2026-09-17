@@ -1,538 +1,342 @@
 # tornado-4337-relayer
 
-**A thin Tornado Cash relayer for Kohaku / ERC-4337 atomic withdrawals.**
+**A thin Tornado Cash relayer and paymaster integration for Kohaku — keep relayers, without turning them into bundlers.**
 
 English | [简体中文](#简体中文)
 
-> Working PoC on Sepolia. Experimental and unaudited.
+> Experimental, unaudited integration. Acceptance is limited to **mainnet forks and live Sepolia**. This is not a mainnet production release.
 
-The goal is simple: let existing Tornado relayers participate in Kohaku's atomic withdrawal flow **without becoming bundlers and without leaving the existing Tornado relayer economy**.
+Existing Tornado relayers can add ERC-4337 sponsorship for atomic withdrawals while retaining their master identity, fee recipient and DAO stake. The existing pools and proving circuit stay unchanged. This is an **optional service alongside the classic relayer**, not a drop-in replacement for its HTTP API or a requirement to migrate.
 
-## For Tornado relayers
-
-The new relayer is intentionally very close to the classic Tornado relayer.
-
-Classic relayer:
+## What changes for a relayer?
 
 ```text
-receive withdrawal
-→ check proof / root / nullifier / fee
-→ sign and send transaction
+Classic:  check withdrawal              → sign and broadcast a transaction
+This:     check UserOperation + simulate → sign sponsorship; wallet submits to a bundler
 ```
 
-This relayer:
+The relayer still quotes fees, checks the withdrawal and decides whether to serve it. It does not run a bundler or manage a UserOperation mempool. The **off-chain relayer signs**; its **on-chain paymaster verifies the signature and sponsors gas**. Deployment, registration and funding are separate setup actions.
+
+## Keep the existing DAO and relayer economy
+
+The supported path is a **standalone `TornadoRelayerPaymaster` contract registered as a worker of an existing master**. The master registers that new contract with `RelayerRegistry.registerWorker(master, paymaster)`, just as it adds a worker today. Its existing ENS identity and TORN stake remain in place; this integration does not require changing the DAO's governance contracts.
+
+The withdrawal proof names the **master** as `relayer` and the UserOperation's **sender** as `recipient`. In worker mode, the quoted withdrawal fee goes to the master as a fixed fee; the paymaster does not refund unused gas to the user. Each authorised `relayWithdraw` goes through `TornadoRouter` and the existing Registry/FeeManager charging rules.
+
+| Funds | Purpose |
+| --- | --- |
+| Master's TORN stake in RelayerRegistry | Charged under the DAO's per-instance fee rules. |
+| Worker's ETH stake in EntryPoint | Separate bundler-validation stake; not the gas balance. |
+| Worker's ETH deposit in EntryPoint | Pays sponsored gas. The operator replenishes it manually. |
+
+Execution stays in one UserOperation:
 
 ```text
-receive UserOperation
-→ check proof / root / nullifier / fee
-→ sign sponsorship
+Wallet → relayer: quote, build proof, request sponsorship
+Wallet → bundler → EntryPoint: submit the signed UserOperation
+EntryPoint validates sender and paymaster, then executes the sender's batch:
+  1. worker.relayWithdraw → TornadoRouter / registry charging → Tornado pool
+  2. sender's tail calls, such as wrap / swap → Aave
 ```
 
-The main difference is simply **what gets signed**.
+Each sponsorship authorises one exact withdrawal. The SDK uses one UserOperation per note: the withdrawal and its tail calls are atomic **within that operation**, not across a multi-note withdrawal. Checks cover top-level account calls, not everything a tail-call contract may do internally.
 
-The relayer no longer has to submit the transaction itself. The user's wallet sends the sponsored UserOperation to an ERC-4337 bundler.
+## Run a Sepolia test relayer
 
-So the relayer still does a small, Tornado-specific job:
-
-- quote the fee;
-- validate the withdrawal;
-- decide whether to sponsor it;
-- sign;
-- keep its existing fee policy, pricing logic and privacy setup.
-
-No bundler needs to be operated by the relayer.
-
-## Keep the existing relayer economy
-
-The paymaster is a small contract registered as a **worker of the existing relayer** — the same registry
-action as adding a worker key today. The relayer software deploys that contract from the relayer's own key on
-first start, stakes and funds it on the EntryPoint, and then waits for the master to register it.
-
-In this mode:
-
-- the proof still names the existing relayer (its master address);
-- the withdrawal fee still goes to the existing relayer;
-- withdrawals still go through `TornadoRouter`, one note per operation;
-- `RelayerRegistry` still charges TORN from the existing relayer's stake, once per relayed withdrawal;
-- the paymaster only signs sponsorships and pays gas from its EntryPoint deposit.
-
-So the existing relayer remains part of the atomic withdrawal path instead of being bypassed, and switching
-means replacing the relayer software — same worker key, same `REWARD_ACCOUNT`, same fee setting.
-
-Two variants exist but are not the recommended path: a standalone contract registered as a new relayer
-*master* (it then refunds users the unused part of the fee), and an experimental EIP-7702 mode in which the
-worker EOA itself delegates to a shared implementation (accepted by Pimlico's public bundler, not guaranteed
-under strict ERC-7562 mempool rules).
-
-### Running it as an existing relayer
+Requires **Node.js 22+** and **pnpm**. Contract development and fork tests additionally require **Foundry with Prague support** and Tornado proving artifacts.
 
 ```bash
-cd relayer && cp .env.example .env
-# PRIVATE_KEY      a relayer key (your worker key works)             REWARD_ACCOUNT  your master address
-# RELAYER_FEE      0.3 (percent, as in tornado-relayer)              HTTP_RPC_URL / NET_ID as before
-# PAYMASTER_DEPOSIT_WEI   gas float to keep on the EntryPoint (the key needs ETH for it, as workers need ETH for gas today)
-pnpm start
+git clone --recurse-submodules https://github.com/dyzz/tornado-4337-relayer.git
+cd tornado-4337-relayer
+pnpm install
+cp relayer/.env.example relayer/.env
 ```
 
-On first start the service deploys the worker paymaster contract from that key, stakes 0.1 ETH and funds the
-deposit, prints the address, and waits. You register it from your master key exactly as you would a new
-worker: `RelayerRegistry.registerWorker(master, paymaster)`. From then on the service only signs.
-`GET /status` shows the mode, the master, the stake left and the TORN burned per pool. Wallets use the
-paymaster address and the service URL as the ERC-7677 endpoint.
+**The template defaults to mainnet. Edit it before starting.** For a Sepolia 0.1 ETH test, replace the network, credentials and pool settings with:
 
-## For Kohaku
-
-Kohaku only needs a relayer-signed sponsorship path:
-
-```text
-Kohaku / wallet
-    ↓
-ask Tornado relayer for quote
-    ↓
-build proof + UserOperation
-    ↓
-ask relayer to sign sponsorship
-    ↓
-send UserOperation to bundler
+```dotenv
+CHAIN_ID=11155111
+RPC_URL=https://<your-sepolia-rpc>
+BUNDLER_URL=https://public.pimlico.io/v2/11155111/rpc
+RELAYER_PRIVATE_KEY=0x<your-test-worker-private-key>
+REWARD_ACCOUNT=0x<your-registered-sepolia-sandbox-master>
+TORNADO_INSTANCES=0x8C4A04d872a6C1BE37964A21ba3a138525dFF50b
+PRICE_SOURCE=none
+PAYMASTER_MODE=standalone
+SPONSORSHIP_STORE=./sponsorships.json
+PAYMASTER_DEPOSIT_WEI=50000000000000000
+MIN_DEPOSIT_WEI=10000000000000000
 ```
 
-This allows atomic flows such as:
+Use a dedicated test key funded with Sepolia ETH. The master must already be registered in the **project's Sepolia sandbox**; mainnet registration does not carry over. The sandbox addresses are in [`client/src/chains.ts`](client/src/chains.ts). Do not use someone else's master or the demonstration worker as your deployment.
 
-```text
-Tornado withdraw
-→ swap
-→ Aave
-```
-
-inside one UserOperation.
-
-The existing Tornado pools and proving circuit stay unchanged.
-
-## Architecture
-
-```text
-Kohaku / wallet
-      ↓
-thin Tornado relayer
-      ↓
-sign sponsorship
-      ↓
-paymaster  (a contract registered as the relayer's worker)
-      ↓
-ERC-4337 bundler
-      ↓
-EntryPoint
-      ↓
-TornadoRouter
-      ↓
-Tornado pool
-      ↓
-atomic tail calls
-```
-
-The Tornado-specific part stays in the relayer. The bundler remains generic infrastructure.
-
-## Current status
-
-The PoC currently demonstrates:
-
-- Kohaku SDK / CLI integration;
-- live Sepolia atomic withdrawal;
-- relayer-signed paymaster sponsorship;
-- atomic `withdraw → wrap/swap → Aave`;
-- `TornadoRouter → RelayerRegistry` integration;
-- TORN stake charging in the Sepolia DAO sandbox;
-- mainnet-fork tests against the real Tornado DAO router / registry;
-- worker mode where an existing relayer receives the fee and its stake is charged;
-- a mainnet acceptance run on a fork: canonical ETH 100 pool, the DAO's live router / registry / FeeManager
-  untouched, a really registered relayer as master, the worker contract deployed by the relayer software,
-  116 TORN burned from the master's stake per withdrawal;
-- strict ERC-7562 mempool rules: the reference bundler's own tracer and rule engine accept the validation
-  phase (and reject it when the paymaster is unstaked).
-
-Review findings addressed in the current code:
-
-- **Sponsorship bound to the exact withdrawal.** The relayer signs the hash of the one `relayWithdraw` it
-  approved; validation records it in transient storage and `relayWithdraw` only runs with those arguments. A
-  sender account with unusual execution semantics, a note owner, or a third party cannot make the paymaster
-  relay (and burn stake for) anything else.
-- **One note per sponsorship.** The one `relayWithdraw` a sponsorship authorises must go through the router
-  and follows the DAO's existing fee rules, exactly as with a classic relayer. Among the operation's own
-  top-level calls a second Tornado withdrawal is refused and nothing but `relayWithdraw` may touch the
-  paymaster; Kohaku's patch issues one operation per note. The check reads top-level calls only: what a
-  tail-call contract does internally is outside what it guarantees. Atomicity holds within each operation,
-  not across the operations of a multi-note withdrawal.
-- **The sponsorship binds the account implementation that executes it.** The relayer signs the EIP-7702
-  implementation the sender will run (the operation's own authorization, else its current delegation), and the
-  paymaster re-checks the sender's delegation designator on-chain during validation. Swapping the authorization
-  to another implementation after the signature is refused (`SenderImplementationMismatch`), so the approved
-  withdrawal cannot be executed by code the relayer never saw. Tested adversarially on the mainnet fork: after
-  the sponsorship is signed, re-delegating the sender to another byte-identical account implementation makes
-  validation reject the operation, so nothing is burned and the note stays unspent.
-- **EntryPoint nonce and EOA nonce are separate.** The SDK reads `EntryPoint.getNonce` for the operation and
-  the sender's transaction count for the EIP-7702 authorization, and attaches no authorization at all when the
-  sender already delegates to Simple7702Account — the two counters diverge as soon as either happens.
-- **Only known account implementations are sponsored.** By default that is the canonical Simple7702Account
-  and nothing else (`ALLOWED_SENDER_IMPLEMENTATIONS` narrows or replaces the list; there is no setting that
-  means "any account"). Binding the implementation fixes *which* code runs the operation but cannot tell
-  whether that code honours the calls the relayer validated: an account whose `execute` ignores its calldata
-  would spend the sponsored gas while performing no withdrawal and paying no fee. The fork tests submit
-  exactly that — valid withdrawal calldata behind a non-executing account — and the relayer refuses before
-  signing.
-- **Every sponsorship is simulated before it is signed, with no way to switch that off.** `BUNDLER_URL` is
-  required and `SIMULATE_WITH_BUNDLER` can no longer disable anything (`true` is tolerated for old files, any
-  other value stops the start-up). A timeout, an HTTP error, a JSON-RPC error, a missing result, or a result
-  lacking any of the five gas fields — both paymaster limits included — refuses the signature; so does an
-  estimate that does not fit the operation's limits, `paymasterPostOpGasLimit` included, so the caller
-  re-quotes rather than the relayer editing a signed operation. This is not a guarantee of payment: ERC-4337 validation
-  simulation does not promise that execution succeeds at inclusion, and an included operation that then
-  reverts is still billed to the paymaster. What bounds the loss is the short signature lifetime, the fee
-  floor and the deposit budget — the fork tests measure exactly that cost on a failed execution.
-- **The deposit is a budget, checked live.** Before each signature the relayer reads its EntryPoint deposit
-  and subtracts the sponsorships already promised and not yet expired, so a burst of concurrent requests
-  cannot each spend the same balance. Below `MIN_DEPOSIT_WEI` it stops signing and keeps answering `/status`;
-  top the deposit up by hand to resume. `MAX_SPONSORSHIP_GAS_WEI` caps any single operation.
-- **A sponsorship is recorded before it is issued, and survives a restart.** The file store
-  (`SPONSORSHIP_STORE`) writes a signed sponsorship — nonce and gas cost as strings — before the signature is
-  returned; if the write fails the signature is dropped and the reservation released, so nothing is left
-  blocking the note. Reservations are never written. The store is opened at start-up, so an unwritable
-  location or an unreadable file stops the service instead of the first request (starting empty would allow
-  a second signature for a live note). Live entries written by an earlier release carry no gas cost: they
-  still deduplicate, and because what they may still cost is unknown — no current setting is a sound
-  stand-in for it — the relayer refuses new sponsorships until they expire, at most one signature lifetime
-  after the upgrade. The fork
-  suite runs a complete withdrawal on the file store, restarts the relayer, and checks that the note is still
-  refused, the budget unchanged, and the next note served.
-- **The registration is read at signing.** Before each signature the registry must still resolve the
-  paymaster to the relayer the proof names; a master that has unregistered its worker stops new sponsorships
-  at once instead of letting `RelayerRegistry.burn` revert inside operations the paymaster pays for.
-- **Start-up refuses an incompatible deployment before it spends anything.** Network, EntryPoint, signing key,
-  router, the worker to master relationship and the paymaster's `paymasterAndData` layout are all read first;
-  a contract from an earlier release (whose terms were 297 bytes rather than 317) is rejected with no stake
-  or deposit sent and no second contract quietly deployed. A future change that keeps the length but alters a
-  field's meaning would need an explicit version in the contract, not a length check.
-- **ERC-7562.** The paymaster reads its own storage during validation, so it is staked (0.1 ETH by the setup;
-  raise `PAYMASTER_STAKE_WEI` to whatever entity minimum the bundler you use enforces, typically 1 ETH).
-- **A failed read is never an answer.** Start-up stops when a registry, fee, ownership or pool-type read
-  fails at the node (only a contract's own revert counts as an on-chain answer — for instance ETH pools
-  having no `token()`), and the worker to master check fails before anything is staked or deposited.
-  `/status` re-reads the deposit, stake, registration and per-pool burn on every call, returns them with the
-  block they were read at, and reports anything it could not read as `null` with the reason under
-  `unavailable` — never the start-up value and never a zero fee.
-- **Hardening.** Every on-chain setup action is logged and can be disabled (`AUTO_SETUP=false`). A
-  multi-instance relayer still needs a shared sponsorship store; the file store is single-process.
-- **Scope.** The supported deployment is the standalone worker contract registered under an existing relayer
-  master. `PAYMASTER_MODE=7702`, where the relayer's own EOA is the paymaster, is experimental and refused at
-  start-up in this release; the contract stays in the tree. This does not affect users' EIP-7702 senders.
-
-Still experimental and unaudited; production use needs an audit.
-
-## Running the tests
-
-Needs pnpm, Foundry and the Tornado proving artifacts from `tornado-cli` (`TORNADO_ARTIFACTS_DIR`).
+With the template's `AUTO_SETUP=true`, startup can deploy the worker contract, set its Router, stake ETH and fund its EntryPoint deposit. It prints the worker address and waits for the master to register it. Reused deployments are checked for compatible layout, EntryPoint, signer and Router before stake/deposit transactions. `AUTO_SETUP=false` disables automatic setup transactions.
 
 ```bash
-pnpm install && (cd contracts && forge install && forge build) && (cd contracts-tornado && forge build)
-(cd contracts && forge test)                                     # paymaster (both variants) + sandbox DAO, 33 tests
-pnpm --filter @tornado-4337/relayer test                         # relayer, 14 tests
-
-# mainnet acceptance: a Foundry fork test against the live DAO contracts (~1 min, pinned block)
-(cd contracts && MAINNET_RPC_URL=… TORNADO_ARTIFACTS_DIR=…/tornado-cli/circuits forge test --match-contract MainnetAcceptance -vv)
-
-# strict ERC-7562 (bundler mempool rules) with the reference bundler's tracer + rule engine, no deployment needed
-MAINNET_RPC_URL=… AA_BUNDLER_DIR=…/eth-infinitism-bundler pnpm --filter @tornado-4337/client exec tsx scripts/erc7562-check.ts
-
-
-# the off-chain stack end to end (relayer service, alto bundler, Kohaku SDK) on forks:
-#   registry-burn        the normal flow in master and worker mode
-#   withdraw-swap-aave   withdraw -> swap -> Aave, and the TS/contract hash equality
-#   relayer-refusals     every request that must be refused *before* a signature exists
-#   relayer-restart      a complete withdrawal on the file store, a restart, and the note still refused
-#   execution-failure    an operation that reverts at inclusion, and the retry after it
-MAINNET_RPC_URL=… pnpm --filter @tornado-4337/client e2e          # ~1–2 min per suite from the committed fork cache
-pnpm --filter @tornado-4337/kohaku-integration setup && pnpm --filter @tornado-4337/kohaku-integration e2e   # real Kohaku SDK, Sepolia fork
+pnpm --filter @tornado-4337/relayer start
+# From the master account, on the same network:
+# RelayerRegistry.registerWorker(masterAddress, newPaymasterAddress)
+# Then, from another terminal:
+curl http://127.0.0.1:8787/status
 ```
 
-The Foundry acceptance test (`contracts/test/fork/MainnetAcceptance.t.sol`) is the main line: the canonical
-ETH 100 pool with its real deposit tree (proof via ffi from the client prover, leaves from the committed
-fixture), the DAO's live `TornadoRouter` / `RelayerRegistry` / FeeManager and the real EntryPoint v0.8 and
-Simple7702Account at their mainnet addresses, a really registered relayer master (solid-relayer.eth), the
-worker contract deployed from the relayer key as the software does — nothing governance-owned touched, the
-only `vm.prank` is the master registering its worker. It also asserts, with the state-diff recorder, that
-validation touches no storage but the paymaster's own.
+`PRIVATE_KEY`, `HTTP_RPC_URL`, `NET_ID` and `RELAYER_FEE` are supported classic-relayer aliases. Prefer one naming scheme: values already exported in the process environment take precedence over `.env`. `RELAYER_FEE=0.3` means **0.3%**, equivalent to `SERVICE_FEE_BPS=30`; the latter takes precedence when both are set.
 
-`scripts/erc7562-check.ts` runs the eth-infinitism reference bundler's `bundlerCollectorTracer` and
-`tracerResultParser` — its actual mempool rule engine — over a `debug_traceCall` of `handleOps` on a live
-archive node, with the worker contract, its storage, its EntryPoint stake and the sender's EIP-7702
-authorization supplied as state overrides. `--unstaked` is the negative control and has to be rejected for the
-expected reason (an unstaked paymaster touching its own storage, STO-031). The bundler checkout is pinned to
-one commit (`client/src/aa-bundler.ts`), so "passes the reference rules" always means one known rule set.
+See [`.env.example`](relayer/.env.example) for all settings. `PAYMASTER_DEPOSIT_WEI` is a **startup funding target**, not continuous auto-refill. `MIN_DEPOSIT_WEI` reserves headroom when accepting new sponsorships; `MAX_SPONSORSHIP_GAS_WEI` optionally caps one operation. ERC-20 pools require a configured price source and pay the withdrawal fee in the pool's token, while sponsored gas is still paid in ETH.
 
-Forks are pinned to a fixed block (block 25 981 000 for mainnet; `E2E_FORK_BLOCK=latest` to override) and
-the RPC cache for that block ships in `client/e2e/fork-cache/` (shared by Foundry and anvil), so a fresh clone
-runs everything without an archive node. After moving the pin, warm the caches once and
-`pnpm --filter @tornado-4337/client fork-cache:save`.
+Keep the paymaster state file and sponsorship store on persistent storage, with stable paths. Run **one signing process per store/key**; the JSON store is not a shared multi-instance backend. Do not delete live sponsorship records to bypass a refusal. Review logging, transport security and access controls before exposing the service publicly.
 
-The vitest suites (anvil + alto bundler + the relayer in-process) cover what Foundry cannot: the relayer
-service's validation, simulation and signing, bundler acceptance, and the Kohaku SDK — ETH pool → swap → Aave;
-DAI pool → Aave with the fee priced by the 1inch oracle; the paymaster as a fresh master, as the worker contract
-the software deploys, and as the experimental 7702 variant.
+## Integrate with Kohaku
 
-## What we did on Sepolia
+This repository supplies patches against pinned Kohaku SDK and CLI revisions; it does not imply the changes are already upstream. Prepare them with:
 
-The DAO's own Sepolia registry has no router, no enabled pools and a zero fee, so we deployed a sandbox copy of
-the relayer stack (`contracts/src/dao-sandbox`: same ABIs, governance = us, test TORN minted by us, TORN price
-set by governance) and enabled the ETH 0.1 / ETH 1 / DAI 100 pools at 0.30 %. Router
-[`0xF2DafFd7…a04D`](https://sepolia.etherscan.io/address/0xF2DafFd789ec02211a8f1be1034165cFf759a04D), registry
-[`0x30318086…a58e`](https://sepolia.etherscan.io/address/0x30318086d99E3cbf3D7378Fbd55BcF3EBDC1a58e); the rest is
-in `client/src/chains.ts`.
+```bash
+pnpm --filter @tornado-4337/kohaku-integration setup
+```
 
-The client host in `kohaku-integration/example` uses Kohaku's own fast-sync path: pre-scraped pool events
-from its snapshot CDN through `externalSyncProvider`, with `minExternalSyncBlocksAmount` set (without that
-value the SDK ignores the provider entirely), and the sync state persisted to a file. A Sepolia sync takes
-about 7 seconds cold and 2 seconds warm, against more than twenty minutes when the pool is scanned from its
-deployment block over a public RPC.
+Configure the worker paymaster, EntryPoint, bundler and relayer URL in the patched SDK:
 
-Then we played an existing relayer: an EOA registered as master `existing-relayer.sandbox.eth` with 5000 TORN,
-exactly like a `tornado-relayer` deployment, and ran the new relayer software with a relayer key and
-`REWARD_ACCOUNT` = the master. On boot the software deployed its worker contract
-[`0x12319951…488D`](https://sepolia.etherscan.io/address/0x12319951c1E1A8de07aa7363BECA8d20Bb54488D), staked
-and funded it, and waited; the master registered it with one
-[`registerWorker`](https://sepolia.etherscan.io/tx/0x5c123f803ae324b78a467ee3993f24da60f0b74121c7e85da8161e5d6cf177e3)
-and the service came up. Then, through the Kohaku SDK: shield 0.1 ETH, then one unshield with an Aave tail
-call. That withdrawal is a single transaction:
+```ts
+const paymasterConfig = {
+  [chainId]: {
+    entryPointAddress: '0x4337084D9E255Ff0702461CF8895CE9E3b5Ff108',
+    paymasterAddress: workerPaymasterAddress,
+    bundlerUrl,
+    poolsAccountsMap: {},
+    relayer: { url: relayerUrl },
+  },
+};
+```
 
-[`0x165edf28…446d`](https://sepolia.etherscan.io/tx/0x165edf282b9cec79e2f6e70354c53c857ddb38a753abb638204552ea8778446d)
-— EntryPoint → worker contract `relayWithdraw` (only with the arguments the relayer signed, and only because
-the sender ran the implementation the relayer signed for) → `TornadoRouter` → `RelayerRegistry.burn`
-(0.1137 TORN from the master's stake) → pool → wrap → Aave. Fee bound in the proof 0.002142 ETH, paid to the
-master; actual gas 0.000842 ETH, paid from the worker's EntryPoint deposit, so the master keeps 0.001300 ETH;
-0.097858 aWETH (exactly denomination − fee) landed on the recipient. The relayer ran with the same settings
-as the fork suites — file-backed sponsorship store, 0.01 ETH deposit reserve — and was restarted while this
-sponsorship was still live: the new process read it back from disk, `/status` budgeted its 0.001674 ETH gas
-ceiling, and replaying the same operation was refused with `note already sponsored`. Earlier runs on the previous worker
-contract, before the sponsorship terms gained the bound implementation, are
-[`0x30fca6f5…d059`](https://sepolia.etherscan.io/tx/0x30fca6f5e1a6b8a05ea0b1b3099e05c3add5055238e8d425b09d43f5a47ed059)
-(the same flow from the Kohaku CLI), a plain unshield without tail calls
-[`0xd4e04a7e…26c6`](https://sepolia.etherscan.io/tx/0xd4e04a7e88f5e3bf96bebabf4a24c431c474d1f8a1f6218b55a5e936743026c6)
-and the experimental 7702 variant
-[`0x0411a50f…e7df`](https://sepolia.etherscan.io/tx/0x0411a50f9b54e642382c28c1b13df74ca763583f33dc566af1687e80e181e7df).
+The wallet obtains a quote, binds `quote.relayer` and `quote.fee` into the proof, estimates gas, obtains sponsorship, signs the final UserOperation and submits it to the bundler. A changed fee requires a new proof; do not alter the signed gas limits or calldata after sponsorship. A stub response is for estimation, **not** an approval.
+
+The [live SDK example](kohaku-integration/example/withdraw-with-relayer.ts) uses `mode: 'paymaster'`, supports optional Aave tail calls and exposes `OP_OUT` for saving the prepared operation. After setting its documented environment variables, run `pnpm --filter @tornado-4337/kohaku-integration example`. It requires an existing shielded note in the host keystore. `MNEMONIC` belongs to the client, not the relayer; its environment is separate from `relayer/.env`.
+
+The [JSON-RPC implementation](relayer/src/rpc.ts) exposes these methods at `POST /`:
+
+| Method | Purpose |
+| --- | --- |
+| `tornado_quote` | Fee and gas quote for an instance; optional tail-call gas or gas overrides. |
+| `pm_getPaymasterStubData` | ERC-7677 estimation fields. |
+| `pm_getPaymasterData` | Validate, simulate and return signed sponsorship. |
+| `tornado_status` | Status, also available at `GET /status`. |
+
+Sponsor methods take `[userOp, entryPoint, chainId, context]`. `GET /health` reports process liveness only; use `/status` to inspect balances, registration, budget and unavailable reads.
+
+## Safety and operating boundaries
+
+**Restricted sponsorship.** The default sender implementation is Simple7702Account v0.8. The relayer enforces a non-empty allowlist, and the paymaster binds both the exact withdrawal and the sender implementation. This release refuses `PAYMASTER_MODE=7702` for the **relayer's own EOA**; that is distinct from the supported **user-side 7702 sender**.
+
+**Checks before issuing.** The service checks the proof, root, nullifier, fee, current worker registration and available gas budget, then requires bundler simulation with all five gas fields. Simulation cannot be disabled. With `SPONSORSHIP_STORE` configured, the signed record is written before the signature is returned; a failed write refuses issuance and releases the reservation. Live legacy records with unknown gas costs pause new sponsorships until they expire, regardless of the current per-operation cap. See [`service.ts`](relayer/src/service.ts) and [`store.ts`](relayer/src/store.ts).
+
+**Atomic does not mean free failure.** If execution reverts, the withdrawal, fee and TORN charge roll back, but the paymaster can still lose gas. Sender nonce/delegation changes need not roll back. Simulation cannot eliminate changes between signing and inclusion, and a successful bundle transaction does not prove its UserOperation succeeded. Short validity and budget limits constrain exposure; they do not guarantee payment or profitability. See the [execution-failure test](client/e2e/execution-failure.test.ts) and [ERC-4337](https://eips.ethereum.org/EIPS/eip-4337).
+
+**Retry and deployment scope.** One live sponsorship per note is retained until expiry, including after a restart. A failed attempt may therefore require waiting before requesting another signature; keep the note and read current nonce/delegation state when rebuilding. Compatibility is scoped to the tested configuration, not every account, bundler or strict mempool. No production-readiness or independent security-audit claim is made.
+
+## Tests and acceptance evidence
+
+### Mainnet fork
+
+The [canonical acceptance test](contracts/test/fork/MainnetAcceptance.t.sol) uses the existing mainnet ETH-100 pool, EntryPoint v0.8, Simple7702Account, DAO Router/Registry/FeeManager and an existing registered master at block **25,981,000**. It simulates the master's worker-registration action without changing governance-owned configuration. Supporting suites also use fixture pools; they are not substitutes for this canonical-pool check.
+
+From the repository root:
+
+```bash
+export MAINNET_RPC_URL='https://<your-mainnet-archive-rpc>'
+export TORNADO_ARTIFACTS_DIR='/absolute/path/to/tornado-cli/circuits'
+(cd contracts && forge install && forge build)
+(cd contracts-tornado && forge build)
+pnpm --filter @tornado-4337/relayer test
+(cd contracts && forge test -vv)
+pnpm --filter @tornado-4337/client e2e
+```
+
+The tests need an RPC that can serve the pinned historical state. Committed fork/leaf caches reduce upstream work, but are not a guarantee of offline execution. Without `MAINNET_RPC_URL`, the Foundry mainnet acceptance tests are skipped. The fork suites cover normal withdrawals, fees, rejected sponsorships, file-backed restart/replay checks and execution failure/retry.
+
+### Live Sepolia
+
+Sepolia uses a **project-controlled DAO sandbox**, with test TORN and test fee settings—not the mainnet DAO. It checks real deployment and UserOperation submission; mainnet-fork tests provide the evidence for integration with existing DAO contracts.
+
+[Latest recorded acceptance](https://github.com/dyzz/tornado-4337-relayer/commit/073e9b42c37b7d8d8acd5ea3a9737bcae6893eed): **2026-09-17**, implementation [`2690d5c`](https://github.com/dyzz/tornado-4337-relayer/commit/2690d5c11d10dc011927c2c36a347b983014c174). The report records **37/37 Foundry tests**, including four mainnet acceptance cases, and **24/24 Vitest fork cases** across six files.
+
+[Sepolia withdrawal `0x165edf28…446d`](https://sepolia.etherscan.io/tx/0x165edf282b9cec79e2f6e70354c53c857ddb38a753abb638204552ea8778446d): **0.1 ETH → registered worker → Router → wrap → Aave**.
+
+| Reported result | Amount, rounded |
+| --- | ---: |
+| Withdrawal fee paid to master | 0.002142 ETH |
+| Gas charged to worker's EntryPoint deposit | 0.000842 ETH |
+| Sandbox TORN charged from master's stake | 0.1137 test TORN |
+| aWETH delivered to recipient | 0.097858 aWETH |
+
+The report also records a relayer restart while sponsorship was live: the file-backed record and its approximately **0.001674 ETH** gas ceiling were restored, and replay was refused with `note already sponsored`. Restart and replay refusal are **off-chain observations in that report**, not facts proven by the transaction alone. These are dated test results, not fixed fees, pricing guidance or an assurance that later revisions pass.
+
+#### On-chain record
+
+Addresses of the demonstration deployment, for checking the transactions below — not for use as your own deployment:
+
+| Role | Sepolia address |
+| --- | --- |
+| Worker paymaster, deployed by the relayer software | [`0x12319951…488D`](https://sepolia.etherscan.io/address/0x12319951c1E1A8de07aa7363BECA8d20Bb54488D) |
+| Relayer signing key, sender of the worker's setup transactions | [`0x168EB79a…F91E`](https://sepolia.etherscan.io/address/0x168EB79a6707CC95935B7773d07a899954A6F91E) |
+| Master: sandbox registration, test TORN stake, fee recipient | [`0x4DC4F08E…c68B`](https://sepolia.etherscan.io/address/0x4DC4F08E87935135FDa56D11E1e303117B26c68B) |
+| Sandbox `TornadoRouter` / `RelayerRegistry` | [`0xF2DafFd7…a04D`](https://sepolia.etherscan.io/address/0xF2DafFd789ec02211a8f1be1034165cFf759a04D) / [`0x30318086…a58e`](https://sepolia.etherscan.io/address/0x30318086d99E3cbf3D7378Fbd55BcF3EBDC1a58e) |
+| ETH 0.1 pool | [`0x8C4A04d8…F50b`](https://sepolia.etherscan.io/address/0x8C4A04d872a6C1BE37964A21ba3a138525dFF50b) |
+| Swap/Aave helper called by the tail call | [`0x2B247C8e…Ca33`](https://sepolia.etherscan.io/address/0x2B247C8ee4556B35d510C0BdBD75194c11C4Ca33) |
+
+| Block | Transaction | Step |
+| ---: | --- | --- |
+| 11716691 | [`0x29991c6b…5010`](https://sepolia.etherscan.io/tx/0x29991c6b803537ac6440c6534ce76734507a4eeef1c7a3d3ead8af11815b5010) | Relayer software deploys the worker paymaster (`AUTO_SETUP`). |
+| 11716693 | [`0xa47543d7…a696`](https://sepolia.etherscan.io/tx/0xa47543d7f76cd36bca4a98d1ca23b96e3b9381adb1970a19c008651a3b7aa696) | Worker stakes 0.02 ETH in the EntryPoint. |
+| 11716695 | [`0x3646cfeb…eca8`](https://sepolia.etherscan.io/tx/0x3646cfeb35a5e4d1ae144e9efa3f45c43142fbd017563b0f89f44d85167deca8) | Worker's EntryPoint deposit is funded with 0.04 ETH. |
+| 11716711 | [`0x5c123f80…77e3`](https://sepolia.etherscan.io/tx/0x5c123f803ae324b78a467ee3993f24da60f0b74121c7e85da8161e5d6cf177e3) | Master calls `registerWorker(master, worker)`. |
+| 11722902 | [`0xae57c597…224f`](https://sepolia.etherscan.io/tx/0xae57c597974715318b134990ce00e8a8f191f25f2cca80c0f939c2529a8c224f) | Test wallet shields 0.1 ETH through the Kohaku SDK. |
+| 11722909 | [`0x165edf28…446d`](https://sepolia.etherscan.io/tx/0x165edf282b9cec79e2f6e70354c53c857ddb38a753abb638204552ea8778446d) | **Sponsored withdrawal** (UserOperation `0x8f7982d6…a0cf`). |
+| 11722912 | [`0x52e5bbe4…c8c0`](https://sepolia.etherscan.io/tx/0x52e5bbe4acd185055e0e7fdadeeb9662e482b27016f4413ab3a2bec91cb5c8c0) | Relayer key tops the deposit back up to its 0.04 ETH startup target (+0.000842 ETH, this withdrawal's gas); sent on the restart described above. |
+
+Logs of the withdrawal transaction, in order:
+
+| Emitted by | Event | Shows |
+| --- | --- | --- |
+| `RelayerRegistry` | `StakeBurned(master, 0.1137 TORN)` | Test TORN charged from the master's stake. |
+| ETH 0.1 pool | `Withdrawal(to = sender, relayer = master, fee = 0.002142 ETH)` | The fee bound in the proof is paid to the master. |
+| Worker paymaster | `Relayed(pool, nullifierHash, master, fee, viaRouter = true)` | The authorised `relayWithdraw` went through `TornadoRouter`. |
+| WETH, Aave pool, aWETH, helper | `Deposit`, `Supply`, `Mint`, `Supplied`: 0.097858 on behalf of the recipient | Tail call: wrap, then supply to Aave. |
+| Worker paymaster | `Sponsored(userOpHash, refundTo = 0, fee = 0.002142 ETH, refund = 0)` | Settled in `postOp`; worker mode refunds nothing. |
+| EntryPoint | `UserOperationEvent(paymaster = worker, success = true, actualGasCost = 0.000842 ETH)` | The operation succeeded; its gas came from the worker's deposit. |
 
 ## Repository
 
-| Path | |
+| Path | Contents |
 | --- | --- |
-| `contracts/` | `TornadoRelayerPaymasterCore.sol` (logic), `TornadoRelayerPaymaster7702.sol` (delegate for worker EOAs), `TornadoRelayerPaymaster.sol` (standalone), `SwapAndSupplyZap.sol`, `dao-sandbox/` (testnet copy of the DAO relayer stack) |
-| `relayer/` | the signing service (`setup.ts` = first-start delegation / stake / deposit) |
-| `client/` | reference wallet flow, proof generation, e2e harness (anvil fork + alto) |
-| `kohaku-integration/` | patches for `@kohaku-eth/tornado-cash` and `kohaku-cli`, Kohaku e2e |
+| [`relayer/`](relayer/) | Signing service, setup, pricing, JSON-RPC and sponsorship store. |
+| [`contracts/`](contracts/) | Paymaster, optional swap/Aave helper, sandbox and Foundry tests. |
+| [`client/`](client/) | Reference wallet/prover flow and mainnet-fork integration tests. |
+| [`kohaku-integration/`](kohaku-integration/) | Pinned SDK/CLI patches and live example. |
 
 ---
 
 # 简体中文
 
-**一个面向 Kohaku / ERC-4337 原子提现的轻量 Tornado Cash relayer。**
+**为 Kohaku 提供轻量 Tornado Cash relayer 与 paymaster 集成：保留现有 relayer，而不是让运营者变成 bundler。**
 
-> 已在 Sepolia 跑通 PoC。实验性质，未经审计。
+[English](#tornado-4337-relayer) | 简体中文
 
-目标很简单：让现有 Tornado relayer 继续参与 Kohaku 的原子提现流程，**不需要自己变成 bundler，也不脱离现有 Tornado relayer 的经济体系。**
+> 实验性集成，未经安全审计。验收范围仅限 **mainnet fork 和 Sepolia 实网上链**，不代表主网生产发布。
 
-## 对现有 Tornado relayer 来说
+现有 Tornado relayer 可以增加 ERC-4337 原子提现赞助服务，同时保留原有 master 身份、手续费收款地址与 DAO 质押。既有池和证明电路不变。这是可以与经典 relayer 并行运行的**可选接入方式**，不是原 HTTP API 的直接替代，也不要求现有运营者迁移。
 
-新的 relayer 和传统 relayer 的工作其实非常接近。
-
-传统 relayer：
+## 对 relayer 来说，变化是什么？
 
 ```text
-收到提现请求
-→ 检查 proof / root / nullifier / fee
-→ 签名并发送交易
+经典 relayer：检查提现请求                  → 签名并广播交易
+本项目：      检查 UserOperation 并模拟执行 → 签 sponsorship，由钱包提交给 bundler
 ```
 
-新的 relayer：
+Relayer 仍然负责报价、检查提现、决定是否服务，不需要运行 bundler 或维护 UserOperation mempool。**链下 relayer 负责签名，链上 paymaster 负责验签和支付 gas**；部署、注册和入金是独立的初始化操作。
 
-```text
-收到 UserOperation
-→ 检查 proof / root / nullifier / fee
-→ 签 sponsorship
-```
+## 保留现有 DAO 与 relayer 经济体系
 
-本质上的区别只是：**签的东西变了。**
+当前支持路径是：部署独立的 `TornadoRelayerPaymaster` 合约，由已有 master 调用 `RelayerRegistry.registerWorker(master, paymaster)`，将其登记为新 worker。Master 原有的 ENS 身份和 TORN stake 保持不变，不需要修改 DAO 治理合约。
 
-relayer 不再需要自己发交易。用户的钱包拿到 sponsorship 后，把 UserOperation 发给 ERC-4337 bundler。
+证明中的 `relayer` 仍是 **master**，`recipient` 则是 UserOperation 的 **sender**。Worker 模式收取固定报价，提现手续费直接支付给 master，paymaster 不向用户退还未使用的 gas 差额。被授权的那笔 `relayWithdraw` 经过 `TornadoRouter`，并按现有 Registry/FeeManager 规则扣费。
 
-所以 relayer 仍然只做很小的一部分 Tornado-specific 工作：
+三类资金必须分清：**master 在 RelayerRegistry 中的 TORN stake** 用于 DAO 扣费；**worker 在 EntryPoint 中的 ETH stake** 是独立的验证质押；**worker 在 EntryPoint 中的 ETH deposit** 才是支付 gas 的余额，需要运营者手动补充。手续费进入 master，不会自动变成 worker 的 gas deposit。
 
-- 报价；
-- 检查提现；
-- 决定是否 sponsor；
-- 签名；
-- 保留原来的 fee、价格逻辑和 privacy setup。
+钱包先取得报价、生成证明并请求赞助，再把签好的 UserOperation 交给 bundler。EntryPoint 完成验证后，由 sender 执行“worker 提现 → Router／Registry 收费 → 池子 → wrap／swap／Aave 等尾调用”。每个 sponsorship 只授权一笔确定的提现，SDK 每张 note 生成一个 UserOperation。原子性仅在**单个 operation 内**成立，多 note 之间不保证整体原子性；顶层调用检查也不保证尾调用合约内部的全部行为。
 
-relayer 自己不需要运行 bundler。
+## 启动 Sepolia 测试 relayer
 
-## 保留现有 relayer 经济模型
+需要 **Node.js 22+ 和 pnpm**；合约开发与 fork 测试另外需要支持 Prague 的 **Foundry** 和 Tornado proving artifacts。
 
-paymaster 是一个小合约，注册成**现有 relayer 的 worker**——和今天往 registry 里加一个 worker key 是同一个动作。relayer 软件首次启动时用 relayer 自己的 key 部署这个合约、在 EntryPoint 上质押和入金，然后等 master 把它登记为 worker。
+安装命令与 Sepolia 配置见上方 [Run a Sepolia test relayer](#run-a-sepolia-test-relayer)。**`.env.example` 默认指向主网，必须先修改，不能直接启动。** 示例只服务 Sepolia 的 0.1 ETH 池，使用专用测试 worker 私钥和已在本项目 sandbox 注册的 master。主网注册关系不会自动带到 Sepolia；不要把别人的 master 或演示 worker 当成自己的部署。
 
-在这个模式下：
-
-- proof 里仍然写现有 relayer（它的 master 地址）；
-- withdrawal fee 仍然付给现有 relayer；
-- 提现仍然经过 `TornadoRouter`，每个 UserOperation 一张 note；
-- `RelayerRegistry` 仍然从现有 relayer 的 stake 里扣 TORN，每转发一笔扣一次；
-- paymaster 只负责签 sponsorship，gas 从它的 EntryPoint 押金里出。
-
-也就是说，现有 relayer 仍然处在新的 atomic withdrawal 路径中，而不是被绕开；切换只是换掉 relayer 软件——worker key、`REWARD_ACCOUNT`、手续费设置都照旧。
-
-另外两种变体存在但不推荐：独立合约注册成新的 relayer *master*（会把 fee 里没用掉的部分退给用户）；以及实验性的 EIP-7702 模式，让 worker EOA 自己委托到共享实现（Pimlico 公共 bundler 接受，严格 ERC-7562 mempool 规则下不保证）。
-
-### 作为现有 relayer 怎么跑
+默认 `AUTO_SETUP=true` 会执行所需的部署、Router 设置、ETH stake 和 deposit 入金，随后打印新 worker 地址并等待 master 注册。复用旧合约时，会在 stake/deposit 交易前检查布局、EntryPoint、signer 和 Router 是否匹配。设置 `AUTO_SETUP=false` 可禁用自动初始化交易。
 
 ```bash
-cd relayer && cp .env.example .env
-# PRIVATE_KEY      一个 relayer key（现有的 worker key 就行）           REWARD_ACCOUNT  你的 master 地址
-# RELAYER_FEE      0.3（百分比，和 tornado-relayer 一样）              HTTP_RPC_URL / NET_ID 照旧
-# PAYMASTER_DEPOSIT_WEI   要在 EntryPoint 保持的 gas 浮存（这个 key 需要 ETH，就像 worker 今天也需要 ETH 付 gas）
-pnpm start
+pnpm --filter @tornado-4337/relayer start
+# 由同一网络上的 master 账户执行：
+# RelayerRegistry.registerWorker(masterAddress, newPaymasterAddress)
+# 在另一个终端查看状态：
+curl http://127.0.0.1:8787/status
 ```
 
-首次启动时服务用这个 key 部署 worker paymaster 合约、质押 0.1 ETH、入金，打印地址后等待。你用 master key 把它登记为 worker，和加新 worker 一模一样：`RelayerRegistry.registerWorker(master, paymaster)`。之后服务只做签名。`GET /status` 显示模式、master、剩余质押和各池每笔要烧的 TORN。钱包把 paymaster 地址和服务 URL 当 ERC-7677 端点即可。
+兼容经典 relayer 的 `PRIVATE_KEY`、`HTTP_RPC_URL`、`NET_ID`、`RELAYER_FEE` 名称。建议只用一套命名；进程环境中已设置的值优先于 `.env`。`RELAYER_FEE=0.3` 表示 **0.3%**，等于 `SERVICE_FEE_BPS=30`，同时设置时后者优先。
 
-## 对 Kohaku 来说
+完整参数见 [`.env.example`](relayer/.env.example)。`PAYMASTER_DEPOSIT_WEI` 是**启动时的入金目标**，不是持续自动补款；`MIN_DEPOSIT_WEI` 为新赞助保留余额余量，`MAX_SPONSORSHIP_GAS_WEI` 可限制单笔 gas 支出上限。ERC-20 池需要配置价格源，提现费使用池内代币计价，而 gas 仍以 ETH 支付。
 
-Kohaku 只需要增加一条由 relayer 签名的 sponsorship 路径：
+Paymaster 状态文件和 sponsorship 文件应使用稳定路径、保存在持久化存储中。**一套 store/key 只运行一个签名进程**；JSON 文件不是多实例共享存储。不要删除仍有效的赞助记录来绕过拒签。对外开放前，应配置传输安全、访问控制和日志保留策略。
 
-```text
-Kohaku / wallet
-    ↓
-向 Tornado relayer 请求报价
-    ↓
-生成 proof + UserOperation
-    ↓
-请求 relayer 签 sponsorship
-    ↓
-把 UserOperation 发给 bundler
-```
+## Kohaku 接入
 
-这样就可以在一个 UserOperation 里完成：
+仓库提供固定版本的 Kohaku SDK／CLI 补丁，不代表修改已经进入上游。运行 `pnpm --filter @tornado-4337/kohaku-integration setup` 准备依赖，然后按上方 [Integrate with Kohaku](#integrate-with-kohaku) 配置 worker paymaster、EntryPoint、bundler URL 和 `relayer: { url }`。
 
-```text
-Tornado withdraw
-→ swap
-→ Aave
-```
+钱包按“报价 → 证明绑定 `quote.relayer` 与 `quote.fee` → gas 估算 → relayer 签 sponsorship → sender 签最终 UserOperation → 提交 bundler”执行。Fee 改变需要重新生成证明；赞助后不能再改 gas 上限或 calldata。Stub 仅供估算，不是已经获批的赞助。
 
-现有 Tornado pool 和 proving circuit 都不需要修改。
+[实网示例](kohaku-integration/example/withdraw-with-relayer.ts) 支持普通提现和 Aave 尾调用。配置其文件头列出的环境变量后，运行 `pnpm --filter @tornado-4337/kohaku-integration example`。它要求客户端 keystore 已持有 shielded note；`MNEMONIC` 是客户端密钥材料，与 relayer 私钥不同，示例的环境配置也不读取 `relayer/.env`。`OP_OUT` 可保存已准备的 operation，方便重放检查。
 
-## 架构
+服务在 `POST /` 提供 `tornado_quote`、ERC-7677 的 `pm_getPaymasterStubData`／`pm_getPaymasterData`，以及 `tornado_status`。两个 sponsor 方法的参数是 `[userOp, entryPoint, chainId, context]`。`GET /status` 返回资金、注册、预算和读取失败信息；`GET /health` 只表示进程存活，不代表当前可以接受赞助。
 
-```text
-Kohaku / wallet
-      ↓
-thin Tornado relayer
-      ↓
-签 sponsorship
-      ↓
-paymaster（注册为 relayer worker 的合约）
-      ↓
-ERC-4337 bundler
-      ↓
-EntryPoint
-      ↓
-TornadoRouter
-      ↓
-Tornado pool
-      ↓
-atomic tail calls
-```
+## 安全与运行边界
 
-Tornado-specific 的逻辑继续留在 relayer；bundler 只是通用基础设施。
+**限制账户实现。** 默认只赞助 Simple7702Account v0.8，白名单不能为空；链上签名绑定确切提现和 sender implementation。当前拒绝的是“relayer 自己的 EOA 兼任 paymaster”的 `PAYMASTER_MODE=7702`，不是用户侧的 7702 sender。
 
-## 当前状态
+**先检查，先记录，再发出签名。** 签名前检查 proof、root、nullifier、fee、当前 worker 注册关系与 gas 预算，并强制要求 bundler 模拟返回全部五个 gas 字段。启用 `SPONSORSHIP_STORE` 后，签名记录必须先落盘才能返回；写入失败会拒绝发出签名并释放预留。仍有效但没有记录 gas 成本的旧条目，会暂停新赞助直到过期，不能用当前单笔 cap 代替旧承诺。实现见 [`service.ts`](relayer/src/service.ts) 和 [`store.ts`](relayer/src/store.ts)。
 
-目前 PoC 已经完成：
+**原子执行不等于失败免费。** 执行回滚时，提现、手续费和 TORN 扣费一起回滚，但 paymaster 仍可能损失 gas；sender nonce／delegation 的变化也不一定回滚。签名前模拟无法排除签名到打包之间的状态变化，外层 bundle 成功不代表内部 UserOperation 成功。短有效期和预算限制只能约束敞口，不保证收款或盈利，具体回归见 [execution-failure 测试](client/e2e/execution-failure.test.ts)。
 
-- Kohaku SDK / CLI 集成；
-- Sepolia 实网 atomic withdrawal；
-- relayer-signed paymaster sponsorship；
-- 原子 `withdraw → wrap/swap → Aave`；
-- `TornadoRouter → RelayerRegistry` 集成；
-- Sepolia DAO sandbox 中的 TORN stake 扣费；
-- 基于真实 Tornado DAO router / registry 的 mainnet-fork 测试；
-- worker mode：现有 relayer 收 fee，同时从它的 stake 中扣 TORN；
-- 主网 fork 上的验收跑：主网真实的 ETH 100 池、DAO 现有的 router / registry / FeeManager 一个字不动、一个真实已注册的 relayer 当 master、relayer 软件自己部署的 worker 合约，每笔从 master 质押里烧 116 TORN；
-- 严格 ERC-7562 mempool 规则：参考 bundler 自己的 tracer 和规则引擎接受验证阶段（paymaster 未质押时则拒绝）。
+**重试与支持范围。** 每张 note 的有效赞助保留到过期，重启也不会清除；一次执行失败后，重新申请赞助可能仍需等待。保留原 note，重建操作时重新读取 nonce／delegation。兼容性结论仅覆盖已测试配置，不扩展为任意账户、任意 bundler 或所有严格 mempool 均可用。当前不作生产就绪或独立安全审计声明。
 
-评审提出的问题已在当前代码里处理：
+## 测试与验收记录
 
-- **sponsorship 绑定到具体那笔提现。** relayer 签的是它批准的那一次 `relayWithdraw` 的哈希；验证阶段记进 transient storage，`relayWithdraw` 只对完全相同的参数放行。执行语义奇怪的 sender 账户、note 持有人、第三方都不能让 paymaster 转发（并烧质押）别的东西。
-- **每个 sponsorship 一张 note。** 本 sponsorship 授权的那一笔 `relayWithdraw` 必须经过 router，并遵守现有 DAO 收费规则，和经典 relayer 完全一样。同一 operation 自身的顶层调用里出现第二笔 Tornado 提现会被拒绝，paymaster 上也只允许 `relayWithdraw`；Kohaku 补丁每张 note 发一个 operation。这个检查只看顶层调用：尾调用合约内部做了什么，不在它的保证范围内。原子性只在单个 operation 内成立，多 note 之间不承诺。
-- **sponsorship 绑定执行它的账户实现。** relayer 把 sender 将要运行的 EIP-7702 implementation（operation 自带的 authorization，没有就用当前 delegation）一起签进条款，paymaster 在验证阶段再链上核对 sender 的 delegation designator。签完之后把 authorization 换成别的 implementation 会被拒（`SenderImplementationMismatch`），已批准的提现不可能由 relayer 没见过的代码执行。主网 fork 上有对抗测试：签完 sponsorship 之后把 sender 重新委托到另一份字节码完全相同的账户实现，验证阶段会拒绝这笔 operation，于是不烧质押、note 也没被花掉。
-- **EntryPoint nonce 与 EOA nonce 分开。** SDK 用 `EntryPoint.getNonce` 取 operation 的 nonce，用 sender 的交易计数取 EIP-7702 authorization 的 nonce；sender 已经委托到 Simple7702Account 时干脆不带 authorization——这两种情况下两个计数就会错开。
-- **只赞助已知的账户实现。** 默认只有主网标准的 Simple7702Account，没有别的（`ALLOWED_SENDER_IMPLEMENTATIONS` 只能收窄或替换这个列表，没有任何写法等于"任意账户"）。绑定实现解决的是"哪段代码来执行"，但它无法判断那段代码是否真的按 relayer 校验过的调用去执行：一个 `execute` 直接忽略 calldata 的账户，会把赞助的 gas 花掉，却既不提现也不付手续费。fork 测试提交的正是这种请求——完全合法的提现 calldata，套在一个什么都不做的账户上——relayer 在签名前就拒绝。
-- **每个 sponsorship 签名前都要模拟，而且关不掉。** `BUNDLER_URL` 是必填项，`SIMULATE_WITH_BUNDLER` 不再能关闭任何东西（旧配置里写 `true` 仍可启动，写其他值直接拒绝启动）。超时、HTTP 错误、JSON-RPC 错误、没有 result、result 缺少五个 gas 字段中的任何一个（两个 paymaster 上限也算在内），一律拒签；估算结果放不进这笔 operation 的上限时同样拒签（包括 `paymasterPostOpGasLimit`），由调用方重新报价，而不是 relayer 去改一笔已签名的 operation。这不等于保证收款：ERC-4337 的验证期模拟本来就不保证执行阶段成功，已上链但执行失败的 operation 仍然由 paymaster 付 gas。真正约束损失的是短签名有效期、手续费下限和存款预算——fork 测试把执行失败这一笔的实际成本量了出来。
-- **存款是预算，而且是实时查的。** 每次签名前读 EntryPoint 存款，减去已经承诺、尚未过期的 sponsorship，所以并发请求不会各自把同一份余额当成全部可用。低于 `MIN_DEPOSIT_WEI` 就停止签名、继续响应 `/status`，人工补款后恢复。`MAX_SPONSORSHIP_GAS_WEI` 限制单笔上限。
-- **sponsorship 先落盘再发出，重启后仍然有效。** 文件存储（`SPONSORSHIP_STORE`）在返回签名之前写入已签名的 sponsorship（nonce 和 gas 成本都以字符串保存）；写入失败就丢弃这个签名并释放预留，不会留下任何挡住这张 note 的记录。预留本身从不写盘。存储在启动时就打开，所以位置不可写或文件读不出来时服务直接起不来，而不是等到第一个请求才失败（空着启动会允许对仍有效的 note 再签一次）。上一个版本写入的仍有效条目没有 gas 成本：它们照样去重；由于它们还可能产生多少成本是未知的——当前任何配置都不能可靠地代替它——relayer 在它们过期前拒绝新的 sponsorship，最长就是升级后的一个签名有效期。fork 测试用文件存储跑完一整笔提现，重启 relayer，再核对 note 仍被拒绝、预算不变、下一张 note 正常服务。
-- **签名时实时读注册关系。** 每次签名前 registry 必须仍然把 paymaster 解析到证明里写的那个 relayer；master 注销了 worker，就立刻停止新的 sponsorship，而不是让 `RelayerRegistry.burn` 在 paymaster 付过钱的 operation 里 revert。
-- **启动时先拒绝不兼容的部署，再谈花钱。** 网络、EntryPoint、签名密钥、router、worker→master 关系，以及 paymaster 的 `paymasterAndData` 布局，全部先只读核对；上一个版本部署的合约（terms 是 297 字节而不是 317）会被直接拒绝，不会花掉任何 stake 或 deposit，也不会悄悄再部署一个。将来如果出现长度相同但字段语义变了的修改，就需要合约里有显式版本号，而不是继续靠长度判断。
-- **ERC-7562。** paymaster 在验证阶段读自身存储，所以要质押（设置步骤质押 0.1 ETH；实际用哪个 bundler 就把 `PAYMASTER_STAKE_WEI` 提到它要求的实体门槛，一般是 1 ETH）。
-- **读取失败不当作答案。** registry、手续费、合约 owner、池子类型的读取在节点层面失败时，启动直接停止（只有合约本身的 revert 才算链上答案，比如 ETH 池没有 `token()`）；worker→master 的核对在任何 stake 或 deposit 之前就会失败。`/status` 每次都重新读存款、stake、注册关系和各池子的 burn，附上读取区块；读不到的字段返回 `null`，原因写在 `unavailable` 里——绝不返回启动时的旧值，也绝不返回零手续费。
-- **加固。** 所有链上设置动作都有日志且可关闭（`AUTO_SETUP=false`）。多实例 relayer 仍需共享的 sponsorship 存储；文件存储只适用于单进程。
-- **适用范围。** 本版本支持的部署形态是：standalone worker 合约，注册在现有 relayer master 名下。`PAYMASTER_MODE=7702`（relayer 自己的 EOA 兼任 paymaster）是实验性的，本版本启动时直接拒绝，合约仍保留在仓库里。这不影响用户侧的 EIP-7702 sender。
+**Mainnet fork。** [Canonical acceptance 测试](contracts/test/fork/MainnetAcceptance.t.sol) 固定在主网区块 **25,981,000**，使用既有 ETH-100 池、EntryPoint v0.8、Simple7702Account、真实 DAO Router／Registry／FeeManager 和已有注册 master，模拟 master 添加 worker，不修改治理管理的配置。其他辅助测试也会使用 fixture 池，不能把它们与 canonical-pool 验收混为一谈。
 
-仍然是实验性实现，未经审计；上生产前需要审计。
+完整命令见上方 [Mainnet fork](#mainnet-fork)。必须设置 `MAINNET_RPC_URL` 与绝对路径的 `TORNADO_ARTIFACTS_DIR`；缺少前者时，Foundry 的主网验收测试会被跳过。RPC 需要能提供固定区块的历史状态；已提交的缓存能减少上游读取，不代表离线即可完成所有测试。
 
-## 怎么跑测试
+**Sepolia 实网。** 使用本项目控制的 DAO sandbox、测试 TORN 与测试费用参数，不是主网 DAO 部署。它验证真实部署和 UserOperation 提交流程；现有 DAO 合约兼容性由主网 fork 验证。
 
-需要 pnpm、Foundry 和 `tornado-cli` 里的证明文件（`TORNADO_ARTIFACTS_DIR`）。
+[2026-09-17 验收记录](https://github.com/dyzz/tornado-4337-relayer/commit/073e9b42c37b7d8d8acd5ea3a9737bcae6893eed) 对应实现版本 `2690d5c`：报告记录 Foundry **37/37**，含四项主网 acceptance，以及六个文件内的 Vitest fork 测试 **24/24**。
 
-```bash
-pnpm install && (cd contracts && forge install && forge build) && (cd contracts-tornado && forge build)
-(cd contracts && forge test)                                     # paymaster 两个版本 + 沙盒 DAO，33 个
-pnpm --filter @tornado-4337/relayer test                         # relayer，14 个
+[Sepolia 交易 `0x165edf28…446d`](https://sepolia.etherscan.io/tx/0x165edf282b9cec79e2f6e70354c53c857ddb38a753abb638204552ea8778446d) 展示 **0.1 ETH 提现 → 注册 worker → Router → wrap → Aave**。报告中的四舍五入数值为：master 收取 **0.002142 ETH**，worker deposit 支付 gas **0.000842 ETH**，master stake 扣除 **0.1137 测试 TORN**，最终到账 **0.097858 aWETH**。
 
-# 主网验收：Foundry fork 测试，对着 DAO 现有合约（固定高度，约 1 分钟）
-(cd contracts && MAINNET_RPC_URL=… TORNADO_ARTIFACTS_DIR=…/tornado-cli/circuits forge test --match-contract MainnetAcceptance -vv)
+该记录还包含一次有效赞助期间的 relayer 重启：恢复文件记录及约 **0.001674 ETH** 的 gas 预算，重复申请返回 `note already sponsored`。重启与拒签属于报告中的**链下运行观察**，不能仅凭交易证明。这些是特定日期与版本的测试结果，不是固定收费、报价建议，也不保证后续修改自动通过。
 
-# 严格 ERC-7562（bundler mempool 规则）：参考 bundler 的 tracer + 规则引擎，不用部署
-MAINNET_RPC_URL=… AA_BUNDLER_DIR=…/eth-infinitism-bundler pnpm --filter @tornado-4337/client exec tsx scripts/erc7562-check.ts
+**链上记录。** 下列地址属于演示部署，仅用于核对下面的交易，不要当作自己的部署：
 
+| 角色 | Sepolia 地址 |
+| --- | --- |
+| Worker paymaster，由 relayer 软件部署 | [`0x12319951…488D`](https://sepolia.etherscan.io/address/0x12319951c1E1A8de07aa7363BECA8d20Bb54488D) |
+| Relayer 签名 key，发出 worker 的初始化交易 | [`0x168EB79a…F91E`](https://sepolia.etherscan.io/address/0x168EB79a6707CC95935B7773d07a899954A6F91E) |
+| Master：sandbox 注册身份、测试 TORN stake、手续费收款地址 | [`0x4DC4F08E…c68B`](https://sepolia.etherscan.io/address/0x4DC4F08E87935135FDa56D11E1e303117B26c68B) |
+| Sandbox `TornadoRouter`／`RelayerRegistry` | [`0xF2DafFd7…a04D`](https://sepolia.etherscan.io/address/0xF2DafFd789ec02211a8f1be1034165cFf759a04D)／[`0x30318086…a58e`](https://sepolia.etherscan.io/address/0x30318086d99E3cbf3D7378Fbd55BcF3EBDC1a58e) |
+| ETH 0.1 池 | [`0x8C4A04d8…F50b`](https://sepolia.etherscan.io/address/0x8C4A04d872a6C1BE37964A21ba3a138525dFF50b) |
+| 尾调用使用的 swap／Aave 辅助合约 | [`0x2B247C8e…Ca33`](https://sepolia.etherscan.io/address/0x2B247C8ee4556B35d510C0BdBD75194c11C4Ca33) |
 
-# 链下栈端到端（relayer 服务、alto bundler、Kohaku SDK），跑在 fork 上：
-#   registry-burn        master / worker 两种模式下的正常流程
-#   withdraw-swap-aave   withdraw -> swap -> Aave，以及 TS 与合约的哈希一致性
-#   relayer-refusals     所有必须在签名之前被拒绝的请求
-#   relayer-restart      用文件存储跑完一笔提现、重启，note 仍被拒绝
-#   execution-failure    上链后执行失败的 operation，以及之后的重试
-MAINNET_RPC_URL=… pnpm --filter @tornado-4337/client e2e          # 有提交的 fork 缓存，每套约 1–2 分钟
-pnpm --filter @tornado-4337/kohaku-integration setup && pnpm --filter @tornado-4337/kohaku-integration e2e   # 真实 Kohaku SDK，Sepolia fork
-```
+| 区块 | 交易 | 步骤 |
+| ---: | --- | --- |
+| 11716691 | [`0x29991c6b…5010`](https://sepolia.etherscan.io/tx/0x29991c6b803537ac6440c6534ce76734507a4eeef1c7a3d3ead8af11815b5010) | relayer 软件部署 worker paymaster（`AUTO_SETUP`）。 |
+| 11716693 | [`0xa47543d7…a696`](https://sepolia.etherscan.io/tx/0xa47543d7f76cd36bca4a98d1ca23b96e3b9381adb1970a19c008651a3b7aa696) | worker 在 EntryPoint 质押 0.02 ETH。 |
+| 11716695 | [`0x3646cfeb…eca8`](https://sepolia.etherscan.io/tx/0x3646cfeb35a5e4d1ae144e9efa3f45c43142fbd017563b0f89f44d85167deca8) | worker 的 EntryPoint deposit 入金 0.04 ETH。 |
+| 11716711 | [`0x5c123f80…77e3`](https://sepolia.etherscan.io/tx/0x5c123f803ae324b78a467ee3993f24da60f0b74121c7e85da8161e5d6cf177e3) | master 调用 `registerWorker(master, worker)`。 |
+| 11722902 | [`0xae57c597…224f`](https://sepolia.etherscan.io/tx/0xae57c597974715318b134990ce00e8a8f191f25f2cca80c0f939c2529a8c224f) | 测试钱包通过 Kohaku SDK shield 0.1 ETH。 |
+| 11722909 | [`0x165edf28…446d`](https://sepolia.etherscan.io/tx/0x165edf282b9cec79e2f6e70354c53c857ddb38a753abb638204552ea8778446d) | **赞助提现**（UserOperation `0x8f7982d6…a0cf`）。 |
+| 11722912 | [`0x52e5bbe4…c8c0`](https://sepolia.etherscan.io/tx/0x52e5bbe4acd185055e0e7fdadeeb9662e482b27016f4413ab3a2bec91cb5c8c0) | relayer key 把 deposit 补回 0.04 ETH 的启动目标（+0.000842 ETH，即这笔提现的 gas），由上文所述的重启发出。 |
 
-主线是 Foundry 验收测试（`contracts/test/fork/MainnetAcceptance.t.sol`）：主网真实的 ETH 100 池及其完整存款树（证明由 client 的 prover 经 ffi 生成，叶子来自提交的 fixture）、DAO 现有的 `TornadoRouter` / `RelayerRegistry` / FeeManager、主网地址上的真实 EntryPoint v0.8 和 Simple7702Account、一个真实已注册的 relayer master（solid-relayer.eth）、按软件的方式从 relayer key 部署的 worker 合约——不碰任何 governance 持有的状态，唯一的 `vm.prank` 是 master 登记自己的 worker。它还用 state-diff 记录器断言验证阶段只碰 paymaster 自己的存储。
+提现交易的日志（按顺序）：
 
-`scripts/erc7562-check.ts` 把 eth-infinitism 参考 bundler 自己的 `bundlerCollectorTracer` 和 `tracerResultParser`（它真正的 mempool 规则引擎）跑在归档节点的 `debug_traceCall(handleOps)` 上，worker 合约代码、存储、EntryPoint 质押和 sender 的 EIP-7702 授权都通过 state override 提供。`--unstaked` 是反例，而且必须是按预期的那条理由被拒（未质押的 paymaster 读自身存储，STO-031）。参考 bundler 的 checkout 固定在一个 commit（`client/src/aa-bundler.ts`），所以"通过参考规则"永远指同一套规则。
-
-fork 固定在一个区块高度（主网 25 981 000；`E2E_FORK_BLOCK=latest` 可覆盖），该高度的 RPC 缓存随仓库提交在 `client/e2e/fork-cache/`（Foundry 和 anvil 共用），所以新克隆下来不需要归档节点也能全部跑。改了高度后先热跑一遍，再 `pnpm --filter @tornado-4337/client fork-cache:save`。
-
-vitest 套件（anvil + alto bundler + 进程内 relayer）覆盖 Foundry 覆盖不了的部分：relayer 服务的校验、模拟、签名，bundler 是否接受，以及 Kohaku SDK——ETH 池 → swap → Aave；DAI 池 → Aave，fee 用 1inch 预言机定价；paymaster 作为新注册的 master、作为软件自部署的 worker 合约、以及实验性的 7702 变体。
-
-## 我们在 Sepolia 做了什么
-
-DAO 自己的 Sepolia registry 没有 router、没有启用的池子、费用为 0，所以我们部署了一套 relayer 栈的沙盒副本（`contracts/src/dao-sandbox`：ABI 一致，governance 是我们，TORN 是我们 mint 的测试币，价格由 governance 设定），按 0.30 % 启用了 ETH 0.1 / ETH 1 / DAI 100 三个池。router [`0xF2DafFd7…a04D`](https://sepolia.etherscan.io/address/0xF2DafFd789ec02211a8f1be1034165cFf759a04D)，registry [`0x30318086…a58e`](https://sepolia.etherscan.io/address/0x30318086d99E3cbf3D7378Fbd55BcF3EBDC1a58e)，其余地址见 `client/src/chains.ts`。
-
-`kohaku-integration/example` 里的 client host 走 Kohaku 自己的快速同步路径：通过 `externalSyncProvider` 从它的快照 CDN 取预先抓好的池子事件，并且设置了 `minExternalSyncBlocksAmount`（不设这个值 SDK 会完全忽略 provider），同步状态也落盘。Sepolia 同步冷启动约 7 秒、热启动约 2 秒；相比之下走公共 RPC 从池子部署区块全量扫描要二十分钟以上。
-
-然后我们扮演一个现有 relayer：一个 EOA 注册为 master `existing-relayer.sandbox.eth`，质押 5000 TORN——和一套 `tornado-relayer` 部署完全一样；用一个 relayer key 启动新软件，`REWARD_ACCOUNT` 填 master。软件启动时自己部署了 worker 合约 [`0x12319951…488D`](https://sepolia.etherscan.io/address/0x12319951c1E1A8de07aa7363BECA8d20Bb54488D)，质押、入金后等待；master 用一笔 [`registerWorker`](https://sepolia.etherscan.io/tx/0x5c123f803ae324b78a467ee3993f24da60f0b74121c7e85da8161e5d6cf177e3) 登记它，服务随即上线。再通过 Kohaku SDK：shield 0.1 ETH，然后一次 unshield 并带上存 Aave 的尾调用。这笔提现是一笔交易：
-
-[`0x165edf28…446d`](https://sepolia.etherscan.io/tx/0x165edf282b9cec79e2f6e70354c53c857ddb38a753abb638204552ea8778446d)
-——EntryPoint → worker 合约 `relayWithdraw`（只接受 relayer 签过的那组参数，而且只在 sender 运行的正是 relayer 签名时绑定的那个实现时才放行）→ `TornadoRouter` → `RelayerRegistry.burn`（从 master 质押里烧 0.1137 TORN）→ 池子 → wrap → Aave。证明里绑定的 fee 是 0.002142 ETH，进 master 口袋；实际 gas 0.000842 ETH 从 worker 的 EntryPoint 存款里出，master 净得 0.001300 ETH；收款地址拿到 0.097858 aWETH（正好是面额减 fee）。relayer 用的是和 fork 测试相同的配置——文件存储的 sponsorship、0.01 ETH 存款保留——并在这笔 sponsorship 仍有效时重启：新进程从磁盘读回了它，`/status` 把它 0.001674 ETH 的 gas 上限计入预算，重放同一笔 operation 被以 `note already sponsored` 拒绝。在 sponsorship 条款加入绑定实现之前、跑在上一个 worker 合约上的几笔分别是 [`0x30fca6f5…d059`](https://sepolia.etherscan.io/tx/0x30fca6f5e1a6b8a05ea0b1b3099e05c3add5055238e8d425b09d43f5a47ed059)（同样的流程，从 Kohaku CLI 发起）、不带尾调用的普通 unshield [`0xd4e04a7e…26c6`](https://sepolia.etherscan.io/tx/0xd4e04a7e88f5e3bf96bebabf4a24c431c474d1f8a1f6218b55a5e936743026c6)，以及实验性的 7702 变体 [`0x0411a50f…e7df`](https://sepolia.etherscan.io/tx/0x0411a50f9b54e642382c28c1b13df74ca763583f33dc566af1687e80e181e7df)。
+| 发出方 | 事件 | 说明 |
+| --- | --- | --- |
+| `RelayerRegistry` | `StakeBurned(master, 0.1137 TORN)` | 从 master stake 扣除测试 TORN。 |
+| ETH 0.1 池 | `Withdrawal(to = sender, relayer = master, fee = 0.002142 ETH)` | 证明中绑定的手续费支付给 master。 |
+| Worker paymaster | `Relayed(pool, nullifierHash, master, fee, viaRouter = true)` | 被授权的 `relayWithdraw` 经过 `TornadoRouter`。 |
+| WETH、Aave pool、aWETH、辅助合约 | `Deposit`、`Supply`、`Mint`、`Supplied`：为收款地址存入 0.097858 | 尾调用：先 wrap，再存入 Aave。 |
+| Worker paymaster | `Sponsored(userOpHash, refundTo = 0, fee = 0.002142 ETH, refund = 0)` | 在 `postOp` 中结算，worker 模式不退款。 |
+| EntryPoint | `UserOperationEvent(paymaster = worker, success = true, actualGasCost = 0.000842 ETH)` | operation 执行成功，gas 从 worker deposit 支付。 |
 
 ## 目录
 
-| 路径 | |
+| 路径 | 内容 |
 | --- | --- |
-| `contracts/` | `TornadoRelayerPaymasterCore.sol`（逻辑）、`TornadoRelayerPaymaster7702.sol`（worker EOA 的委托目标）、`TornadoRelayerPaymaster.sol`（独立部署版）、`SwapAndSupplyZap.sol`、`dao-sandbox/`（测试网用的 DAO relayer 栈副本） |
-| `relayer/` | 签名服务（`setup.ts` = 首次启动的委托 / 质押 / 入金） |
-| `client/` | 参考钱包流程、证明生成、e2e 测试台（anvil fork + alto） |
-| `kohaku-integration/` | `@kohaku-eth/tornado-cash` 与 `kohaku-cli` 的补丁、Kohaku e2e |
+| [`relayer/`](relayer/) | 签名服务、初始化、定价、JSON-RPC、赞助存储。 |
+| [`contracts/`](contracts/) | Paymaster、可选 swap／Aave 辅助合约、sandbox 与 Foundry 测试。 |
+| [`client/`](client/) | 钱包／prover 参考流程与 mainnet-fork 集成测试。 |
+| [`kohaku-integration/`](kohaku-integration/) | 固定版本 SDK／CLI 补丁与实网示例。 |
