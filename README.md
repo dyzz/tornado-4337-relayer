@@ -302,14 +302,14 @@ and funded it, and waited; the master registered it with one
 and the service came up. Then, through the Kohaku SDK: shield 0.1 ETH, then one unshield with an Aave tail
 call. That withdrawal is a single transaction:
 
-[`0xdc1f3681…5420`](https://sepolia.etherscan.io/tx/0xdc1f36817553b1b5ed99fd64fc6bbac84c5cb980bfd9d377e5f32dc1257e5420)
+[`0x165edf28…446d`](https://sepolia.etherscan.io/tx/0x165edf282b9cec79e2f6e70354c53c857ddb38a753abb638204552ea8778446d)
 — EntryPoint → worker contract `relayWithdraw` (only with the arguments the relayer signed, and only because
 the sender ran the implementation the relayer signed for) → `TornadoRouter` → `RelayerRegistry.burn`
-(0.1137 TORN from the master's stake) → pool → wrap → Aave. Fee bound in the proof 0.002237 ETH, paid to the
-master; actual gas 0.000840 ETH, paid from the worker's EntryPoint deposit, so the master keeps 0.001397 ETH;
-0.097763 aWETH (exactly denomination − fee) landed on the recipient. The relayer ran with the same settings
+(0.1137 TORN from the master's stake) → pool → wrap → Aave. Fee bound in the proof 0.002142 ETH, paid to the
+master; actual gas 0.000842 ETH, paid from the worker's EntryPoint deposit, so the master keeps 0.001300 ETH;
+0.097858 aWETH (exactly denomination − fee) landed on the recipient. The relayer ran with the same settings
 as the fork suites — file-backed sponsorship store, 0.01 ETH deposit reserve — and was restarted while this
-sponsorship was still live: the new process read it back from disk, `/status` budgeted its 0.001761 ETH gas
+sponsorship was still live: the new process read it back from disk, `/status` budgeted its 0.001674 ETH gas
 ceiling, and replaying the same operation was refused with `note already sponsored`. Earlier runs on the previous worker
 contract, before the sponsorship terms gained the bound implementation, are
 [`0x30fca6f5…d059`](https://sepolia.etherscan.io/tx/0x30fca6f5e1a6b8a05ea0b1b3099e05c3add5055238e8d425b09d43f5a47ed059)
@@ -525,8 +525,8 @@ DAO 自己的 Sepolia registry 没有 router、没有启用的池子、费用为
 
 然后我们扮演一个现有 relayer：一个 EOA 注册为 master `existing-relayer.sandbox.eth`，质押 5000 TORN——和一套 `tornado-relayer` 部署完全一样；用一个 relayer key 启动新软件，`REWARD_ACCOUNT` 填 master。软件启动时自己部署了 worker 合约 [`0x12319951…488D`](https://sepolia.etherscan.io/address/0x12319951c1E1A8de07aa7363BECA8d20Bb54488D)，质押、入金后等待；master 用一笔 [`registerWorker`](https://sepolia.etherscan.io/tx/0x5c123f803ae324b78a467ee3993f24da60f0b74121c7e85da8161e5d6cf177e3) 登记它，服务随即上线。再通过 Kohaku SDK：shield 0.1 ETH，然后一次 unshield 并带上存 Aave 的尾调用。这笔提现是一笔交易：
 
-[`0xdc1f3681…5420`](https://sepolia.etherscan.io/tx/0xdc1f36817553b1b5ed99fd64fc6bbac84c5cb980bfd9d377e5f32dc1257e5420)
-——EntryPoint → worker 合约 `relayWithdraw`（只接受 relayer 签过的那组参数，而且只在 sender 运行的正是 relayer 签名时绑定的那个实现时才放行）→ `TornadoRouter` → `RelayerRegistry.burn`（从 master 质押里烧 0.1137 TORN）→ 池子 → wrap → Aave。证明里绑定的 fee 是 0.002237 ETH，进 master 口袋；实际 gas 0.000840 ETH 从 worker 的 EntryPoint 存款里出，master 净得 0.001397 ETH；收款地址拿到 0.097763 aWETH（正好是面额减 fee）。relayer 用的是和 fork 测试相同的配置——文件存储的 sponsorship、0.01 ETH 存款保留——并在这笔 sponsorship 仍有效时重启：新进程从磁盘读回了它，`/status` 把它 0.001761 ETH 的 gas 上限计入预算，重放同一笔 operation 被以 `note already sponsored` 拒绝。在 sponsorship 条款加入绑定实现之前、跑在上一个 worker 合约上的几笔分别是 [`0x30fca6f5…d059`](https://sepolia.etherscan.io/tx/0x30fca6f5e1a6b8a05ea0b1b3099e05c3add5055238e8d425b09d43f5a47ed059)（同样的流程，从 Kohaku CLI 发起）、不带尾调用的普通 unshield [`0xd4e04a7e…26c6`](https://sepolia.etherscan.io/tx/0xd4e04a7e88f5e3bf96bebabf4a24c431c474d1f8a1f6218b55a5e936743026c6)，以及实验性的 7702 变体 [`0x0411a50f…e7df`](https://sepolia.etherscan.io/tx/0x0411a50f9b54e642382c28c1b13df74ca763583f33dc566af1687e80e181e7df)。
+[`0x165edf28…446d`](https://sepolia.etherscan.io/tx/0x165edf282b9cec79e2f6e70354c53c857ddb38a753abb638204552ea8778446d)
+——EntryPoint → worker 合约 `relayWithdraw`（只接受 relayer 签过的那组参数，而且只在 sender 运行的正是 relayer 签名时绑定的那个实现时才放行）→ `TornadoRouter` → `RelayerRegistry.burn`（从 master 质押里烧 0.1137 TORN）→ 池子 → wrap → Aave。证明里绑定的 fee 是 0.002142 ETH，进 master 口袋；实际 gas 0.000842 ETH 从 worker 的 EntryPoint 存款里出，master 净得 0.001300 ETH；收款地址拿到 0.097858 aWETH（正好是面额减 fee）。relayer 用的是和 fork 测试相同的配置——文件存储的 sponsorship、0.01 ETH 存款保留——并在这笔 sponsorship 仍有效时重启：新进程从磁盘读回了它，`/status` 把它 0.001674 ETH 的 gas 上限计入预算，重放同一笔 operation 被以 `note already sponsored` 拒绝。在 sponsorship 条款加入绑定实现之前、跑在上一个 worker 合约上的几笔分别是 [`0x30fca6f5…d059`](https://sepolia.etherscan.io/tx/0x30fca6f5e1a6b8a05ea0b1b3099e05c3add5055238e8d425b09d43f5a47ed059)（同样的流程，从 Kohaku CLI 发起）、不带尾调用的普通 unshield [`0xd4e04a7e…26c6`](https://sepolia.etherscan.io/tx/0xd4e04a7e88f5e3bf96bebabf4a24c431c474d1f8a1f6218b55a5e936743026c6)，以及实验性的 7702 变体 [`0x0411a50f…e7df`](https://sepolia.etherscan.io/tx/0x0411a50f9b54e642382c28c1b13df74ca763583f33dc566af1687e80e181e7df)。
 
 ## 目录
 
