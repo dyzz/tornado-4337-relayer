@@ -69,6 +69,9 @@ async function handle(service: RelayerService, req: JsonRpcRequest) {
       return { jsonrpc: '2.0', id, error: { code: err.code, message: err.message, data: err.data } };
     }
     const message = err instanceof Error ? err.message : String(err);
+    // An unexpected internal error is a bug, not a client mistake: log it with its stack so the cause
+    // is visible in the relayer's own output rather than only as a one-line message to the caller.
+    console.error(`[relayer] internal error in ${req?.method}:`, err);
     return { jsonrpc: '2.0', id, error: { code: -32603, message } };
   }
 }

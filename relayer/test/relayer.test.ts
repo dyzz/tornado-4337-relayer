@@ -245,8 +245,10 @@ describe('userop', () => {
 
 describe('sponsorship store', () => {
   const NH: Hex = `0x${'aa'.repeat(32)}`;
-  const a = { validUntil: 2_000_000_000, sender: SENDER, nonce: 0n };
-  const b = { validUntil: 2_000_000_000, sender: MASTER, nonce: 0n };
+  // maxGasCostWei is what the deposit budget counts, and it is a bigint: the file store has to write it
+  // as a string and read it back, so the fixtures carry it.
+  const a = { validUntil: 2_000_000_000, sender: SENDER, nonce: 0n, maxGasCostWei: 12_345_678_901n };
+  const b = { validUntil: 2_000_000_000, sender: MASTER, nonce: 0n, maxGasCostWei: 99n };
 
   it('reserve is check-and-set; a failed request releases only its own pending entry', () => {
     const store = new MemorySponsorshipStore();
@@ -287,5 +289,20 @@ describe('sponsorship store', () => {
     const second = new FileSponsorshipStore(file);
     expect(second.reserve(NH, b).ok).toBe(false);
     expect(second.get(NH)?.status).toBe('signed');
+    // Every bigint field survives the JSON round trip; the restored entry still counts against the budget.
+    expect(second.get(NH)?.nonce).toBe(0n);
+    expect(second.get(NH)?.maxGasCostWei).toBe(a.maxGasCostWei);
+    expect(second.outstanding(1_999_999_999).reduce((s, n) => s + (n.maxGasCostWei ?? 0n), 0n)).toBe(a.maxGasCostWei);
+  });
+
+  it('outstanding() counts live sponsorships and forgets expired ones', () => {
+    const store = new MemorySponsorshipStore();
+    const r = store.reserve(NH, a) as { ok: true; token: string };
+    // A pending reservation already counts: it may still become a signature.
+    expect(store.outstanding(1_000).map((n) => n.maxGasCostWei)).toEqual([a.maxGasCostWei]);
+    store.commit(NH, r.token);
+    expect(store.outstanding(1_000).map((n) => n.status)).toEqual(['signed']);
+    // Past its validUntil it is nobody's liability any more.
+    expect(store.outstanding(2_000_000_001)).toEqual([]);
   });
 });

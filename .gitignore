@@ -13,3 +13,4 @@ kohaku-integration/vendor/
 contracts-tornado/out/
 contracts-tornado/cache/
 .kohaku-cli/
+kohaku-integration/.cache/

@@ -13,11 +13,26 @@ export class FileSponsorshipStore extends MemorySponsorshipStore {
     if (existsSync(path)) {
       const raw = JSON.parse(readFileSync(path, 'utf8')) as Record<
         string,
-        { validUntil: number; sender: `0x${string}`; nonce: string; status?: 'pending' | 'signed'; token?: string }
+        {
+          validUntil: number;
+          sender: `0x${string}`;
+          nonce: string;
+          status?: 'pending' | 'signed';
+          token?: string;
+          maxGasCostWei?: string;
+        }
       >;
       // Only signed sponsorships matter across a restart; a pending one died with the process.
       for (const [k, v] of Object.entries(raw)) {
-        if (v.status === 'signed') this.notes.set(k as Hex, { ...v, nonce: BigInt(v.nonce), status: 'signed', token: v.token ?? 'restored' });
+        if (v.status !== 'signed') continue;
+        this.notes.set(k as Hex, {
+          ...v,
+          nonce: BigInt(v.nonce),
+          // A restored sponsorship still counts against the deposit budget until it expires.
+          maxGasCostWei: v.maxGasCostWei === undefined ? undefined : BigInt(v.maxGasCostWei),
+          status: 'signed',
+          token: v.token ?? 'restored',
+        });
       }
     }
   }
@@ -40,7 +55,10 @@ export class FileSponsorshipStore extends MemorySponsorshipStore {
 
   private flush() {
     const obj: Record<string, unknown> = {};
-    for (const [k, v] of this.notes) obj[k] = { ...v, nonce: v.nonce.toString() };
+    // JSON has no bigint: every numeric field is written as a decimal string and parsed back above.
+    for (const [k, v] of this.notes) {
+      obj[k] = { ...v, nonce: v.nonce.toString(), maxGasCostWei: v.maxGasCostWei?.toString() };
+    }
     const tmp = `${this.path}.tmp`;
     writeFileSync(tmp, JSON.stringify(obj));
     renameSync(tmp, this.path);

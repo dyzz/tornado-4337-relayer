@@ -14,12 +14,18 @@
  *   BUNDLER_URL      default https://public.pimlico.io/v2/<CHAIN_ID>/rpc
  *   MNEMONIC         host keystore mnemonic
  *   RECIPIENT        final recipient (receives the funds / aTokens and the fee refund)
+ *   STATE_FILE       where the SDK's sync state is kept (default ../.cache/tornado-state.json). The
+ *                    first run seeds from the snapshot below; later runs resume from here.
+ *   SAGA=off         skip Kohaku's snapshot CDN and scan the pool from the chain instead (slow)
  *   ZAP              optional SwapAndSupplyZap address: wrap + supply to Aave instead of a plain forward
  */
 import { createPublicClient, encodeFunctionData, getAddress, http, parseEther, type Address, type Hex } from 'viem';
 import { mainnet, sepolia } from 'viem/chains';
 
-import { MemoryStorage, MnemonicKeystore, type Host } from '@kohaku-eth/plugins';
+import { MnemonicKeystore, type Host } from '@kohaku-eth/plugins';
+// Kohaku's own snapshot client, from the vendored CLI (scripts/setup.sh checks it out).
+import { tornadoExternalSyncForChain } from '../vendor/kohaku-cli/src/utils/saga-external-sync.js';
+import { FileStorage } from './file-storage.js';
 import { viem as viemProvider } from '@kohaku-eth/provider/viem';
 import { createTCBroadcaster, E_ADDRESS, TornadoCashConfigs, TornadoCashProtocol } from '@kohaku-eth/tornado-cash';
 
@@ -41,7 +47,14 @@ const zap = process.env.ZAP ? getAddress(process.env.ZAP) : undefined;
 const publicClient = createPublicClient({ chain, transport: http(rpcUrl) });
 const host: Host = {
   keystore: new MnemonicKeystore(env('MNEMONIC')),
-  storage: new MemoryStorage(),
+  // Persisted sync state: the first run scans the pool from its deployment block, later ones resume.
+  // STATE_FILE overrides the location; the default is ignored by the repository.
+  storage: new FileStorage(process.env.STATE_FILE ?? new URL('../.cache/tornado-state.json', import.meta.url).pathname),
+  // Kohaku's own fast-sync path: pre-scraped pool events from the Saga CDN, so only the tail since the
+  // snapshot is pulled from the RPC. Without it the SDK scans the pool from its deployment block, which
+  // takes about twenty minutes per run against a public endpoint. Set SAGA=off to scan from the chain.
+  externalSyncProvider:
+    process.env.SAGA === 'off' ? undefined : tornadoExternalSyncForChain(BigInt(chainId), { fetch }),
   network: { fetch },
   provider: viemProvider(publicClient),
 };
@@ -57,7 +70,14 @@ const paymasterConfig = {
   },
 };
 
-const protocol = new TornadoCashProtocol(host, { protocolConfig: TornadoCashConfigs[chainId], paymasterConfig });
+const protocol = new TornadoCashProtocol(host, {
+  protocolConfig: TornadoCashConfigs[chainId],
+  paymasterConfig,
+  // Required for the snapshot above to be used at all: the SDK only consults `externalSyncProvider`
+  // when it is more than this many blocks behind (`minExternalSyncBlocksAmount == null` disables it
+  // entirely). Same value as the Kohaku CLI's TORNADO_MIN_EXTERNAL_SYNC_BLOCKS.
+  minExternalSyncBlocksAmount: 1_000,
+});
 const broadcaster = createTCBroadcaster(host, { paymasterConfig });
 
 console.log('syncing ...');

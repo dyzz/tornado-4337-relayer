@@ -104,10 +104,10 @@ index 77d4591..f633f42 100644
 \ No newline at end of file
 diff --git a/packages/tornado-cash/src/paymaster/relayer-paymaster-client.ts b/packages/tornado-cash/src/paymaster/relayer-paymaster-client.ts
 new file mode 100644
-index 0000000..f63f8ce
+index 0000000..630a144
 --- /dev/null
 +++ b/packages/tornado-cash/src/paymaster/relayer-paymaster-client.ts
-@@ -0,0 +1,164 @@
+@@ -0,0 +1,169 @@
 +import { hexToBigInt, parseAbi, toHex, type Address, type Hex } from 'viem';
 +
 +import { SerializedUserOperation, UserOpGasLimits } from '../interfaces/user-ops.interface';
@@ -188,7 +188,12 @@ index 0000000..f63f8ce
 +    const res = await this.fetchFn(this.url, {
 +      method: 'POST',
 +      headers: { 'Content-Type': 'application/json' },
-+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
++      // JSON has no bigint. Kohaku carries addresses and amounts as bigints internally, and the ERC-7677
++      // payload is hex throughout, so anything still numeric here is serialized as a 0x quantity rather
++      // than throwing "Do not know how to serialize a BigInt" at the point of sending.
++      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }, (_key, value) =>
++        typeof value === 'bigint' ? toHex(value) : value,
++      ),
 +    });
 +    const body = (await res.json()) as { result?: T; error?: { code: number; message: string } };
 +

@@ -266,6 +266,12 @@ set by governance) and enabled the ETH 0.1 / ETH 1 / DAI 100 pools at 0.30 %. Ro
 [`0x30318086…a58e`](https://sepolia.etherscan.io/address/0x30318086d99E3cbf3D7378Fbd55BcF3EBDC1a58e); the rest is
 in `client/src/chains.ts`.
 
+The client host in `kohaku-integration/example` uses Kohaku's own fast-sync path: pre-scraped pool events
+from its snapshot CDN through `externalSyncProvider`, with `minExternalSyncBlocksAmount` set (without that
+value the SDK ignores the provider entirely), and the sync state persisted to a file. A Sepolia sync takes
+about 7 seconds cold and 2 seconds warm, against more than twenty minutes when the pool is scanned from its
+deployment block over a public RPC.
+
 Then we played an existing relayer: an EOA registered as master `existing-relayer.sandbox.eth` with 5000 TORN,
 exactly like a `tornado-relayer` deployment, and ran the new relayer software with a relayer key and
 `REWARD_ACCOUNT` = the master. On boot the software deployed its worker contract
@@ -275,12 +281,12 @@ and funded it, and waited; the master registered it with one
 and the service came up. Then, through the Kohaku SDK: shield 0.1 ETH, then one unshield with an Aave tail
 call. That withdrawal is a single transaction:
 
-[`0x5b488530…06f9`](https://sepolia.etherscan.io/tx/0x5b4885302db74fe3b9e01615a4bc56169a03dfb1a39e8271340f1b644e6206f9)
+[`0x56ff1679…8461`](https://sepolia.etherscan.io/tx/0x56ff16797444dcb9ce154a3775122382ae667ed3a795c10eaef357de6e808461)
 — EntryPoint → worker contract `relayWithdraw` (only with the arguments the relayer signed, and only because
 the sender ran the implementation the relayer signed for) → `TornadoRouter` → `RelayerRegistry.burn`
-(0.1137 TORN from the master's stake) → pool → wrap → Aave. Fee bound in the proof 0.002348 ETH, paid to the
-master; actual gas 0.000867 ETH, paid from the worker's EntryPoint deposit, so the master keeps 0.001481 ETH;
-0.097652 aWETH (exactly denomination − fee) landed on the recipient. Earlier runs on the previous worker
+(0.1137 TORN from the master's stake) → pool → wrap → Aave. Fee bound in the proof 0.002018 ETH, paid to the
+master; actual gas 0.000840 ETH, paid from the worker's EntryPoint deposit, so the master keeps 0.001177 ETH;
+0.097982 aWETH (exactly denomination − fee) landed on the recipient. Earlier runs on the previous worker
 contract, before the sponsorship terms gained the bound implementation, are
 [`0x30fca6f5…d059`](https://sepolia.etherscan.io/tx/0x30fca6f5e1a6b8a05ea0b1b3099e05c3add5055238e8d425b09d43f5a47ed059)
 (the same flow from the Kohaku CLI), a plain unshield without tail calls
@@ -487,10 +493,12 @@ vitest 套件（anvil + alto bundler + 进程内 relayer）覆盖 Foundry 覆盖
 
 DAO 自己的 Sepolia registry 没有 router、没有启用的池子、费用为 0，所以我们部署了一套 relayer 栈的沙盒副本（`contracts/src/dao-sandbox`：ABI 一致，governance 是我们，TORN 是我们 mint 的测试币，价格由 governance 设定），按 0.30 % 启用了 ETH 0.1 / ETH 1 / DAI 100 三个池。router [`0xF2DafFd7…a04D`](https://sepolia.etherscan.io/address/0xF2DafFd789ec02211a8f1be1034165cFf759a04D)，registry [`0x30318086…a58e`](https://sepolia.etherscan.io/address/0x30318086d99E3cbf3D7378Fbd55BcF3EBDC1a58e)，其余地址见 `client/src/chains.ts`。
 
+`kohaku-integration/example` 里的 client host 走 Kohaku 自己的快速同步路径：通过 `externalSyncProvider` 从它的快照 CDN 取预先抓好的池子事件，并且设置了 `minExternalSyncBlocksAmount`（不设这个值 SDK 会完全忽略 provider），同步状态也落盘。Sepolia 同步冷启动约 7 秒、热启动约 2 秒；相比之下走公共 RPC 从池子部署区块全量扫描要二十分钟以上。
+
 然后我们扮演一个现有 relayer：一个 EOA 注册为 master `existing-relayer.sandbox.eth`，质押 5000 TORN——和一套 `tornado-relayer` 部署完全一样；用一个 relayer key 启动新软件，`REWARD_ACCOUNT` 填 master。软件启动时自己部署了 worker 合约 [`0x12319951…488D`](https://sepolia.etherscan.io/address/0x12319951c1E1A8de07aa7363BECA8d20Bb54488D)，质押、入金后等待；master 用一笔 [`registerWorker`](https://sepolia.etherscan.io/tx/0x5c123f803ae324b78a467ee3993f24da60f0b74121c7e85da8161e5d6cf177e3) 登记它，服务随即上线。再通过 Kohaku SDK：shield 0.1 ETH，然后一次 unshield 并带上存 Aave 的尾调用。这笔提现是一笔交易：
 
-[`0x5b488530…06f9`](https://sepolia.etherscan.io/tx/0x5b4885302db74fe3b9e01615a4bc56169a03dfb1a39e8271340f1b644e6206f9)
-——EntryPoint → worker 合约 `relayWithdraw`（只接受 relayer 签过的那组参数，而且只在 sender 运行的正是 relayer 签名时绑定的那个实现时才放行）→ `TornadoRouter` → `RelayerRegistry.burn`（从 master 质押里烧 0.1137 TORN）→ 池子 → wrap → Aave。证明里绑定的 fee 是 0.002348 ETH，进 master 口袋；实际 gas 0.000867 ETH 从 worker 的 EntryPoint 存款里出，master 净得 0.001481 ETH；收款地址拿到 0.097652 aWETH（正好是面额减 fee）。在 sponsorship 条款加入绑定实现之前、跑在上一个 worker 合约上的几笔分别是 [`0x30fca6f5…d059`](https://sepolia.etherscan.io/tx/0x30fca6f5e1a6b8a05ea0b1b3099e05c3add5055238e8d425b09d43f5a47ed059)（同样的流程，从 Kohaku CLI 发起）、不带尾调用的普通 unshield [`0xd4e04a7e…26c6`](https://sepolia.etherscan.io/tx/0xd4e04a7e88f5e3bf96bebabf4a24c431c474d1f8a1f6218b55a5e936743026c6)，以及实验性的 7702 变体 [`0x0411a50f…e7df`](https://sepolia.etherscan.io/tx/0x0411a50f9b54e642382c28c1b13df74ca763583f33dc566af1687e80e181e7df)。
+[`0x56ff1679…8461`](https://sepolia.etherscan.io/tx/0x56ff16797444dcb9ce154a3775122382ae667ed3a795c10eaef357de6e808461)
+——EntryPoint → worker 合约 `relayWithdraw`（只接受 relayer 签过的那组参数，而且只在 sender 运行的正是 relayer 签名时绑定的那个实现时才放行）→ `TornadoRouter` → `RelayerRegistry.burn`（从 master 质押里烧 0.1137 TORN）→ 池子 → wrap → Aave。证明里绑定的 fee 是 0.002018 ETH，进 master 口袋；实际 gas 0.000840 ETH 从 worker 的 EntryPoint 存款里出，master 净得 0.001177 ETH；收款地址拿到 0.097982 aWETH（正好是面额减 fee）。在 sponsorship 条款加入绑定实现之前、跑在上一个 worker 合约上的几笔分别是 [`0x30fca6f5…d059`](https://sepolia.etherscan.io/tx/0x30fca6f5e1a6b8a05ea0b1b3099e05c3add5055238e8d425b09d43f5a47ed059)（同样的流程，从 Kohaku CLI 发起）、不带尾调用的普通 unshield [`0xd4e04a7e…26c6`](https://sepolia.etherscan.io/tx/0xd4e04a7e88f5e3bf96bebabf4a24c431c474d1f8a1f6218b55a5e936743026c6)，以及实验性的 7702 变体 [`0x0411a50f…e7df`](https://sepolia.etherscan.io/tx/0x0411a50f9b54e642382c28c1b13df74ca763583f33dc566af1687e80e181e7df)。
 
 ## 目录
 
