@@ -146,6 +146,14 @@ function allowedSenderImplementationsFromEnv(): Address[] {
 
 /** Build a RelayerConfig from environment variables (see .env.example). `paymaster` comes from the setup step. */
 export function configFromEnv(paymaster: Address): RelayerConfig {
+  // The pre-signing simulation is not optional. `SIMULATE_WITH_BUNDLER=true` from older .env files is
+  // accepted as a no-op; any other value is refused rather than silently ignored.
+  const simulate = process.env.SIMULATE_WITH_BUNDLER;
+  if (simulate !== undefined && simulate !== '' && simulate !== 'true') {
+    throw new Error(
+      `SIMULATE_WITH_BUNDLER=${simulate}: the pre-signing bundler simulation cannot be disabled (remove the setting)`,
+    );
+  }
   const signerKey = env('RELAYER_PRIVATE_KEY');
   if (!isHex(signerKey) || signerKey.length !== 66) throw new Error('RELAYER_PRIVATE_KEY / PRIVATE_KEY must be a 32-byte hex key');
   const chainId = BigInt(env('CHAIN_ID', '1'));
@@ -184,7 +192,6 @@ export function configFromEnv(paymaster: Address): RelayerConfig {
     priceSource: priceSourceFromEnv(rpcUrl, chainId),
     serviceFeeBps,
     signatureTtlSec: Number(env('SIGNATURE_TTL_SEC', '300')),
-    simulateWithBundler: env('SIMULATE_WITH_BUNDLER', 'true') === 'true',
     bundlerTimeoutMs: Number(env('BUNDLER_TIMEOUT_MS', '20000')),
     // Gas budget. The service never moves funds while it is serving: when the deposit cannot cover the
     // live sponsorships plus this reserve, it stops signing until someone tops it up.

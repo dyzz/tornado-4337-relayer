@@ -180,10 +180,12 @@ Review findings addressed in the current code:
   would spend the sponsored gas while performing no withdrawal and paying no fee. The fork tests submit
   exactly that — valid withdrawal calldata behind a non-executing account — and the relayer refuses before
   signing.
-- **Every sponsorship is simulated before it is signed.** `BUNDLER_URL` is required, and a timeout, an HTTP
-  error, a JSON-RPC error, a missing result or a result without usable gas fields all refuse the signature;
-  an estimate that does not fit the operation's gas limits is refused too, so the caller re-quotes rather
-  than the relayer editing a signed operation. This is not a guarantee of payment: ERC-4337 validation
+- **Every sponsorship is simulated before it is signed, with no way to switch that off.** `BUNDLER_URL` is
+  required and `SIMULATE_WITH_BUNDLER` can no longer disable anything (`true` is tolerated for old files, any
+  other value stops the start-up). A timeout, an HTTP error, a JSON-RPC error, a missing result, or a result
+  lacking any of the five gas fields — both paymaster limits included — refuses the signature; so does an
+  estimate that does not fit the operation's limits, `paymasterPostOpGasLimit` included, so the caller
+  re-quotes rather than the relayer editing a signed operation. This is not a guarantee of payment: ERC-4337 validation
   simulation does not promise that execution succeeds at inclusion, and an included operation that then
   reverts is still billed to the paymaster. What bounds the loss is the short signature lifetime, the fee
   floor and the deposit budget — the fork tests measure exactly that cost on a failed execution.
@@ -191,6 +193,19 @@ Review findings addressed in the current code:
   and subtracts the sponsorships already promised and not yet expired, so a burst of concurrent requests
   cannot each spend the same balance. Below `MIN_DEPOSIT_WEI` it stops signing and keeps answering `/status`;
   top the deposit up by hand to resume. `MAX_SPONSORSHIP_GAS_WEI` caps any single operation.
+- **A sponsorship is recorded before it is issued, and survives a restart.** The file store
+  (`SPONSORSHIP_STORE`) writes a signed sponsorship — nonce and gas cost as strings — before the signature is
+  returned; if the write fails the signature is dropped and the reservation released, so nothing is left
+  blocking the note. Reservations are never written. The store is opened at start-up, so an unwritable
+  location or an unreadable file stops the service instead of the first request (starting empty would allow
+  a second signature for a live note). Live entries written by an earlier release carry no gas cost: they
+  still deduplicate, and they are budgeted at `MAX_SPONSORSHIP_GAS_WEI` when it is set; otherwise the relayer
+  refuses new sponsorships until they expire, at most one signature lifetime after the upgrade. The fork
+  suite runs a complete withdrawal on the file store, restarts the relayer, and checks that the note is still
+  refused, the budget unchanged, and the next note served.
+- **The registration is read at signing.** Before each signature the registry must still resolve the
+  paymaster to the relayer the proof names; a master that has unregistered its worker stops new sponsorships
+  at once instead of letting `RelayerRegistry.burn` revert inside operations the paymaster pays for.
 - **Start-up refuses an incompatible deployment before it spends anything.** Network, EntryPoint, signing key,
   router, the worker to master relationship and the paymaster's `paymasterAndData` layout are all read first;
   a contract from an earlier release (whose terms were 297 bytes rather than 317) is rejected with no stake
@@ -198,9 +213,14 @@ Review findings addressed in the current code:
   field's meaning would need an explicit version in the contract, not a length check.
 - **ERC-7562.** The paymaster reads its own storage during validation, so it is staked (0.1 ETH by the setup;
   raise `PAYMASTER_STAKE_WEI` to whatever entity minimum the bundler you use enforces, typically 1 ETH).
-- **Hardening.** Live sponsorships can be persisted (`SPONSORSHIP_STORE`), and every on-chain setup action is
-  logged and can be disabled (`AUTO_SETUP=false`). A multi-instance relayer still needs a shared sponsorship
-  store. `/status` reports live numbers with the block they were read at, and says which are unavailable.
+- **A failed read is never an answer.** Start-up stops when a registry, fee, ownership or pool-type read
+  fails at the node (only a contract's own revert counts as an on-chain answer — for instance ETH pools
+  having no `token()`), and the worker to master check fails before anything is staked or deposited.
+  `/status` re-reads the deposit, stake, registration and per-pool burn on every call, returns them with the
+  block they were read at, and reports anything it could not read as `null` with the reason under
+  `unavailable` — never the start-up value and never a zero fee.
+- **Hardening.** Every on-chain setup action is logged and can be disabled (`AUTO_SETUP=false`). A
+  multi-instance relayer still needs a shared sponsorship store; the file store is single-process.
 - **Scope.** The supported deployment is the standalone worker contract registered under an existing relayer
   master. `PAYMASTER_MODE=7702`, where the relayer's own EOA is the paymaster, is experimental and refused at
   start-up in this release; the contract stays in the tree. This does not affect users' EIP-7702 senders.
@@ -227,6 +247,7 @@ MAINNET_RPC_URL=… AA_BUNDLER_DIR=…/eth-infinitism-bundler pnpm --filter @tor
 #   registry-burn        the normal flow in master and worker mode
 #   withdraw-swap-aave   withdraw -> swap -> Aave, and the TS/contract hash equality
 #   relayer-refusals     every request that must be refused *before* a signature exists
+#   relayer-restart      a complete withdrawal on the file store, a restart, and the note still refused
 #   execution-failure    an operation that reverts at inclusion, and the retry after it
 MAINNET_RPC_URL=… pnpm --filter @tornado-4337/client e2e          # ~1–2 min per suite from the committed fork cache
 pnpm --filter @tornado-4337/kohaku-integration setup && pnpm --filter @tornado-4337/kohaku-integration e2e   # real Kohaku SDK, Sepolia fork
@@ -447,11 +468,14 @@ Tornado-specific 的逻辑继续留在 relayer；bundler 只是通用基础设�
 - **sponsorship 绑定执行它的账户实现。** relayer 把 sender 将要运行的 EIP-7702 implementation（operation 自带的 authorization，没有就用当前 delegation）一起签进条款，paymaster 在验证阶段再链上核对 sender 的 delegation designator。签完之后把 authorization 换成别的 implementation 会被拒（`SenderImplementationMismatch`），已批准的提现不可能由 relayer 没见过的代码执行。主网 fork 上有对抗测试：签完 sponsorship 之后把 sender 重新委托到另一份字节码完全相同的账户实现，验证阶段会拒绝这笔 operation，于是不烧质押、note 也没被花掉。
 - **EntryPoint nonce 与 EOA nonce 分开。** SDK 用 `EntryPoint.getNonce` 取 operation 的 nonce，用 sender 的交易计数取 EIP-7702 authorization 的 nonce；sender 已经委托到 Simple7702Account 时干脆不带 authorization——这两种情况下两个计数就会错开。
 - **只赞助已知的账户实现。** 默认只有主网标准的 Simple7702Account，没有别的（`ALLOWED_SENDER_IMPLEMENTATIONS` 只能收窄或替换这个列表，没有任何写法等于"任意账户"）。绑定实现解决的是"哪段代码来执行"，但它无法判断那段代码是否真的按 relayer 校验过的调用去执行：一个 `execute` 直接忽略 calldata 的账户，会把赞助的 gas 花掉，却既不提现也不付手续费。fork 测试提交的正是这种请求——完全合法的提现 calldata，套在一个什么都不做的账户上——relayer 在签名前就拒绝。
-- **每个 sponsorship 签名前都要模拟。** `BUNDLER_URL` 是必填项；超时、HTTP 错误、JSON-RPC 错误、没有 result、result 里缺少可用 gas 字段，一律拒签；估算结果放不进这笔 operation 的 gas 上限时同样拒签，由调用方重新报价，而不是 relayer 去改一笔已签名的 operation。这不等于保证收款：ERC-4337 的验证期模拟本来就不保证执行阶段成功，已上链但执行失败的 operation 仍然由 paymaster 付 gas。真正约束损失的是短签名有效期、手续费下限和存款预算——fork 测试把执行失败这一笔的实际成本量了出来。
+- **每个 sponsorship 签名前都要模拟，而且关不掉。** `BUNDLER_URL` 是必填项，`SIMULATE_WITH_BUNDLER` 不再能关闭任何东西（旧配置里写 `true` 仍可启动，写其他值直接拒绝启动）。超时、HTTP 错误、JSON-RPC 错误、没有 result、result 缺少五个 gas 字段中的任何一个（两个 paymaster 上限也算在内），一律拒签；估算结果放不进这笔 operation 的上限时同样拒签（包括 `paymasterPostOpGasLimit`），由调用方重新报价，而不是 relayer 去改一笔已签名的 operation。这不等于保证收款：ERC-4337 的验证期模拟本来就不保证执行阶段成功，已上链但执行失败的 operation 仍然由 paymaster 付 gas。真正约束损失的是短签名有效期、手续费下限和存款预算——fork 测试把执行失败这一笔的实际成本量了出来。
 - **存款是预算，而且是实时查的。** 每次签名前读 EntryPoint 存款，减去已经承诺、尚未过期的 sponsorship，所以并发请求不会各自把同一份余额当成全部可用。低于 `MIN_DEPOSIT_WEI` 就停止签名、继续响应 `/status`，人工补款后恢复。`MAX_SPONSORSHIP_GAS_WEI` 限制单笔上限。
+- **sponsorship 先落盘再发出，重启后仍然有效。** 文件存储（`SPONSORSHIP_STORE`）在返回签名之前写入已签名的 sponsorship（nonce 和 gas 成本都以字符串保存）；写入失败就丢弃这个签名并释放预留，不会留下任何挡住这张 note 的记录。预留本身从不写盘。存储在启动时就打开，所以位置不可写或文件读不出来时服务直接起不来，而不是等到第一个请求才失败（空着启动会允许对仍有效的 note 再签一次）。上一个版本写入的仍有效条目没有 gas 成本：它们照样去重；设置了 `MAX_SPONSORSHIP_GAS_WEI` 时按这个上限计入预算，没设置时 relayer 在它们过期前拒绝新的 sponsorship，最长就是升级后的一个签名有效期。fork 测试用文件存储跑完一整笔提现，重启 relayer，再核对 note 仍被拒绝、预算不变、下一张 note 正常服务。
+- **签名时实时读注册关系。** 每次签名前 registry 必须仍然把 paymaster 解析到证明里写的那个 relayer；master 注销了 worker，就立刻停止新的 sponsorship，而不是让 `RelayerRegistry.burn` 在 paymaster 付过钱的 operation 里 revert。
 - **启动时先拒绝不兼容的部署，再谈花钱。** 网络、EntryPoint、签名密钥、router、worker→master 关系，以及 paymaster 的 `paymasterAndData` 布局，全部先只读核对；上一个版本部署的合约（terms 是 297 字节而不是 317）会被直接拒绝，不会花掉任何 stake 或 deposit，也不会悄悄再部署一个。将来如果出现长度相同但字段语义变了的修改，就需要合约里有显式版本号，而不是继续靠长度判断。
 - **ERC-7562。** paymaster 在验证阶段读自身存储，所以要质押（设置步骤质押 0.1 ETH；实际用哪个 bundler 就把 `PAYMASTER_STAKE_WEI` 提到它要求的实体门槛，一般是 1 ETH）。
-- **加固。** 进行中的 sponsorship 可持久化（`SPONSORSHIP_STORE`），所有链上设置动作都有日志且可关闭（`AUTO_SETUP=false`）。多实例 relayer 仍需共享的 sponsorship 存储。`/status` 返回的是实时数值，附带读取区块，读不到的字段明确标为不可用。
+- **读取失败不当作答案。** registry、手续费、合约 owner、池子类型的读取在节点层面失败时，启动直接停止（只有合约本身的 revert 才算链上答案，比如 ETH 池没有 `token()`）；worker→master 的核对在任何 stake 或 deposit 之前就会失败。`/status` 每次都重新读存款、stake、注册关系和各池子的 burn，附上读取区块；读不到的字段返回 `null`，原因写在 `unavailable` 里——绝不返回启动时的旧值，也绝不返回零手续费。
+- **加固。** 所有链上设置动作都有日志且可关闭（`AUTO_SETUP=false`）。多实例 relayer 仍需共享的 sponsorship 存储；文件存储只适用于单进程。
 - **适用范围。** 本版本支持的部署形态是：standalone worker 合约，注册在现有 relayer master 名下。`PAYMASTER_MODE=7702`（relayer 自己的 EOA 兼任 paymaster）是实验性的，本版本启动时直接拒绝，合约仍保留在仓库里。这不影响用户侧的 EIP-7702 sender。
 
 仍然是实验性实现，未经审计；上生产前需要审计。
@@ -476,6 +500,7 @@ MAINNET_RPC_URL=… AA_BUNDLER_DIR=…/eth-infinitism-bundler pnpm --filter @tor
 #   registry-burn        master / worker 两种模式下的正常流程
 #   withdraw-swap-aave   withdraw -> swap -> Aave，以及 TS 与合约的哈希一致性
 #   relayer-refusals     所有必须在签名之前被拒绝的请求
+#   relayer-restart      用文件存储跑完一笔提现、重启，note 仍被拒绝
 #   execution-failure    上链后执行失败的 operation，以及之后的重试
 MAINNET_RPC_URL=… pnpm --filter @tornado-4337/client e2e          # 有提交的 fork 缓存，每套约 1–2 分钟
 pnpm --filter @tornado-4337/kohaku-integration setup && pnpm --filter @tornado-4337/kohaku-integration e2e   # 真实 Kohaku SDK，Sepolia fork

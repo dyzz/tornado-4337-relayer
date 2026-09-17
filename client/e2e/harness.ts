@@ -1,5 +1,8 @@
 import { serve, type ServerType } from '@hono/node-server';
+import { mkdtempSync } from 'node:fs';
 import { createServer } from 'node:net';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { Instance } from 'prool';
 import {
   createPublicClient,
@@ -23,10 +26,12 @@ import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 import {
   createRelayerApp,
   ensurePaymasterSetup,
+  FileSponsorshipStore,
   FixedPriceSource,
   OneInchPriceSource,
   RelayerService,
   type PriceSource,
+  type RelayerConfig,
 } from '@tornado-4337/relayer';
 import { CHAINS, type ChainSetup } from '../src/chains.js';
 import { restoreForkCache } from './fork-cache.js';
@@ -83,7 +88,12 @@ export interface Harness {
   erc20Denomination: bigint;
   paymaster: Address;
   zap: Address;
-  relayer: RelayerService;
+  /** The running relayer service (a new instance after `restartRelayer()`). */
+  readonly relayer: RelayerService;
+  /** Where the relayer's sponsorships are persisted. */
+  sponsorshipFile: string;
+  /** Stop the relayer and start a new service on the same port and the same sponsorship file. */
+  restartRelayer(): Promise<void>;
   /** Address the proofs name as relayer: the paymaster, or the master EOA in worker mode. */
   rewardAccount: Address;
   /** Set when the harness wired the paymaster to the DAO router and registered it. */
@@ -154,6 +164,8 @@ export interface HarnessOptions {
   workerOf?: Address;
   /** Protocol fee (burn) set on the fresh instances, in 1e-4 (default 30 = 0.30 %, the DAO's ETH-1 setting). */
   protocolFeePercentage?: number;
+  /** Sponsorship store file (default: a fresh temporary file). */
+  sponsorshipFile?: string;
   anvilPort?: number;
   altoPort?: number;
   relayerPort?: number;
@@ -470,35 +482,45 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
     const rate = await priceSource.tokenPerEth(setup.demoErc20.address, setup.demoErc20.decimals);
     log(`1inch oracle: ${rate} ${setup.demoErc20.symbol}-units per ETH (${((Date.now() - t0) / 1000).toFixed(0)}s)`);
   }
-  const relayer = await RelayerService.create(
-    {
-      chainId: BigInt(chain.id),
-      rpcUrl,
-      bundlerUrl,
-      entryPoint: setup.entryPoint,
-      paymaster,
-      signerKey: relayerKey,
-      rewardAccount,
-      instances: opts.canonicalInstances
-        ? [...Object.values(setup.tornadoEth), ...(erc20 ? [erc20Instance] : [])]
-        : [instance, ...(erc20 ? [erc20Instance] : [])],
-      priceSource,
-      serviceFeeBps: opts.serviceFeeBps ?? 30n,
-      signatureTtlSec: 300,
-      simulateWithBundler: true,
-      // The harness's senders are Simple7702Account; the relayer refuses anything else.
-      allowedSenderImplementations: [setup.simple7702Implementation],
-      gasPriceMarginBps: 11_000n,
-      sponsorName: 'tornado-4337-relayer (e2e)',
-    },
-    { info: (m, meta) => log(`relayer: ${m} ${meta ? JSON.stringify(meta) : ''}`), warn: (m) => log(`relayer WARN: ${m}`) },
-  );
-  const relayerPort = opts.relayerPort ?? (await freePort());
-  const server: ServerType = await new Promise((resolve) => {
-    const s = serve({ fetch: createRelayerApp(relayer).fetch, port: relayerPort }, () => resolve(s));
+  // The relayer runs with the persistence and budget an operator would configure (relayer/.env.example):
+  // a file-backed sponsorship store and a deposit reserve. `restartRelayer()` replaces the service with a
+  // fresh one reading the same file, as a process restart would.
+  const sponsorshipFile = opts.sponsorshipFile ?? join(mkdtempSync(join(tmpdir(), 'relayer-store-')), 'sponsorships.json');
+  const relayerConfig = (): RelayerConfig => ({
+    chainId: BigInt(chain.id),
+    rpcUrl,
+    bundlerUrl,
+    entryPoint: setup.entryPoint,
+    paymaster,
+    signerKey: relayerKey,
+    rewardAccount,
+    instances: opts.canonicalInstances
+      ? [...Object.values(setup.tornadoEth), ...(erc20 ? [erc20Instance] : [])]
+      : [instance, ...(erc20 ? [erc20Instance] : [])],
+    priceSource,
+    serviceFeeBps: opts.serviceFeeBps ?? 30n,
+    signatureTtlSec: 300,
+    // The harness's senders are Simple7702Account; the relayer refuses anything else.
+    allowedSenderImplementations: [setup.simple7702Implementation],
+    sponsorshipStore: new FileSponsorshipStore(sponsorshipFile),
+    minDepositWei: parseEther('0.01'),
+    gasPriceMarginBps: 11_000n,
+    sponsorName: 'tornado-4337-relayer (e2e)',
   });
+  const relayerLog = {
+    info: (m: string, meta?: Record<string, unknown>) => log(`relayer: ${m} ${meta ? JSON.stringify(meta) : ''}`),
+    warn: (m: string) => log(`relayer WARN: ${m}`),
+  };
+  let relayer = await RelayerService.create(relayerConfig(), relayerLog);
+  const relayerPort = opts.relayerPort ?? (await freePort());
+  const listen = () =>
+    new Promise<ServerType>((resolve) => {
+      const s = serve({ fetch: createRelayerApp(relayer).fetch, port: relayerPort }, () => resolve(s));
+    });
+  const close = (s: ServerType) => new Promise<void>((r) => s.close(() => r()));
+  let server = await listen();
   const relayerUrl = `http://127.0.0.1:${relayerPort}`;
-  log(`relayer on ${relayerUrl}`);
+  log(`relayer on ${relayerUrl} (sponsorship store ${sponsorshipFile})`);
 
   return {
     setup,
@@ -518,7 +540,16 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
     erc20Denomination,
     paymaster,
     zap,
-    relayer,
+    get relayer() {
+      return relayer;
+    },
+    sponsorshipFile,
+    async restartRelayer() {
+      await close(server);
+      relayer = await RelayerService.create(relayerConfig(), relayerLog);
+      server = await listen();
+      log(`relayer restarted on ${relayerUrl}, sponsorships reloaded from ${sponsorshipFile}`);
+    },
     rewardAccount,
     registry,
     setBalance,
@@ -527,7 +558,7 @@ export async function startHarness(opts: HarnessOptions = {}): Promise<Harness> 
     mine,
     impersonated,
     async stop() {
-      await new Promise<void>((r) => server.close(() => r()));
+      await close(server);
       await altoInstance.stop();
       await anvilInstance.stop();
     },

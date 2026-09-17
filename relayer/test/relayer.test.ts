@@ -6,9 +6,10 @@ import { DEFAULT_GAS, minimumFee, serviceFeeFor } from '../src/fee.js';
 import { FixedPriceSource, parseDecimal, weiPerTokenFrom } from '../src/price.js';
 import { encodePaymasterData, DUMMY_SIGNATURE, EIP7702_INITCODE_MARKER, initCodeHash, isEip7702InitCode, packInitCode, paymasterHash, readGas, totalGas } from '../src/userop.js';
 import { decodeAccountCalls, findSponsoringWithdraw, ValidationError } from '../src/validate.js';
-import { MemorySponsorshipStore } from '../src/service.js';
+import { asGasEstimate, committedGasCost, MemorySponsorshipStore, type SponsoredNote } from '../src/service.js';
 import { FileSponsorshipStore } from '../src/store.js';
-import { mkdtempSync } from 'node:fs';
+import { configFromEnv } from '../src/config.js';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -280,19 +281,111 @@ describe('sponsorship store', () => {
     expect(store.reserve(NH, b).ok).toBe(true);
   });
 
-  it('file store persists signed sponsorships across instances, drops pending ones', () => {
+  it('file store: a signed entry survives a restart with every bigint intact, and still dedups and budgets', () => {
     const file = join(mkdtempSync(join(tmpdir(), 'sponsor-')), 'sponsorships.json');
-    const first = new FileSponsorshipStore(file);
+    const first = new FileSponsorshipStore(file, 1_000);
     const r = first.reserve(NH, a) as { ok: true; token: string };
-    expect(new FileSponsorshipStore(file).get(NH)).toBeUndefined(); // pending: not carried over
     first.commit(NH, r.token);
-    const second = new FileSponsorshipStore(file);
-    expect(second.reserve(NH, b).ok).toBe(false);
-    expect(second.get(NH)?.status).toBe('signed');
-    // Every bigint field survives the JSON round trip; the restored entry still counts against the budget.
-    expect(second.get(NH)?.nonce).toBe(0n);
-    expect(second.get(NH)?.maxGasCostWei).toBe(a.maxGasCostWei);
-    expect(second.outstanding(1_999_999_999).reduce((s, n) => s + (n.maxGasCostWei ?? 0n), 0n)).toBe(a.maxGasCostWei);
+
+    const restarted = new FileSponsorshipStore(file, 1_000);
+    expect(restarted.legacyEntries).toBe(0);
+    const note = restarted.get(NH)!;
+    expect(note.status).toBe('signed');
+    expect(note.sender).toBe(SENDER);
+    expect(note.nonce).toBe(0n);
+    expect(note.maxGasCostWei).toBe(a.maxGasCostWei);
+    // Still one sponsorship per note after the restart …
+    expect(restarted.reserve(NH, b).ok).toBe(false);
+    // … and still counted against the deposit.
+    expect(committedGasCost(restarted.outstanding(1_000))).toEqual({ known: true, wei: a.maxGasCostWei });
+    // Written as decimal strings.
+    expect(JSON.parse(readFileSync(file, 'utf8'))[NH]).toMatchObject({ nonce: '0', maxGasCostWei: a.maxGasCostWei.toString() });
+  });
+
+  it('file store: a reservation is never written; only a commit reaches the disk', () => {
+    const file = join(mkdtempSync(join(tmpdir(), 'sponsor-')), 'sponsorships.json');
+    const store = new FileSponsorshipStore(file, 1_000);
+    const r = store.reserve(NH, a) as { ok: true; token: string };
+    expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({});
+    expect(new FileSponsorshipStore(file, 1_000).get(NH)).toBeUndefined();
+    store.release(NH, r.token);
+    expect(store.get(NH)).toBeUndefined();
+  });
+
+  it('file store: a failed write leaves no pending entry behind and the note free for the next request', () => {
+    const file = join(mkdtempSync(join(tmpdir(), 'sponsor-')), 'sponsorships.json');
+    const store = new FileSponsorshipStore(file, 1_000);
+    const r = store.reserve(NH, a) as { ok: true; token: string };
+    // Make the write fail for real: the temporary path is now a directory.
+    mkdirSync(`${file}.tmp`);
+    expect(() => store.commit(NH, r.token)).toThrow();
+    // Nothing changed: not signed in memory, not on disk.
+    expect(store.get(NH)?.status).toBe('pending');
+    expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({});
+    // The signing path releases the reservation it could not record (RelayerService.sign does this).
+    store.release(NH, r.token);
+    expect(store.get(NH)).toBeUndefined();
+    expect(store.outstanding(1_000)).toEqual([]);
+    // Once the disk is writable again the same note can be sponsored.
+    rmdirSync(`${file}.tmp`);
+    const again = store.reserve(NH, b) as { ok: true; token: string };
+    expect(again.ok).toBe(true);
+    store.commit(NH, again.token);
+    expect(new FileSponsorshipStore(file, 1_000).get(NH)?.sender).toBe(MASTER);
+  });
+
+  it('file store: refuses to start on a file it cannot trust or a location it cannot write', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sponsor-'));
+    const garbage = join(dir, 'garbage.json');
+    writeFileSync(garbage, '{ not json');
+    expect(() => new FileSponsorshipStore(garbage)).toThrow();
+    const malformed = join(dir, 'malformed.json');
+    writeFileSync(malformed, JSON.stringify({ [NH]: { status: 'signed', validUntil: 'soon', nonce: '0', sender: SENDER } }));
+    expect(() => new FileSponsorshipStore(malformed)).toThrow(/malformed entry/);
+    // A path under a regular file cannot be created: start-up fails instead of the first request.
+    const blocker = join(dir, 'blocker');
+    writeFileSync(blocker, 'x');
+    expect(() => new FileSponsorshipStore(join(blocker, 'sponsorships.json'))).toThrow();
+  });
+
+  it('file store: entries from an earlier release keep their dedup, and their unknown cost is never counted as zero', () => {
+    const file = join(mkdtempSync(join(tmpdir(), 'sponsor-')), 'sponsorships.json');
+    const OTHER: Hex = `0x${'bb'.repeat(32)}`;
+    const PENDING: Hex = `0x${'cc'.repeat(32)}`;
+    // The format written before the deposit budget: no maxGasCostWei, pending entries included.
+    writeFileSync(
+      file,
+      JSON.stringify({
+        [NH]: { validUntil: 2_000, sender: SENDER, nonce: '3', status: 'signed', token: 't1' },
+        [OTHER]: { validUntil: 500, sender: SENDER, nonce: '4', status: 'signed', token: 't2' }, // expired
+        [PENDING]: { validUntil: 2_000, sender: SENDER, nonce: '5', status: 'pending', token: 't3' },
+      }),
+    );
+    const store = new FileSponsorshipStore(file, 1_000);
+    expect(store.legacyEntries).toBe(1);
+    expect(store.get(NH)?.nonce).toBe(3n);
+    expect(store.get(NH)?.maxGasCostWei).toBeUndefined();
+    expect(store.get(OTHER)).toBeUndefined();
+    expect(store.get(PENDING)).toBeUndefined();
+    expect(store.reserve(NH, a).ok).toBe(false);
+    // Without a per-operation cap the budget is unknown until the entry expires …
+    expect(committedGasCost(store.outstanding(1_000))).toEqual({ known: false, unknown: 1, until: 2_000 });
+    // … with one, the entry is budgeted at the cap.
+    expect(committedGasCost(store.outstanding(1_000), 7n)).toEqual({ known: true, wei: 7n });
+    // After it expires the budget is known again.
+    store.prune(2_001);
+    expect(committedGasCost(store.outstanding(2_001))).toEqual({ known: true, wei: 0n });
+    // The rewrite at start-up dropped the expired and the pending entry.
+    expect(Object.keys(JSON.parse(readFileSync(file, 'utf8')))).toEqual([NH]);
+  });
+
+  it('commit refuses a reservation the request no longer holds', () => {
+    const store = new MemorySponsorshipStore();
+    const r = store.reserve(NH, a) as { ok: true; token: string };
+    expect(() => store.commit(NH, 'not-the-holder')).toThrow(/no longer held/);
+    store.prune(2_000_000_001);
+    expect(() => store.commit(NH, r.token)).toThrow(/no longer held/);
+    expect(store.get(NH)).toBeUndefined();
   });
 
   it('outstanding() counts live sponsorships and forgets expired ones', () => {
@@ -304,5 +397,110 @@ describe('sponsorship store', () => {
     expect(store.outstanding(1_000).map((n) => n.status)).toEqual(['signed']);
     // Past its validUntil it is nobody's liability any more.
     expect(store.outstanding(2_000_000_001)).toEqual([]);
+  });
+
+  it('committedGasCost sums known costs and budgets unknown ones only at an explicit cap', () => {
+    const note = (validUntil: number, maxGasCostWei?: bigint): SponsoredNote => ({
+      validUntil,
+      sender: SENDER,
+      nonce: 0n,
+      status: 'signed',
+      token: 't',
+      maxGasCostWei,
+    });
+    expect(committedGasCost([])).toEqual({ known: true, wei: 0n });
+    expect(committedGasCost([note(10, 3n), note(10, 4n)])).toEqual({ known: true, wei: 7n });
+    expect(committedGasCost([note(10, 3n), note(20), note(15)])).toEqual({ known: false, unknown: 2, until: 20 });
+    expect(committedGasCost([note(10, 3n), note(20)], 100n)).toEqual({ known: true, wei: 103n });
+  });
+});
+
+describe('bundler estimate', () => {
+  const full = {
+    callGasLimit: '0x10',
+    verificationGasLimit: '0x20',
+    preVerificationGas: '0x30',
+    paymasterVerificationGasLimit: '0x40',
+    paymasterPostOpGasLimit: '0x50',
+  };
+
+  it('parses a complete estimate', () => {
+    expect(asGasEstimate(full, true)).toEqual({
+      ok: true,
+      estimate: {
+        callGasLimit: 16n,
+        verificationGasLimit: 32n,
+        preVerificationGas: 48n,
+        paymasterVerificationGasLimit: 64n,
+        paymasterPostOpGasLimit: 80n,
+      },
+    });
+  });
+
+  it('requires both paymaster limits for an op with a paymaster, and says which one is missing', () => {
+    const { paymasterPostOpGasLimit: _, ...noPostOp } = full;
+    expect(asGasEstimate(noPostOp, true)).toEqual({ ok: false, reason: 'paymasterPostOpGasLimit is missing' });
+    const { paymasterVerificationGasLimit: __, ...noVerif } = full;
+    expect(asGasEstimate(noVerif, true)).toMatchObject({ ok: false, reason: 'paymasterVerificationGasLimit is missing' });
+    // Without a paymaster they are not part of the estimate.
+    expect(asGasEstimate(noPostOp, false).ok).toBe(true);
+  });
+
+  it('rejects bodies that are not estimates', () => {
+    expect(asGasEstimate(null, true).ok).toBe(false);
+    expect(asGasEstimate([], true).ok).toBe(false);
+    expect(asGasEstimate({ ok: true }, true)).toMatchObject({ ok: false, reason: 'callGasLimit is missing' });
+    expect(asGasEstimate({ ...full, callGasLimit: 'lots' }, true)).toMatchObject({ ok: false, reason: expect.stringMatching(/not a quantity/) });
+    expect(asGasEstimate({ ...full, preVerificationGas: -1 }, true).ok).toBe(false);
+  });
+});
+
+describe('config', () => {
+  const base = {
+    RELAYER_PRIVATE_KEY: `0x${'11'.repeat(32)}`,
+    CHAIN_ID: '11155111',
+    RPC_URL: 'http://127.0.0.1:1',
+    BUNDLER_URL: 'http://127.0.0.1:2',
+    TORNADO_INSTANCES: INSTANCE,
+  };
+  const withEnv = <T>(env: Record<string, string | undefined>, fn: () => T): T => {
+    const saved = { ...process.env };
+    for (const k of ['SIMULATE_WITH_BUNDLER', 'ALLOWED_SENDER_IMPLEMENTATIONS', 'SPONSORSHIP_STORE', 'BUNDLER_URL', 'PRICE_SOURCE']) delete process.env[k];
+    Object.assign(process.env, base);
+    for (const [k, v] of Object.entries(env)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    try {
+      return fn();
+    } finally {
+      process.env = saved;
+    }
+  };
+
+  it('defaults the sponsored implementations to Simple7702Account and never to "any"', () => {
+    expect(withEnv({}, () => configFromEnv(PAYMASTER).allowedSenderImplementations)).toEqual([
+      '0xe6Cae83BdE06E4c305530e199D7217f42808555B',
+    ]);
+    expect(() => withEnv({ ALLOWED_SENDER_IMPLEMENTATIONS: '' }, () => configFromEnv(PAYMASTER))).toThrow(/empty/);
+    expect(() => withEnv({ ALLOWED_SENDER_IMPLEMENTATIONS: ' , ' }, () => configFromEnv(PAYMASTER))).toThrow(/empty/);
+  });
+
+  it('cannot switch the pre-signing simulation off, and needs a bundler', () => {
+    expect(() => withEnv({ SIMULATE_WITH_BUNDLER: 'false' }, () => configFromEnv(PAYMASTER))).toThrow(/cannot be disabled/);
+    expect(() => withEnv({ SIMULATE_WITH_BUNDLER: '0' }, () => configFromEnv(PAYMASTER))).toThrow(/cannot be disabled/);
+    // Older .env files that say `true` keep working.
+    expect(withEnv({ SIMULATE_WITH_BUNDLER: 'true' }, () => configFromEnv(PAYMASTER)).bundlerUrl).toBe(base.BUNDLER_URL);
+    expect(() => withEnv({ BUNDLER_URL: undefined }, () => configFromEnv(PAYMASTER))).toThrow(/BUNDLER_URL/);
+  });
+
+  it('opens the sponsorship store at configuration time, so an unusable one stops the start-up', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sponsor-'));
+    const ok = join(dir, 'nested', 'sponsorships.json');
+    expect(withEnv({ SPONSORSHIP_STORE: ok }, () => configFromEnv(PAYMASTER)).sponsorshipStore).toBeDefined();
+    expect(existsSync(ok)).toBe(true);
+    const blocker = join(dir, 'blocker');
+    writeFileSync(blocker, 'x');
+    expect(() => withEnv({ SPONSORSHIP_STORE: join(blocker, 'x.json') }, () => configFromEnv(PAYMASTER))).toThrow();
   });
 });

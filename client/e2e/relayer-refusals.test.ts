@@ -9,157 +9,21 @@
  *   MAINNET_RPC_URL=… npx vitest run e2e/relayer-refusals.test.ts
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import {
-  createWalletClient,
-  encodeFunctionData,
-  http,
-  parseEther,
-  toHex,
-  type Address,
-  type Hex,
-} from 'viem';
+import { mkdirSync, rmdirSync } from 'node:fs';
+import { createWalletClient, http, parseEther, toHex, zeroAddress, type Address, type Hex } from 'viem';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 
-import { delegationCode, ensurePaymasterSetup, RelayerService } from '@tornado-4337/relayer';
-import { paymasterAdminAbi, relayerRegistryAbi, tornadoAbi } from '../src/abi.js';
+import { ensurePaymasterSetup, MemorySponsorshipStore, RelayerService } from '@tornado-4337/relayer';
+import { relayerRegistryAbi } from '../src/abi.js';
 import { loadArtifacts } from '../src/artifacts.js';
 import { forgeArtifact } from '../src/deploy.js';
-import { merklePath, syncLeaves } from '../src/merkle.js';
-import { commitmentHex, createNote, nullifierHashHex, type Note } from '../src/note.js';
+import { nullifierHashHex } from '../src/note.js';
 import { createTornadoProver, type TornadoProver } from '../src/prover.js';
 import { RelayerRpc } from '../src/relayerClient.js';
 import { startHarness, type Harness } from './harness.js';
+import { askForSponsorship, shield, sponsorshipRequest, startFailingRpc, startStubBundler } from './sponsorship-request.js';
 
 const log = (m: string) => console.log(`[e2e-refusals] ${m}`);
-
-/** Shield a note into the harness pool and return it with the pool's leaves. */
-async function shield(h: Harness): Promise<{ note: Note; leaves: (bigint | string)[] }> {
-  const depositor = await h.newFundedAccount(parseEther('10'));
-  const wallet = createWalletClient({ account: depositor, chain: h.setup.chain, transport: http(h.rpcUrl) });
-  const note = createNote();
-  const hash = await wallet.writeContract({
-    address: h.instance,
-    abi: tornadoAbi,
-    functionName: 'deposit',
-    args: [commitmentHex(note)],
-    value: h.denomination,
-  });
-  const receipt = await h.publicClient.waitForTransactionReceipt({ hash });
-  // Sync up to the deposit's own block: the node's reported head can still lag the receipt.
-  const { leaves } = await syncLeaves(h.publicClient, h.instance, {
-    fromBlock: h.instanceDeployBlock,
-    toBlock: receipt.blockNumber,
-    log,
-  });
-  return { note, leaves };
-}
-
-/**
- * A complete, valid sponsorship request for `note`, as the client would build it: a real proof naming
- * `sender` as recipient and the master as relayer, wrapped in the account's `executeBatch` calldata.
- * `senderImplementation` decides what the op's EIP-7702 authorization points at.
- */
-async function sponsorshipRequest(
-  h: Harness,
-  prover: TornadoProver,
-  note: Note,
-  leaves: (bigint | string)[],
-  owner: ReturnType<typeof privateKeyToAccount>,
-  senderImplementation: Address,
-): Promise<{ op: Record<string, unknown>; fee: bigint }> {
-  const rpc = new RelayerRpc(h.relayerUrl);
-  const quote = await rpc.quote({ instance: h.instance, tailCallsGas: 60_000n });
-  const path = merklePath(leaves, note.commitment);
-  const proof = await prover.prove({
-    nullifier: note.nullifier,
-    secret: note.secret,
-    pathElements: path.pathElements,
-    pathIndices: path.pathIndices,
-    root: path.root,
-    nullifierHash: note.nullifierHash,
-    recipient: BigInt(owner.address),
-    relayer: BigInt(quote.relayer),
-    fee: quote.fee,
-    refund: 0n,
-  });
-  const [root, nullifierHash, recipient, relayerArg, feeArg] = proof.args;
-  const withdraw = {
-    target: h.paymaster,
-    value: 0n,
-    data: encodeFunctionData({
-      abi: paymasterAdminAbi,
-      functionName: 'relayWithdraw',
-      args: [h.instance, proof.proof, root, nullifierHash, recipient, relayerArg, BigInt(feeArg)],
-    }),
-  };
-  const callData = encodeFunctionData({
-    abi: [
-      {
-        type: 'function',
-        name: 'executeBatch',
-        stateMutability: 'nonpayable',
-        inputs: [
-          {
-            name: 'calls',
-            type: 'tuple[]',
-            components: [
-              { name: 'target', type: 'address' },
-              { name: 'value', type: 'uint256' },
-              { name: 'data', type: 'bytes' },
-            ],
-          },
-        ],
-        outputs: [],
-      },
-    ],
-    functionName: 'executeBatch',
-    args: [[withdraw]],
-  });
-  const authorization = await owner.signAuthorization({
-    address: senderImplementation,
-    chainId: h.setup.chain.id,
-    nonce: await h.publicClient.getTransactionCount({ address: owner.address }),
-  });
-  return {
-    fee: quote.fee,
-    op: {
-      sender: owner.address,
-      nonce: toHex(0n),
-      factory: '0x7702',
-      callData,
-      callGasLimit: toHex(quote.gas.callGasLimit),
-      verificationGasLimit: toHex(quote.gas.verificationGasLimit),
-      preVerificationGas: toHex(quote.gas.preVerificationGas),
-      paymasterVerificationGasLimit: toHex(quote.gas.paymasterVerificationGasLimit),
-      paymasterPostOpGasLimit: toHex(quote.gas.paymasterPostOpGasLimit),
-      maxFeePerGas: toHex(quote.maxFeePerGas),
-      maxPriorityFeePerGas: toHex(quote.maxPriorityFeePerGas),
-      eip7702Auth: {
-        address: senderImplementation,
-        chainId: toHex(authorization.chainId),
-        nonce: toHex(authorization.nonce),
-        r: authorization.r,
-        s: authorization.s,
-        yParity: toHex(authorization.yParity!),
-      },
-    },
-  };
-}
-
-/** `pm_getPaymasterData` as a client would call it, returning the JSON-RPC error when refused. */
-async function askForSponsorship(h: Harness, op: Record<string, unknown>) {
-  const res = await fetch(h.relayerUrl, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      jsonrpc: '2.0',
-      id: 1,
-      method: 'pm_getPaymasterData',
-      params: [op, h.setup.entryPoint, toHex(BigInt(h.setup.chain.id)), {}],
-    }),
-  });
-  return (await res.json()) as { result?: { paymasterData?: Hex }; error?: { code: number; message: string } };
-}
 
 describe('the relayer refuses to sign', () => {
   let h: Harness;
@@ -217,6 +81,20 @@ describe('the relayer refuses to sign', () => {
       ['JSON-RPC error', async () => Response.json({ jsonrpc: '2.0', id: 1, error: { code: -32521, message: 'AA33 reverted' } })],
       ['empty result', async () => Response.json({ jsonrpc: '2.0', id: 1 })],
       ['result without gas fields', async () => Response.json({ jsonrpc: '2.0', id: 1, result: { ok: true } })],
+      [
+        'result without paymasterPostOpGasLimit',
+        async () =>
+          Response.json({
+            jsonrpc: '2.0',
+            id: 1,
+            result: {
+              callGasLimit: toHex(1n),
+              verificationGasLimit: toHex(1n),
+              preVerificationGas: toHex(1n),
+              paymasterVerificationGasLimit: toHex(1n),
+            },
+          }),
+      ],
     ] as const) {
       const stub = await startStubBundler(handler);
       (h.relayer.config as { bundlerUrl: string }).bundlerUrl = stub.url;
@@ -256,6 +134,8 @@ describe('the relayer refuses to sign', () => {
           callGasLimit: toHex(50_000_000n),
           verificationGasLimit: toHex(100_000n),
           preVerificationGas: toHex(60_000n),
+          paymasterVerificationGasLimit: toHex(1n),
+          paymasterPostOpGasLimit: toHex(1n),
         },
       }),
     );
@@ -269,6 +149,62 @@ describe('the relayer refuses to sign', () => {
       await stub.stop();
       (h.relayer.config as { bundlerUrl: string }).bundlerUrl = realBundler;
     }
+  }, 300_000);
+
+  it('an estimate where only paymasterPostOpGasLimit exceeds the operation', async () => {
+    const { note, leaves } = await shield(h);
+    const owner = privateKeyToAccount(generatePrivateKey());
+    const { op } = await sponsorshipRequest(h, prover, note, leaves, owner, h.setup.simple7702Implementation);
+    const realBundler = h.relayer.config.bundlerUrl;
+    // Every other field fits comfortably; postOp needs one gas more than the operation allows. A postOp
+    // that runs out of gas reverts the execution after the paymaster has paid, fee transfer included.
+    const postOpLimit = BigInt(op.paymasterPostOpGasLimit as Hex);
+    const stub = await startStubBundler(async () =>
+      Response.json({
+        jsonrpc: '2.0',
+        id: 1,
+        result: {
+          callGasLimit: toHex(1n),
+          verificationGasLimit: toHex(1n),
+          preVerificationGas: toHex(1n),
+          paymasterVerificationGasLimit: toHex(1n),
+          paymasterPostOpGasLimit: toHex(postOpLimit + 1n),
+        },
+      }),
+    );
+    (h.relayer.config as { bundlerUrl: string }).bundlerUrl = stub.url;
+    try {
+      const res = await askForSponsorship(h, op);
+      expect(res.result).toBeUndefined();
+      expect(res.error!.message).toMatch(new RegExp(`paymasterPostOpGasLimit ${postOpLimit} < ${postOpLimit + 1n}`));
+      expect(res.error!.message).not.toMatch(/callGasLimit|verificationGasLimit \d|preVerificationGas/);
+      expect(h.relayer.sponsorships.get(nullifierHashHex(note))).toBeUndefined();
+    } finally {
+      await stub.stop();
+      (h.relayer.config as { bundlerUrl: string }).bundlerUrl = realBundler;
+    }
+  }, 300_000);
+
+  it('a sponsorship it cannot record, and leaves nothing behind that would block the note', async () => {
+    const { note, leaves } = await shield(h);
+    const owner = privateKeyToAccount(generatePrivateKey());
+    const { op } = await sponsorshipRequest(h, prover, note, leaves, owner, h.setup.simple7702Implementation);
+    const nullifier = nullifierHashHex(note);
+    // The store's write fails for real: its temporary path is a directory.
+    const blocker = `${h.sponsorshipFile}.tmp`;
+    mkdirSync(blocker);
+    try {
+      const res = await askForSponsorship(h, op);
+      expect(res.result, 'an unrecorded signature must not be issued').toBeUndefined();
+      expect(res.error!.message).toMatch(/could not record the sponsorship, not issuing it/);
+      expect(h.relayer.sponsorships.get(nullifier), 'no pending residue').toBeUndefined();
+    } finally {
+      rmdirSync(blocker);
+    }
+    // The very next request for the same note is signed and recorded.
+    const ok = await askForSponsorship(h, op);
+    expect(ok.error).toBeUndefined();
+    expect(h.relayer.sponsorships.get(nullifier)?.status).toBe('signed');
   }, 300_000);
 
   it('once the EntryPoint deposit cannot cover the sponsorships already promised', async () => {
@@ -384,28 +320,35 @@ describe('the relayer refuses to sign', () => {
     expect(await h.publicClient.getBalance({ address: h.relayerSigner.address })).toBe(before);
   }, 300_000);
 
-  it('when the registry no longer resolves the worker to the configured master', async () => {
-    // The master unregisters the worker while the service is running: /status must show it, rather than
-    // repeating what was true at start-up.
+  it('while the registry no longer resolves the worker to the configured master', async () => {
+    // The master unregisters the worker while the service is running. A request must be refused at
+    // signing — Router -> RelayerRegistry.burn would otherwise revert inside an operation the paymaster
+    // pays for — and /status must show the change rather than what start-up saw.
     const reg = h.registry!;
+    const { note, leaves } = await shield(h);
+    const owner = privateKeyToAccount(generatePrivateKey());
+    const { op } = await sponsorshipRequest(h, prover, note, leaves, owner, h.setup.simple7702Implementation);
+    const nullifier = nullifierHashHex(note);
+    const unregister = [{ type: 'function', name: 'unregisterWorker', stateMutability: 'nonpayable', inputs: [{ type: 'address' }], outputs: [] }] as const;
     await h.impersonated(reg.master, (w) =>
-      w.writeContract({
-        address: reg.relayerRegistry,
-        abi: [{ type: 'function', name: 'unregisterWorker', stateMutability: 'nonpayable', inputs: [{ type: 'address' }], outputs: [] }] as const,
-        functionName: 'unregisterWorker',
-        args: [h.paymaster],
-        chain: h.setup.chain,
-        account: w.account!,
-      }),
+      w.writeContract({ address: reg.relayerRegistry, abi: unregister, functionName: 'unregisterWorker', args: [h.paymaster], chain: h.setup.chain, account: w.account! }),
     );
     try {
+      const res = await askForSponsorship(h, op);
+      expect(res.result).toBeUndefined();
+      expect(res.error!.message).toMatch(/resolves paymaster .* to no relayer, not .*: not signing until the registration is restored/);
+      expect(h.relayer.sponsorships.get(nullifier)).toBeUndefined();
+
       const status = await new RelayerRpc(h.relayerUrl).request<{
-        registry: { mode: string; master: Address; masterAtStartup: Address };
+        registered: boolean;
+        registry: { mode: string; master: Address; modeAtStartup: string; masterAtStartup: Address };
       }>('tornado_status');
+      expect(status.registered).toBe(false);
       expect(status.registry.mode).toBe('unregistered');
+      expect(status.registry.master).toBe(zeroAddress);
+      expect(status.registry.modeAtStartup).toBe('worker');
       expect(status.registry.masterAtStartup.toLowerCase()).toBe(reg.master.toLowerCase());
-      expect(status.registry.master).not.toBe(status.registry.masterAtStartup);
-      log(`registry change visible in /status: ${status.registry.mode}`);
+      log(`unregistered: request refused (${res.error!.message.slice(0, 80)}…), /status mode=${status.registry.mode}`);
     } finally {
       await h.impersonated(reg.master, (w) =>
         w.writeContract({
@@ -418,28 +361,89 @@ describe('the relayer refuses to sign', () => {
         }),
       );
     }
-    const restored = await new RelayerRpc(h.relayerUrl).request<{ registry: { mode: string } }>('tornado_status');
+    // Registered again: the same request is signed, and /status agrees.
+    const ok = await askForSponsorship(h, op);
+    expect(ok.error).toBeUndefined();
+    expect(h.relayer.sponsorships.get(nullifier)?.status).toBe('signed');
+    const restored = await new RelayerRpc(h.relayerUrl).request<{ registered: boolean; registry: { mode: string } }>('tornado_status');
+    expect(restored.registered).toBe(true);
     expect(restored.registry.mode).toBe('worker');
   }, 300_000);
-});
 
-/** A one-request JSON-RPC server standing in for the bundler. */
-async function startStubBundler(handler: () => Promise<Response>): Promise<{ url: string; stop(): Promise<void> }> {
-  const { createServer } = await import('node:http');
-  const { freePort } = await import('./harness.js');
-  const port = await freePort();
-  const server = createServer(async (_req, res) => {
-    const out = await handler();
-    const body = await out.text();
-    res.writeHead(out.status, { 'content-type': out.headers.get('content-type') ?? 'text/plain' }).end(body);
-  });
-  await new Promise<void>((r) => server.listen(port, '127.0.0.1', r));
-  return {
-    url: `http://127.0.0.1:${port}`,
-    stop: () =>
-      new Promise((r) => {
-        server.closeAllConnections?.();
-        server.close(() => r());
-      }),
-  };
-}
+  it('a node that fails a registry read: start-up stops, /status says unavailable, never a zero fee', async () => {
+    const proxy = await startFailingRpc(h.rpcUrl, ['instanceFee(address)']);
+    const quiet = { info: () => {}, warn: () => {} };
+    const config = () => ({ ...h.relayer.config, rpcUrl: proxy.url, sponsorshipStore: new MemorySponsorshipStore() });
+    try {
+      // With the FeeManager read failing, the service does not start (it would otherwise report 0 burn).
+      await expect(RelayerService.create(config(), quiet)).rejects.toThrow(/injected node failure/);
+
+      // Started while the node was healthy, then the read fails: /status reports it, with the reason.
+      proxy.failing = false;
+      const service = await RelayerService.create(config(), quiet);
+      proxy.failing = true;
+      const status = await service.status();
+      expect(status.registry.mode).toBeNull();
+      expect(status.registry.burnPerWithdraw).toBeNull();
+      expect(status.registry.stake).toBeNull();
+      expect(status.registered).toBeNull();
+      expect(status.unavailable.registry).toMatch(/injected node failure/);
+      // The fields that could be read still are.
+      expect(status.deposit.wei).not.toBeNull();
+      proxy.failing = false;
+      const healthy = await service.status();
+      expect(healthy.registry.mode).toBe('worker');
+      expect(healthy.unavailable).toEqual({});
+      // Healthy again, the value is whatever the FeeManager itself returns (a fresh pool's stored fee is
+      // zero until the router's first withdrawal updates it — a real zero, read from the chain).
+      const feeManagerAbi = [
+        { type: 'function', name: 'instanceFee', stateMutability: 'view', inputs: [{ type: 'address' }], outputs: [{ type: 'uint160' }] },
+      ] as const;
+      const burn = Object.entries(healthy.registry.burnPerWithdraw!).find(([k]) => k.toLowerCase() === h.instance.toLowerCase());
+      expect(burn, 'the pool is reported').toBeDefined();
+      expect(BigInt(burn![1])).toBe(
+        BigInt(await h.publicClient.readContract({ address: h.registry!.feeManager, abi: feeManagerAbi, functionName: 'instanceFee', args: [h.instance] })),
+      );
+    } finally {
+      await proxy.stop();
+    }
+  }, 300_000);
+
+  it('a start-up that cannot read the worker -> master relationship, or finds another master, before any funding', async () => {
+    const reg = h.registry!;
+    const cfg = {
+      chainId: BigInt(h.setup.chain.id),
+      rpcUrl: h.rpcUrl,
+      entryPoint: h.setup.entryPoint,
+      signerKey: h.relayerSignerKey,
+      mode: 'standalone' as const,
+      paymaster: h.paymaster,
+      router: reg.router,
+      rewardAccount: reg.master,
+      autoSetup: true,
+      stakeWei: parseEther('5'), // more than is staked: a passing preflight would go on to stake
+      unstakeDelaySec: 86_400,
+      depositWei: parseEther('5'),
+      requireRegistration: false,
+    };
+    const quiet = { info: () => {}, warn: () => {} };
+    const before = await h.publicClient.getBalance({ address: h.relayerSigner.address });
+
+    // The registry answers, and names a different master than the one configured.
+    const stranger = privateKeyToAccount(generatePrivateKey()).address;
+    await expect(ensurePaymasterSetup({ ...cfg, rewardAccount: stranger }, quiet)).rejects.toThrow(
+      new RegExp(`resolves paymaster ${h.paymaster} to master ${reg.master}, but REWARD_ACCOUNT is ${stranger}`, 'i'),
+    );
+
+    // The registry read fails: that is not "not registered yet".
+    const proxy = await startFailingRpc(h.rpcUrl, ['workers(address)']);
+    try {
+      await expect(ensurePaymasterSetup({ ...cfg, rpcUrl: proxy.url }, quiet)).rejects.toThrow(
+        /cannot read the worker -> master relationship .*injected node failure.*nothing has been staked or deposited/s,
+      );
+    } finally {
+      await proxy.stop();
+    }
+    expect(await h.publicClient.getBalance({ address: h.relayerSigner.address })).toBe(before);
+  }, 300_000);
+});

@@ -1,6 +1,8 @@
 import {
   BaseError,
   ContractFunctionRevertedError,
+  ContractFunctionZeroDataError,
+  ExecutionRevertedError,
   createPublicClient,
   decodeErrorResult,
   getAddress,
@@ -47,8 +49,15 @@ export interface RelayerConfig {
   chainId: bigint;
   rpcUrl: string;
   /**
-   * Bundler RPC (Pimlico / alto). Required: every sponsorship is simulated there before it is signed,
-   * and the quote's gas price comes from it. A configuration without one is refused at start-up.
+   * Bundler RPC (Pimlico / alto). Required: every sponsorship is simulated there before it is signed
+   * (`eth_estimateUserOperationGas`, which exercises the execution phase — the withdrawal and the
+   * caller's tail calls — as well as validation), and the quote's gas price comes from it. There is no
+   * way to switch the simulation off, and a configuration without a bundler is refused at start-up.
+   *
+   * The simulation is not a guarantee of payment. ERC-4337 validation-phase simulation does not promise
+   * that execution succeeds at inclusion time, and a UserOperation that lands and then reverts in
+   * execution is still paid for by the paymaster. The bounded exposure comes from the short signature
+   * lifetime, the per-operation fee floor and the deposit budget, not from this call.
    */
   bundlerUrl: string;
   entryPoint: Address;
@@ -83,17 +92,6 @@ export interface RelayerConfig {
   serviceFeeBps: bigint;
   /** How long a signature stays valid. Keep short: the fee is quoted at signing time. */
   signatureTtlSec: number;
-  /**
-   * Run eth_estimateUserOperationGas on the bundler before signing. Leave on: it is the only check that
-   * exercises the *execution* phase (the withdrawal plus the caller's tail calls) before the relayer
-   * commits its signature. Turning it off is for tests with no bundler.
-   *
-   * It is not a guarantee of payment. ERC-4337 validation-phase simulation does not promise that
-   * execution succeeds at inclusion time, and a UserOperation that lands and then reverts in execution
-   * is still paid for by the paymaster. The bounded exposure comes from the short signature lifetime,
-   * the per-operation fee floor and the deposit budget, not from this call.
-   */
-  simulateWithBundler: boolean;
   /** Per-request timeout for bundler JSON-RPC calls (default 20 s). A timeout refuses the sponsorship. */
   bundlerTimeoutMs?: number;
   /**
@@ -234,15 +232,24 @@ export interface SponsoredNote {
  * sponsorship is never dropped by a later failed request. The default is in-memory; the file store
  * survives restarts. Several relayer instances sharing a key need a shared store whose `reserve` is
  * atomic on the backend (SETNX-style), not these.
+ *
+ * Durability is only owed to *signed* entries: a pending reservation belongs to a request that is still
+ * in this process and dies with it. So `reserve`, `release` and `prune` never touch durable storage and
+ * cannot fail for storage reasons, and `commit` writes before it changes anything — if it throws, the
+ * entry is exactly as it was (still pending) and the caller must not issue the signature.
  */
 export interface SponsorshipStore {
   get(nullifierHash: Hex): SponsoredNote | undefined;
-  /** Atomically claim the note as `pending`; refused while any unexpired entry exists. */
+  /** Atomically claim the note as `pending`; refused while any unexpired entry exists. No I/O. */
   reserve(nullifierHash: Hex, note: Omit<SponsoredNote, 'status' | 'token'>): { ok: true; token: string } | { ok: false; held: SponsoredNote };
-  /** Mark the reservation `token` holds as signed. */
+  /**
+   * Record the reservation `token` holds as signed, durably, before returning. Throws — leaving the
+   * entry pending — when it cannot be recorded or when `token` no longer holds the reservation.
+   */
   commit(nullifierHash: Hex, token: string): void;
-  /** Drop the reservation `token` holds if it is still pending (no-op otherwise). */
+  /** Drop the reservation `token` holds if it is still pending (no-op otherwise). No I/O. */
   release(nullifierHash: Hex, token: string): void;
+  /** Forget entries that expired before `now`. No I/O: a durable copy of an expired entry is harmless. */
   prune(now: number): void;
   /** Every entry still live at `now`: pending and signed sponsorships the paymaster may still pay for. */
   outstanding(now: number): SponsoredNote[];
@@ -254,33 +261,62 @@ export class MemorySponsorshipStore implements SponsorshipStore {
   get(k: Hex) {
     return this.notes.get(k);
   }
-  protected set(k: Hex, v: SponsoredNote) {
-    this.notes.set(k, v);
-  }
-  protected delete(k: Hex) {
-    this.notes.delete(k);
-  }
   reserve(k: Hex, note: Omit<SponsoredNote, 'status' | 'token'>): { ok: true; token: string } | { ok: false; held: SponsoredNote } {
     const held = this.notes.get(k);
     if (held) return { ok: false, held };
     const token = `${Date.now()}-${++this.seq}`;
-    this.set(k, { ...note, status: 'pending', token });
+    this.notes.set(k, { ...note, status: 'pending', token });
     return { ok: true, token };
   }
   commit(k: Hex, token: string) {
     const held = this.notes.get(k);
-    if (held && held.token === token) this.set(k, { ...held, status: 'signed' });
+    if (!held || held.token !== token) {
+      // Losing the reservation mid-request means another request may now own the note: never
+      // record a signature for it.
+      throw new Error(`sponsorship reservation for ${k} is no longer held by this request`);
+    }
+    const next: SponsoredNote = { ...held, status: 'signed' };
+    this.persistSigned(k, next); // durable stores write first; a throw leaves memory untouched
+    this.notes.set(k, next);
   }
   release(k: Hex, token: string) {
     const held = this.notes.get(k);
-    if (held && held.token === token && held.status === 'pending') this.delete(k);
+    if (held && held.token === token && held.status === 'pending') this.notes.delete(k);
   }
   prune(now: number) {
-    for (const [k, v] of this.notes) if (v.validUntil < now) this.delete(k);
+    for (const [k, v] of this.notes) if (v.validUntil < now) this.notes.delete(k);
   }
   outstanding(now: number): SponsoredNote[] {
     return [...this.notes.values()].filter((v) => v.validUntil >= now);
   }
+  /** Durable stores record `next` (a newly signed entry) here, before it becomes visible. */
+  protected persistSigned(_k: Hex, _next: SponsoredNote): void {}
+}
+
+/**
+ * What the live sponsorships can still cost the paymaster, for the deposit budget.
+ *
+ * An entry restored from a store written by a release that predates the budget carries no gas cost.
+ * Such an entry is never counted as zero: it is counted at the per-operation cap when one is
+ * configured, and otherwise the total is unknown until it expires — the caller must not sign then.
+ * Signatures live for `signatureTtlSec`, so this lasts at most that long after an upgrade.
+ */
+export function committedGasCost(
+  notes: SponsoredNote[],
+  perOperationCap?: bigint,
+): { known: true; wei: bigint } | { known: false; unknown: number; until: number } {
+  let wei = 0n;
+  let unknown = 0;
+  let until = 0;
+  for (const n of notes) {
+    if (n.maxGasCostWei !== undefined) wei += n.maxGasCostWei;
+    else if (perOperationCap !== undefined) wei += perOperationCap;
+    else {
+      unknown++;
+      until = Math.max(until, n.validUntil);
+    }
+  }
+  return unknown > 0 ? { known: false, unknown, until } : { known: true, wei };
 }
 
 export interface Logger {
@@ -335,8 +371,11 @@ export class RelayerService {
           'would sponsor an account whose execute() ignores the calldata, paying gas for no withdrawal',
       );
     }
-    if (config.simulateWithBundler && !config.bundlerUrl) {
+    if (!config.bundlerUrl) {
       throw new Error('BUNDLER_URL is required: sponsorships are simulated on the bundler before they are signed');
+    }
+    if ((config as { simulateWithBundler?: boolean }).simulateWithBundler === false) {
+      throw new Error('the pre-signing bundler simulation cannot be disabled');
     }
     const client = createPublicClient({ transport: http(config.rpcUrl) });
     const chainId = BigInt(await client.getChainId());
@@ -363,18 +402,25 @@ export class RelayerService {
     for (const raw of config.instances) {
       const address = getAddress(raw);
       const denomination = await client.readContract({ address, abi: tornadoInstanceAbi, functionName: 'denomination' });
-      // ERC20Tornado exposes token(); ETHTornado does not.
+      // ERC20Tornado exposes token(); ETHTornado does not, and calling it reverts. Only that revert
+      // means "ETH pool": a transport failure must stop the start-up, not reclassify an ERC-20 pool.
       const token = await client
         .readContract({ address, abi: tornadoInstanceAbi, functionName: 'token' })
         .then((t) => getAddress(t))
-        .catch(() => zeroAddress);
+        .catch((err) => {
+          if (isContractRevert(err)) return zeroAddress;
+          throw new Error(`cannot read ${address}.token(): ${shortError(err)}`);
+        });
       let decimals = 18;
       let symbol = 'ETH';
       if (token !== zeroAddress) {
         if (!config.priceSource) throw new Error(`instance ${address} is an ERC-20 pool but no priceSource is configured`);
         [decimals, symbol] = await Promise.all([
           client.readContract({ address: token, abi: erc20MetadataAbi, functionName: 'decimals' }),
-          client.readContract({ address: token, abi: erc20MetadataAbi, functionName: 'symbol' }).catch(() => 'TOKEN'),
+          client.readContract({ address: token, abi: erc20MetadataAbi, functionName: 'symbol' }).catch((err) => {
+            if (isContractRevert(err)) return 'TOKEN'; // a token without symbol(): cosmetic only
+            throw new Error(`cannot read ${token}.symbol(): ${shortError(err)}`);
+          }),
         ]);
         // Fail fast if the token cannot be priced.
         await config.priceSource.tokenPerEth(token, decimals);
@@ -399,6 +445,18 @@ export class RelayerService {
       throw new Error(
         `the registry resolves the paymaster to master ${registry.master} but REWARD_ACCOUNT is ${rewardAccount}: ` +
           'the proof must name the master or Router.withdraw reverts with "only relayer"',
+      );
+    }
+
+    const restoredWithoutCost = committedGasCost(
+      (config.sponsorshipStore ?? new MemorySponsorshipStore()).outstanding(Math.floor(Date.now() / 1000)),
+      config.maxSponsorshipGasWei,
+    );
+    if (!restoredWithoutCost.known) {
+      log.warn(
+        `${restoredWithoutCost.unknown} live sponsorships were restored from an earlier release without a recorded gas ` +
+          `cost and no MAX_SPONSORSHIP_GAS_WEI is set to budget them: new sponsorships are refused until they expire ` +
+          `at ${new Date(restoredWithoutCost.until * 1000).toISOString()}`,
       );
     }
 
@@ -436,7 +494,9 @@ export class RelayerService {
   async status() {
     const now = Math.floor(Date.now() / 1000);
     this.sponsored.prune(now);
-    const live = await this.liveRegistryState();
+    const live = await this.liveState(now);
+    // Every value below is either read now or null; `unavailable` says why each null is null.
+    const unavailable: Record<string, string> = { ...live.unavailable };
     const ethPrices: Record<string, string> = {};
     for (const i of this.instances.values()) {
       if (i.token === zeroAddress) continue;
@@ -444,9 +504,10 @@ export class RelayerService {
         const rate = await this.config.priceSource!.tokenPerEth(i.token, i.decimals);
         ethPrices[i.symbol.toLowerCase()] = weiPerTokenFrom(rate, i.decimals).toString();
       } catch (err) {
-        this.log.warn('price unavailable', { token: i.token, err: String(err) });
+        unavailable[`ethPrices.${i.symbol.toLowerCase()}`] = shortError(err);
       }
     }
+    const reg = live.registry;
     return {
       version: '0.2.0',
       chainId: toHex(this.config.chainId),
@@ -457,17 +518,17 @@ export class RelayerService {
       /** Whether postOp refunds `fee - gas - serviceFee` (master mode) or the fee is fixed (worker mode). */
       refunds: this.refunds,
       registry: {
-        mode: live.registry?.mode ?? this.registry.mode,
+        /** Read now. Null when the registry could not be read (see `unavailable.registry`). */
+        mode: reg?.mode ?? null,
+        master: reg?.master ?? null,
+        stake: reg ? toHex(reg.stake) : null,
+        minStake: reg ? toHex(reg.minStake) : null,
+        burnPerWithdraw: reg ? Object.fromEntries(Object.entries(reg.burnPerWithdraw).map(([k, v]) => [k, toHex(v)])) : null,
         router: this.registry.router,
         relayerRegistry: this.registry.relayerRegistry,
-        master: live.registry?.master ?? this.registry.master,
-        stake: live.registry ? toHex(live.registry.stake) : null,
-        minStake: live.registry ? toHex(live.registry.minStake) : null,
         ensHash: this.registry.ensHash,
-        burnPerWithdraw: live.registry
-          ? Object.fromEntries(Object.entries(live.registry.burnPerWithdraw).map(([k, v]) => [k, toHex(v)]))
-          : null,
-        /** The master this worker resolved to at start-up; a change here means the registration moved. */
+        /** What start-up saw. A difference from `mode` / `master` means the registration has moved. */
+        modeAtStartup: this.registry.mode,
         masterAtStartup: this.registry.master,
       },
       /** EntryPoint balances and what is already promised out of them. */
@@ -475,13 +536,17 @@ export class RelayerService {
         wei: live.deposit === undefined ? null : toHex(live.deposit),
         stakeWei: live.stake === undefined ? null : toHex(live.stake),
         minWei: toHex(this.config.minDepositWei ?? 0n),
-        committedWei: toHex(live.committed),
-        /** false while the relayer refuses new sponsorships because the deposit cannot cover them. */
+        /** Null while restored sponsorships without a recorded cost are live (see `unavailable`). */
+        committedWei: live.committed.known ? toHex(live.committed.wei) : null,
+        /** false while the relayer refuses new sponsorships for budget reasons (or cannot tell). */
         accepting: live.accepting,
       },
-      /** When these numbers were read. Null values mean the node could not be reached for that field. */
+      /** Whether the registry, read now, still resolves the paymaster to `rewardAccount`. */
+      registered: reg ? live.registrationCurrent : null,
+      /** When these numbers were read. */
       checkedAt: now,
       checkedAtBlock: live.blockNumber === undefined ? null : toHex(live.blockNumber),
+      unavailable,
       signer: this.signer.address,
       instances: [...this.instances.values()].map((i) => ({
         address: i.address,
@@ -697,17 +762,21 @@ export class RelayerService {
       //    is already held, so concurrent requests see each other's commitments here.
       await this.assertDepositCovers(maxGasCostWei, now);
 
-      // 6. On-chain sanity: the proof must verify against the instance right now.
+      // 6. The registry must still resolve the paymaster to the relayer the proof names. A master that
+      //    has unregistered this worker is read live here, not remembered from start-up.
+      await this.assertRegistrationCurrent();
+
+      // 7. On-chain sanity: the proof must verify against the instance right now.
       await this.assertWithdrawSimulates(w);
 
-      // 7. Full simulation on the bundler (validation + execution incl. tail calls).
-      if (this.config.simulateWithBundler) await this.assertBundlerSimulates(op, context);
+      // 8. Full simulation on the bundler (validation + execution incl. tail calls). Always.
+      await this.assertBundlerSimulates(op, context);
     } catch (err) {
       this.sponsored.release(w.nullifierHash, token);
       throw err;
     }
 
-    // 8. Sign.
+    // 9. Sign.
     const terms: FeeTerms = {
       validUntil,
       validAfter: 0,
@@ -730,7 +799,14 @@ export class RelayerService {
       this.sponsored.release(w.nullifierHash, token);
       throw err;
     }
-    this.sponsored.commit(w.nullifierHash, token);
+    // 10. Record before issuing. A signature that could not be recorded is dropped here: a restart could
+    //     otherwise sign the same note again while this one is still valid.
+    try {
+      this.sponsored.commit(w.nullifierHash, token);
+    } catch (err) {
+      this.sponsored.release(w.nullifierHash, token);
+      throw new Error(`could not record the sponsorship, not issuing it: ${shortError(err)}`);
+    }
     this.log.info('sponsored', {
       instance: w.instance,
       symbol: info.symbol,
@@ -741,6 +817,7 @@ export class RelayerService {
       tokenPerEth: tokenPerEth.toString(),
       refundTo: terms.refundTo,
       validUntil: terms.validUntil,
+      maxGasCostWei: maxGasCostWei.toString(),
     });
 
     return {
@@ -763,33 +840,66 @@ export class RelayerService {
   }
 
   /**
-   * One read of everything `/status` reports about the chain. Every field is optional: a node that
-   * cannot be reached produces `undefined`, which the caller renders as "unavailable" instead of
-   * repeating a start-up value that may no longer be true.
+   * One read of everything `/status` reports about the chain. A read that fails leaves its field
+   * undefined and records the reason; nothing falls back to a start-up value or to zero.
    */
-  private async liveRegistryState(): Promise<{
+  private async liveState(now: number): Promise<{
     blockNumber?: bigint;
     deposit?: bigint;
     stake?: bigint;
-    committed: bigint;
-    accepting: boolean;
     registry?: RegistryInfo;
+    registrationCurrent: boolean;
+    committed: ReturnType<typeof committedGasCost>;
+    accepting: boolean;
+    unavailable: Record<string, string>;
   }> {
-    const now = Math.floor(Date.now() / 1000);
-    const committed = this.sponsored.outstanding(now).reduce((sum, n) => sum + (n.maxGasCostWei ?? 0n), 0n);
+    const unavailable: Record<string, string> = {};
+    const attempt = async <T>(field: string, read: () => Promise<T>): Promise<T | undefined> => {
+      try {
+        return await read();
+      } catch (err) {
+        unavailable[field] = shortError(err);
+        return undefined;
+      }
+    };
     const [blockNumber, deposit, depositInfo, registry] = await Promise.all([
-      this.client.getBlockNumber().catch(() => undefined),
-      this.depositWei().catch(() => undefined),
-      this.client
-        .readContract({ address: this.config.entryPoint, abi: entryPointAbi, functionName: 'getDepositInfo', args: [this.config.paymaster] })
-        .catch(() => undefined),
+      attempt('checkedAtBlock', () => this.client.getBlockNumber()),
+      attempt('deposit.wei', () => this.depositWei()),
+      attempt('deposit.stakeWei', () =>
+        this.client.readContract({
+          address: this.config.entryPoint,
+          abi: entryPointAbi,
+          functionName: 'getDepositInfo',
+          args: [this.config.paymaster],
+        }),
+      ),
       this.registry.mode === 'no-router'
         ? Promise.resolve(undefined)
-        : probeRegistry(this.client, this.config.paymaster, this.registry.router, [...this.instances.keys()]).catch(() => undefined),
+        : attempt('registry', () =>
+            probeRegistry(this.client, this.config.paymaster, this.registry.router, [...this.instances.keys()]),
+          ),
     ]);
+    const committed = committedGasCost(this.sponsored.outstanding(now), this.config.maxSponsorshipGasWei);
+    if (!committed.known) {
+      unavailable['deposit.committedWei'] =
+        `${committed.unknown} restored sponsorships have no recorded gas cost until ${new Date(committed.until * 1000).toISOString()}`;
+    }
     const floor = this.config.minDepositWei ?? 0n;
-    const accepting = deposit !== undefined && deposit >= committed + floor;
-    return { blockNumber, deposit, stake: depositInfo ? BigInt(depositInfo.stake) : undefined, committed, accepting, registry };
+    const accepting = deposit !== undefined && committed.known && deposit >= committed.wei + floor;
+    const registrationCurrent =
+      this.registry.mode === 'no-router' || this.registry.mode === 'unregistered'
+        ? true
+        : !!registry && isAddressEqual(registry.master, this.rewardAccount);
+    return {
+      blockNumber,
+      deposit,
+      stake: depositInfo ? BigInt(depositInfo.stake) : undefined,
+      registry,
+      registrationCurrent,
+      committed,
+      accepting,
+      unavailable,
+    };
   }
 
   // ------------------------------------------------------------------ internals
@@ -808,6 +918,35 @@ export class RelayerService {
    */
   async depositWei(): Promise<bigint> {
     return this.client.readContract({ address: this.config.paymaster, abi: paymasterAbi, functionName: 'getDeposit' });
+  }
+
+  /**
+   * The registry, read now, must resolve the paymaster to the relayer the proofs name (itself in master
+   * mode, the master in worker mode). Otherwise `RelayerRegistry.burn` would revert inside the operation
+   * — after the paymaster has paid for it. A registry that cannot be read is a refusal, not a pass.
+   * Skipped only where there is nothing to check: no router, or a start-up that explicitly allowed an
+   * unregistered paymaster.
+   */
+  private async assertRegistrationCurrent(): Promise<void> {
+    if (this.registry.mode === 'no-router' || this.registry.mode === 'unregistered') return;
+    let resolved: Address;
+    try {
+      resolved = await this.client.readContract({
+        address: this.registry.relayerRegistry,
+        abi: relayerRegistryAbi,
+        functionName: 'workers',
+        args: [this.config.paymaster],
+      });
+    } catch (err) {
+      throw new ValidationError(`cannot read the relayer registry: ${shortError(err)}`, -32010);
+    }
+    if (!isAddressEqual(resolved, this.rewardAccount)) {
+      throw new ValidationError(
+        `the registry resolves paymaster ${this.config.paymaster} to ${resolved === zeroAddress ? 'no relayer' : resolved}, ` +
+          `not ${this.rewardAccount}: not signing until the registration is restored`,
+        -32010,
+      );
+    }
   }
 
   /**
@@ -832,9 +971,16 @@ export class RelayerService {
       throw new ValidationError(`cannot read the paymaster's EntryPoint deposit: ${shortError(err)}`, -32004);
     }
     // Everything already promised and not yet expired, including this request's own reservation.
-    const committed = this.sponsored
-      .outstanding(now)
-      .reduce((sum, note) => sum + (note.maxGasCostWei ?? 0n), 0n);
+    const budget = committedGasCost(this.sponsored.outstanding(now), cap);
+    if (!budget.known) {
+      throw new ValidationError(
+        `${budget.unknown} live sponsorships restored from an earlier release have no recorded gas cost: ` +
+          `not signing until they expire at ${new Date(budget.until * 1000).toISOString()} ` +
+          '(or set MAX_SPONSORSHIP_GAS_WEI to budget them at that cap)',
+        -32004,
+      );
+    }
+    const committed = budget.wei;
     if (deposit < committed + floor) {
       throw new ValidationError(
         `paymaster deposit ${deposit} wei cannot cover ${committed} wei of live sponsorships plus the ${floor} wei reserve: ` +
@@ -935,14 +1081,13 @@ export class RelayerService {
       throw new ValidationError(`bundler simulation failed: ${shortError(err)}`, -32007);
     }
 
-    // A transport that answers 200 with no usable estimate is a failed simulation, not a pass.
-    const estimate = asGasEstimate(result);
-    if (!estimate) {
-      throw new ValidationError(
-        `bundler simulation returned no usable gas estimate: ${JSON.stringify(result ?? null).slice(0, 200)}`,
-        -32007,
-      );
+    // A transport that answers 200 with no usable estimate is a failed simulation, not a pass. The op
+    // always has a paymaster here, so both paymaster gas fields are part of a usable estimate.
+    const parsed = asGasEstimate(result, true);
+    if (!parsed.ok) {
+      throw new ValidationError(`bundler simulation returned no usable gas estimate: ${parsed.reason}`, -32007);
     }
+    const estimate = parsed.estimate;
     // The op is signed with the limits the caller sent, so the estimate has to fit inside them. If it
     // does not, the caller re-quotes with the higher limits (and re-proves at the new fee) and asks
     // again — the relayer never edits an operation it has signed.
@@ -955,8 +1100,13 @@ export class RelayerService {
     if (estimate.preVerificationGas > sent.preVerificationGas) {
       tooSmall.push(`preVerificationGas ${sent.preVerificationGas} < ${estimate.preVerificationGas}`);
     }
-    if (estimate.paymasterVerificationGasLimit !== undefined && estimate.paymasterVerificationGasLimit > sent.paymasterVerificationGasLimit) {
+    if (estimate.paymasterVerificationGasLimit! > sent.paymasterVerificationGasLimit) {
       tooSmall.push(`paymasterVerificationGasLimit ${sent.paymasterVerificationGasLimit} < ${estimate.paymasterVerificationGasLimit}`);
+    }
+    // A postOp that runs out of gas reverts the whole execution after the paymaster has paid: the fee
+    // transfer is undone with it.
+    if (estimate.paymasterPostOpGasLimit! > sent.paymasterPostOpGasLimit) {
+      tooSmall.push(`paymasterPostOpGasLimit ${sent.paymasterPostOpGasLimit} < ${estimate.paymasterPostOpGasLimit}`);
     }
     if (tooSmall.length > 0) {
       throw new ValidationError(
@@ -1052,15 +1202,15 @@ export async function probeRegistry(
     client.readContract({ address: relayerRegistry, abi: relayerRegistryAbi, functionName: 'getRelayerBalance', args: [paymaster] }),
     client.readContract({ address: relayerRegistry, abi: relayerRegistryAbi, functionName: 'minStakeAmount' }),
     client.readContract({ address: relayerRegistry, abi: relayerRegistryAbi, functionName: 'getRelayerEnsHash', args: [paymaster] }),
-    client.readContract({ address: relayerRegistry, abi: relayerRegistryAbi, functionName: 'feeManager' }).catch(() => zeroAddress),
+    client.readContract({ address: relayerRegistry, abi: relayerRegistryAbi, functionName: 'feeManager' }),
   ]);
+  // Every read here is required. A failed read is an error, never a zero fee: a zero from this function
+  // must mean the FeeManager itself said zero.
   const burnPerWithdraw: Record<Address, bigint> = {};
   if (feeManager !== zeroAddress) {
     for (const instance of instances) {
       burnPerWithdraw[instance] = BigInt(
-        await client
-          .readContract({ address: feeManager, abi: feeManagerAbi, functionName: 'instanceFee', args: [instance] })
-          .catch(() => 0n),
+        await client.readContract({ address: feeManager, abi: feeManagerAbi, functionName: 'instanceFee', args: [instance] }),
       );
     }
   }
@@ -1073,36 +1223,65 @@ function stripUndefined<T extends object>(obj: T): Partial<T> {
   return Object.fromEntries(Object.entries(obj).filter(([, v]) => v !== undefined)) as Partial<T>;
 }
 
+export interface GasEstimate {
+  callGasLimit: bigint;
+  verificationGasLimit: bigint;
+  preVerificationGas: bigint;
+  /** Present whenever the estimated op has a paymaster (`asGasEstimate(…, true)` requires both). */
+  paymasterVerificationGasLimit?: bigint;
+  paymasterPostOpGasLimit?: bigint;
+}
+
 /**
  * `eth_estimateUserOperationGas`'s result, when it really is one. Bundlers return hex quantities; a
- * body missing any of the three required fields (or carrying something that is not a quantity) is not
- * an estimate and must not be read as a successful simulation.
+ * body missing a required field, or carrying something that is not a quantity, is not an estimate and
+ * must not be read as a successful simulation. For an op with a paymaster the two paymaster limits are
+ * required too — Pimlico's bundler (and alto) return both for EntryPoint v0.7+.
  */
-function asGasEstimate(result: unknown):
-  | {
-      callGasLimit: bigint;
-      verificationGasLimit: bigint;
-      preVerificationGas: bigint;
-      paymasterVerificationGasLimit?: bigint;
-    }
-  | undefined {
-  if (!result || typeof result !== 'object') return undefined;
+export function asGasEstimate(
+  result: unknown,
+  hasPaymaster: boolean,
+): { ok: true; estimate: GasEstimate } | { ok: false; reason: string } {
+  if (!result || typeof result !== 'object' || Array.isArray(result)) {
+    return { ok: false, reason: `not an object: ${JSON.stringify(result ?? null).slice(0, 120)}` };
+  }
   const r = result as Record<string, unknown>;
   const quantity = (v: unknown): bigint | undefined => {
-    if (typeof v === 'number' && Number.isInteger(v) && v >= 0) return BigInt(v);
+    if (typeof v === 'number' && Number.isSafeInteger(v) && v >= 0) return BigInt(v);
     if (typeof v !== 'string' || !/^0x[0-9a-fA-F]+$/.test(v)) return undefined;
     return hexToBigInt(v as Hex);
   };
-  const callGasLimit = quantity(r.callGasLimit);
-  const verificationGasLimit = quantity(r.verificationGasLimit);
-  const preVerificationGas = quantity(r.preVerificationGas);
-  if (callGasLimit === undefined || verificationGasLimit === undefined || preVerificationGas === undefined) return undefined;
+  const required = ['callGasLimit', 'verificationGasLimit', 'preVerificationGas'];
+  if (hasPaymaster) required.push('paymasterVerificationGasLimit', 'paymasterPostOpGasLimit');
+  const values: Record<string, bigint> = {};
+  for (const field of required) {
+    const v = quantity(r[field]);
+    if (v === undefined) {
+      return { ok: false, reason: `${field} is ${r[field] === undefined ? 'missing' : `not a quantity (${JSON.stringify(r[field])})`}` };
+    }
+    values[field] = v;
+  }
   return {
-    callGasLimit,
-    verificationGasLimit,
-    preVerificationGas,
-    paymasterVerificationGasLimit: quantity(r.paymasterVerificationGasLimit),
+    ok: true,
+    estimate: {
+      callGasLimit: values.callGasLimit!,
+      verificationGasLimit: values.verificationGasLimit!,
+      preVerificationGas: values.preVerificationGas!,
+      paymasterVerificationGasLimit: values.paymasterVerificationGasLimit,
+      paymasterPostOpGasLimit: values.paymasterPostOpGasLimit,
+    },
   };
+}
+
+/**
+ * True when `err` is the contract itself reverting (or returning nothing), as opposed to the node or
+ * the transport failing. Only the former may be read as an on-chain answer.
+ */
+export function isContractRevert(err: unknown): boolean {
+  if (!(err instanceof BaseError)) return false;
+  return !!err.walk(
+    (e) => e instanceof ContractFunctionRevertedError || e instanceof ContractFunctionZeroDataError || e instanceof ExecutionRevertedError,
+  );
 }
 
 /** Implementation named by the op's EIP-7702 authorization, if it carries one. */
@@ -1131,6 +1310,11 @@ function decodeRevert(data: Hex): string {
 }
 
 function shortError(err: unknown): string {
+  // viem keeps the node's own words in `details`; the short message alone is often just
+  // "An internal error was received."
+  if (err instanceof BaseError) {
+    return err.details && !err.shortMessage.includes(err.details) ? `${err.shortMessage} (${err.details})` : err.shortMessage;
+  }
   if (err && typeof err === 'object' && 'shortMessage' in err) return String((err as { shortMessage: string }).shortMessage);
   return err instanceof Error ? err.message : String(err);
 }

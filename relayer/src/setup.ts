@@ -1,4 +1,5 @@
 import {
+  BaseError,
   concatHex,
   createPublicClient,
   createWalletClient,
@@ -103,7 +104,8 @@ export async function ensurePaymasterSetup(cfg: PaymasterSetupConfig, log: Logge
   // Stake (needed for validation-phase storage access under ERC-7562) and gas deposit.
   const info = await publicClient.readContract({ address: cfg.entryPoint, abi: entryPointAbi, functionName: 'getDepositInfo', args: [paymaster] });
   // Admin functions belong to the contract owner: the relayer key itself for a self-deployed contract or a 7702 EOA.
-  const owner = await publicClient.readContract({ address: paymaster, abi: paymasterAbi, functionName: 'owner' }).catch(() => zeroAddress);
+  // Required read: a node error here must not turn into "someone else owns this contract".
+  const owner = await publicClient.readContract({ address: paymaster, abi: paymasterAbi, functionName: 'owner' });
   const canAdmin = isAddressEqual(owner, account.address);
   if (cfg.stakeWei > 0n && (!info.staked || BigInt(info.stake) < cfg.stakeWei)) {
     const missing = cfg.stakeWei - BigInt(info.stake);
@@ -143,6 +145,13 @@ export async function ensurePaymasterSetup(cfg: PaymasterSetupConfig, log: Logge
  * already happened once. It cannot catch a future change that keeps the length and alters the meaning of
  * a field; such a change needs an explicit version in the contract, not a longer length.
  */
+function describeError(err: unknown): string {
+  if (err instanceof BaseError) {
+    return err.details && !err.shortMessage.includes(err.details) ? `${err.shortMessage} (${err.details})` : err.shortMessage;
+  }
+  return err instanceof Error ? err.message.split('\n')[0]! : String(err);
+}
+
 async function assertPaymasterCompatible(
   cfg: PaymasterSetupConfig,
   paymaster: Address,
@@ -162,7 +171,7 @@ async function assertPaymasterCompatible(
     } catch (err) {
       throw new Error(
         `paymaster ${paymaster} does not answer ${functionName}(): it is not a TornadoRelayerPaymaster this ` +
-          `software can drive (${(err as Error).message.split('\n')[0]})`,
+          `software can drive (${describeError(err)})`,
       );
     }
   };
@@ -194,14 +203,19 @@ async function assertPaymasterCompatible(
     );
   }
   if (cfg.rewardAccount && cfg.router && cfg.router !== zeroAddress) {
-    // The worker -> master relationship the proofs will name. Not fatal here (the master may not have
-    // registered us yet, which `ensureRegistered` waits for), but a *different* master is a misconfiguration.
-    const master = await publicClient
-      .readContract({ address: router, abi: tornadoRouterAbi, functionName: 'relayerRegistry' })
-      .then((registry) =>
-        publicClient.readContract({ address: registry as Address, abi: relayerRegistryAbi, functionName: 'workers', args: [paymaster] }),
-      )
-      .catch(() => zeroAddress as Address);
+    // The worker -> master relationship the proofs will name. "Not registered yet" (the registry
+    // answers zero) is fine — `ensureRegistered` waits for the master — but a *different* master is a
+    // misconfiguration, and a registry that cannot be read stops the setup before anything is funded.
+    let master: Address;
+    try {
+      const registry = await publicClient.readContract({ address: router, abi: tornadoRouterAbi, functionName: 'relayerRegistry' });
+      master = await publicClient.readContract({ address: registry, abi: relayerRegistryAbi, functionName: 'workers', args: [paymaster] });
+    } catch (err) {
+      throw new Error(
+        `cannot read the worker -> master relationship of ${paymaster} from router ${router}: ` +
+          `${describeError(err)} (nothing has been staked or deposited)`,
+      );
+    }
     if (master !== zeroAddress && !isAddressEqual(master, cfg.rewardAccount)) {
       throw new Error(
         `the registry resolves paymaster ${paymaster} to master ${master}, but REWARD_ACCOUNT is ${cfg.rewardAccount}`,
