@@ -28,7 +28,8 @@ interface StoredNote {
  * Loading is strict: an unreadable or malformed file stops the service rather than starting empty,
  * because starting empty would allow a second signature for a note whose first is still live. Entries
  * that have expired are dropped. Live entries from a release that did not record `maxGasCostWei` are
- * kept, counted in `legacyEntries`, and budgeted conservatively (`committedGasCost`).
+ * kept and counted in `legacyEntries`; while any of them is live the budget is unknown and no new
+ * sponsorship is signed (`committedGasCost`).
  *
  * The constructor also writes the file once, so a store that cannot be written fails at start-up and
  * not on the first request.

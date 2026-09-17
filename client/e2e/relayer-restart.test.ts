@@ -10,7 +10,7 @@
  *   MAINNET_RPC_URL=… npx vitest run e2e/relayer-restart.test.ts
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { createWalletClient, http, parseEther, type Address, type Hex } from 'viem';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 
@@ -152,5 +152,42 @@ describe('a relayer with a file-backed store, across a restart', () => {
     });
     expect(stakeAfter).toBeLessThan(stakeBefore);
     log(`withdrawal 2 in ${r2.receipt.receipt.transactionHash} after the restart; master stake ${stakeBefore} -> ${stakeAfter}`);
+  }, 900_000);
+
+  it('pauses new sponsorships while a restored entry without a recorded cost is live, whatever the cap', async () => {
+    // A live entry as an earlier release wrote it: signed, no maxGasCostWei. What it may still cost is
+    // unknown, so the restarted relayer must not sign anything until it has expired.
+    const legacyKey = `0x${'5a'.repeat(32)}` as Hex;
+    const until = Math.floor(Date.now() / 1000) + 75;
+    const file = JSON.parse(readFileSync(h.sponsorshipFile, 'utf8'));
+    file[legacyKey] = { validUntil: until, sender: h.relayerSigner.address, nonce: '0', status: 'signed', token: 'legacy' };
+    writeFileSync(h.sponsorshipFile, JSON.stringify(file));
+    await h.restartRelayer();
+    expect(h.relayer.sponsorships.get(legacyKey)).toMatchObject({ status: 'signed', maxGasCostWei: undefined });
+
+    const s = await status();
+    expect(s.deposit.committedWei).toBeNull();
+    expect(s.deposit.accepting).toBe(false);
+    expect(s.unavailable['deposit.committedWei']).toMatch(/1 restored sponsorships have no recorded gas cost/);
+
+    // A generous per-operation cap is configured: it must not be used as a stand-in for the old cost.
+    (h.relayer.config as { maxSponsorshipGasWei?: bigint }).maxSponsorshipGasWei = parseEther('1');
+    const { note, leaves } = await shieldNote();
+    const req = await sponsorshipRequest(h, prover, note, leaves, privateKeyToAccount(generatePrivateKey()), h.setup.simple7702Implementation);
+    const refused = await askForSponsorship(h, req.op);
+    expect(refused.result).toBeUndefined();
+    expect(refused.error!.message).toMatch(/1 live sponsorships restored from an earlier release have no recorded gas cost: not signing until they expire/);
+    expect(h.relayer.sponsorships.get(nullifierHashHex(note))).toBeUndefined();
+
+    // Once the old entry has expired, the very same request is signed.
+    const waitMs = (until + 1) * 1000 - Date.now();
+    if (waitMs > 0) await new Promise((r) => setTimeout(r, waitMs));
+    const ok = await askForSponsorship(h, req.op);
+    expect(ok.error).toBeUndefined();
+    expect(h.relayer.sponsorships.get(nullifierHashHex(note))?.status).toBe('signed');
+    const after = await status();
+    expect(after.deposit.accepting).toBe(true);
+    expect(after.unavailable).toEqual({});
+    log(`legacy entry paused signing until ${until}, then the same request was signed`);
   }, 900_000);
 });

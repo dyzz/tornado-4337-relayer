@@ -115,18 +115,15 @@ export interface SponsorRules {
  * `rewardAccount` as relayer and the sender as recipient, so the DAO's Router / RelayerRegistry sees
  * the paymaster as the relayer and burns the stake once per relayed withdrawal, as today.
  *
- * What this guarantees, precisely: each sponsorship authorises exactly one withdrawal, that withdrawal
- * goes through the Router, and it is charged by the Registry / FeeManager rules in force. A second
- * Tornado withdrawal among the operation's own calls is refused, and nothing but `relayWithdraw` may
- * touch the paymaster — a direct `pool.withdraw` would ride on the sponsored gas without the burn.
+ * What this guarantees, precisely: the one `relayWithdraw` this sponsorship authorises must go through the
+ * Router and follows the DAO's existing fee rules. Among the operation's own (top-level) calls a second
+ * Tornado withdrawal is refused, and nothing but `relayWithdraw` may touch the paymaster.
  *
- * What it does not guarantee: these are the account's *top-level* calls. A tail-call contract could
- * reach Tornado again inside its own call tree, and this decoder does not walk it. That is not the risk
- * it looks like — any such withdrawal pays its own way through the Router with its own relayer and fee,
- * and the sponsorship still covers exactly the one withdrawal the relayer priced — but it means "one
- * note per operation" is a statement about what this relayer sponsors, not a claim about everything
- * that can happen inside an operation. Multi-note withdrawals are separate UserOperations (the Kohaku
- * SDK issues one per note); atomicity holds within each operation, not across them.
+ * What it does not cover: anything a tail-call contract does internally. These are the account's
+ * top-level calls only; the decoder does not walk the call tree, so it makes no statement about other
+ * withdrawals or calls made inside a tail call — whether they go through the Router, pay a relayer or
+ * burn TORN. Multi-note withdrawals are separate UserOperations (the Kohaku SDK issues one per note);
+ * atomicity holds within each operation, not across them.
  */
 export function findSponsoringWithdraw(calls: DecodedCall[], rules: SponsorRules): TornadoWithdrawCall {
   const withdraws = decodeTornadoWithdraws(calls, rules.paymaster);

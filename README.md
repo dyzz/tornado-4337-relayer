@@ -156,13 +156,12 @@ Review findings addressed in the current code:
   approved; validation records it in transient storage and `relayWithdraw` only runs with those arguments. A
   sender account with unusual execution semantics, a note owner, or a third party cannot make the paymaster
   relay (and burn stake for) anything else.
-- **One note per sponsorship.** Each sponsorship authorises exactly one withdrawal, which goes through the
-  router and is charged by the Registry / FeeManager rules in force, exactly as with a classic relayer. A
-  second Tornado withdrawal among the operation's own calls is refused and nothing but `relayWithdraw` may
-  touch the paymaster; Kohaku's patch issues one operation per note. The check reads the account's top-level
-  calls, so it is a statement about what this relayer sponsors, not a claim that no contract deeper in a tail
-  call can reach Tornado — any such withdrawal pays its own way through the router with its own relayer and
-  fee. Atomicity holds within each operation, not across the operations of a multi-note withdrawal.
+- **One note per sponsorship.** The one `relayWithdraw` a sponsorship authorises must go through the router
+  and follows the DAO's existing fee rules, exactly as with a classic relayer. Among the operation's own
+  top-level calls a second Tornado withdrawal is refused and nothing but `relayWithdraw` may touch the
+  paymaster; Kohaku's patch issues one operation per note. The check reads top-level calls only: what a
+  tail-call contract does internally is outside what it guarantees. Atomicity holds within each operation,
+  not across the operations of a multi-note withdrawal.
 - **The sponsorship binds the account implementation that executes it.** The relayer signs the EIP-7702
   implementation the sender will run (the operation's own authorization, else its current delegation), and the
   paymaster re-checks the sender's delegation designator on-chain during validation. Swapping the authorization
@@ -199,8 +198,9 @@ Review findings addressed in the current code:
   blocking the note. Reservations are never written. The store is opened at start-up, so an unwritable
   location or an unreadable file stops the service instead of the first request (starting empty would allow
   a second signature for a live note). Live entries written by an earlier release carry no gas cost: they
-  still deduplicate, and they are budgeted at `MAX_SPONSORSHIP_GAS_WEI` when it is set; otherwise the relayer
-  refuses new sponsorships until they expire, at most one signature lifetime after the upgrade. The fork
+  still deduplicate, and because what they may still cost is unknown — no current setting is a sound
+  stand-in for it — the relayer refuses new sponsorships until they expire, at most one signature lifetime
+  after the upgrade. The fork
   suite runs a complete withdrawal on the file store, restarts the relayer, and checks that the note is still
   refused, the budget unchanged, and the next note served.
 - **The registration is read at signing.** Before each signature the registry must still resolve the
@@ -467,13 +467,13 @@ Tornado-specific 的逻辑继续留在 relayer；bundler 只是通用基础设�
 评审提出的问题已在当前代码里处理：
 
 - **sponsorship 绑定到具体那笔提现。** relayer 签的是它批准的那一次 `relayWithdraw` 的哈希；验证阶段记进 transient storage，`relayWithdraw` 只对完全相同的参数放行。执行语义奇怪的 sender 账户、note 持有人、第三方都不能让 paymaster 转发（并烧质押）别的东西。
-- **每个 sponsorship 一张 note。** 每个 sponsorship 只授权一笔确定的提现，该提现经过 router，并按现行 Registry / FeeManager 规则扣费，和经典 relayer 完全一样。同一 operation 自身的调用里出现第二笔 Tornado 提现会被拒绝，paymaster 上也只允许 `relayWithdraw`；Kohaku 补丁每张 note 发一个 operation。这个检查看的是账户的顶层调用，所以它描述的是"这个 relayer 赞助什么"，而不是"尾调用内部任何合约都不可能再碰 Tornado"——真有的话，那笔提现也得自己走 router、自带 relayer 和手续费。原子性只在单个 operation 内成立，多 note 之间不承诺。
+- **每个 sponsorship 一张 note。** 本 sponsorship 授权的那一笔 `relayWithdraw` 必须经过 router，并遵守现有 DAO 收费规则，和经典 relayer 完全一样。同一 operation 自身的顶层调用里出现第二笔 Tornado 提现会被拒绝，paymaster 上也只允许 `relayWithdraw`；Kohaku 补丁每张 note 发一个 operation。这个检查只看顶层调用：尾调用合约内部做了什么，不在它的保证范围内。原子性只在单个 operation 内成立，多 note 之间不承诺。
 - **sponsorship 绑定执行它的账户实现。** relayer 把 sender 将要运行的 EIP-7702 implementation（operation 自带的 authorization，没有就用当前 delegation）一起签进条款，paymaster 在验证阶段再链上核对 sender 的 delegation designator。签完之后把 authorization 换成别的 implementation 会被拒（`SenderImplementationMismatch`），已批准的提现不可能由 relayer 没见过的代码执行。主网 fork 上有对抗测试：签完 sponsorship 之后把 sender 重新委托到另一份字节码完全相同的账户实现，验证阶段会拒绝这笔 operation，于是不烧质押、note 也没被花掉。
 - **EntryPoint nonce 与 EOA nonce 分开。** SDK 用 `EntryPoint.getNonce` 取 operation 的 nonce，用 sender 的交易计数取 EIP-7702 authorization 的 nonce；sender 已经委托到 Simple7702Account 时干脆不带 authorization——这两种情况下两个计数就会错开。
 - **只赞助已知的账户实现。** 默认只有主网标准的 Simple7702Account，没有别的（`ALLOWED_SENDER_IMPLEMENTATIONS` 只能收窄或替换这个列表，没有任何写法等于"任意账户"）。绑定实现解决的是"哪段代码来执行"，但它无法判断那段代码是否真的按 relayer 校验过的调用去执行：一个 `execute` 直接忽略 calldata 的账户，会把赞助的 gas 花掉，却既不提现也不付手续费。fork 测试提交的正是这种请求——完全合法的提现 calldata，套在一个什么都不做的账户上——relayer 在签名前就拒绝。
 - **每个 sponsorship 签名前都要模拟，而且关不掉。** `BUNDLER_URL` 是必填项，`SIMULATE_WITH_BUNDLER` 不再能关闭任何东西（旧配置里写 `true` 仍可启动，写其他值直接拒绝启动）。超时、HTTP 错误、JSON-RPC 错误、没有 result、result 缺少五个 gas 字段中的任何一个（两个 paymaster 上限也算在内），一律拒签；估算结果放不进这笔 operation 的上限时同样拒签（包括 `paymasterPostOpGasLimit`），由调用方重新报价，而不是 relayer 去改一笔已签名的 operation。这不等于保证收款：ERC-4337 的验证期模拟本来就不保证执行阶段成功，已上链但执行失败的 operation 仍然由 paymaster 付 gas。真正约束损失的是短签名有效期、手续费下限和存款预算——fork 测试把执行失败这一笔的实际成本量了出来。
 - **存款是预算，而且是实时查的。** 每次签名前读 EntryPoint 存款，减去已经承诺、尚未过期的 sponsorship，所以并发请求不会各自把同一份余额当成全部可用。低于 `MIN_DEPOSIT_WEI` 就停止签名、继续响应 `/status`，人工补款后恢复。`MAX_SPONSORSHIP_GAS_WEI` 限制单笔上限。
-- **sponsorship 先落盘再发出，重启后仍然有效。** 文件存储（`SPONSORSHIP_STORE`）在返回签名之前写入已签名的 sponsorship（nonce 和 gas 成本都以字符串保存）；写入失败就丢弃这个签名并释放预留，不会留下任何挡住这张 note 的记录。预留本身从不写盘。存储在启动时就打开，所以位置不可写或文件读不出来时服务直接起不来，而不是等到第一个请求才失败（空着启动会允许对仍有效的 note 再签一次）。上一个版本写入的仍有效条目没有 gas 成本：它们照样去重；设置了 `MAX_SPONSORSHIP_GAS_WEI` 时按这个上限计入预算，没设置时 relayer 在它们过期前拒绝新的 sponsorship，最长就是升级后的一个签名有效期。fork 测试用文件存储跑完一整笔提现，重启 relayer，再核对 note 仍被拒绝、预算不变、下一张 note 正常服务。
+- **sponsorship 先落盘再发出，重启后仍然有效。** 文件存储（`SPONSORSHIP_STORE`）在返回签名之前写入已签名的 sponsorship（nonce 和 gas 成本都以字符串保存）；写入失败就丢弃这个签名并释放预留，不会留下任何挡住这张 note 的记录。预留本身从不写盘。存储在启动时就打开，所以位置不可写或文件读不出来时服务直接起不来，而不是等到第一个请求才失败（空着启动会允许对仍有效的 note 再签一次）。上一个版本写入的仍有效条目没有 gas 成本：它们照样去重；由于它们还可能产生多少成本是未知的——当前任何配置都不能可靠地代替它——relayer 在它们过期前拒绝新的 sponsorship，最长就是升级后的一个签名有效期。fork 测试用文件存储跑完一整笔提现，重启 relayer，再核对 note 仍被拒绝、预算不变、下一张 note 正常服务。
 - **签名时实时读注册关系。** 每次签名前 registry 必须仍然把 paymaster 解析到证明里写的那个 relayer；master 注销了 worker，就立刻停止新的 sponsorship，而不是让 `RelayerRegistry.burn` 在 paymaster 付过钱的 operation 里 revert。
 - **启动时先拒绝不兼容的部署，再谈花钱。** 网络、EntryPoint、签名密钥、router、worker→master 关系，以及 paymaster 的 `paymasterAndData` 布局，全部先只读核对；上一个版本部署的合约（terms 是 297 字节而不是 317）会被直接拒绝，不会花掉任何 stake 或 deposit，也不会悄悄再部署一个。将来如果出现长度相同但字段语义变了的修改，就需要合约里有显式版本号，而不是继续靠长度判断。
 - **ERC-7562。** paymaster 在验证阶段读自身存储，所以要质押（设置步骤质押 0.1 ETH；实际用哪个 bundler 就把 `PAYMASTER_STAKE_WEI` 提到它要求的实体门槛，一般是 1 ETH）。

@@ -297,20 +297,19 @@ export class MemorySponsorshipStore implements SponsorshipStore {
  * What the live sponsorships can still cost the paymaster, for the deposit budget.
  *
  * An entry restored from a store written by a release that predates the budget carries no gas cost.
- * Such an entry is never counted as zero: it is counted at the per-operation cap when one is
- * configured, and otherwise the total is unknown until it expires — the caller must not sign then.
- * Signatures live for `signatureTtlSec`, so this lasts at most that long after an upgrade.
+ * Its liability is then genuinely unknown: the operation it signed may have been priced under any
+ * configuration, so no current setting (the per-operation cap included) is a sound stand-in for it. While
+ * any such entry is live the total is unknown and the caller must not sign; signatures live for
+ * `signatureTtlSec`, so this lasts at most that long after an upgrade.
  */
 export function committedGasCost(
   notes: SponsoredNote[],
-  perOperationCap?: bigint,
 ): { known: true; wei: bigint } | { known: false; unknown: number; until: number } {
   let wei = 0n;
   let unknown = 0;
   let until = 0;
   for (const n of notes) {
     if (n.maxGasCostWei !== undefined) wei += n.maxGasCostWei;
-    else if (perOperationCap !== undefined) wei += perOperationCap;
     else {
       unknown++;
       until = Math.max(until, n.validUntil);
@@ -450,13 +449,11 @@ export class RelayerService {
 
     const restoredWithoutCost = committedGasCost(
       (config.sponsorshipStore ?? new MemorySponsorshipStore()).outstanding(Math.floor(Date.now() / 1000)),
-      config.maxSponsorshipGasWei,
     );
     if (!restoredWithoutCost.known) {
       log.warn(
         `${restoredWithoutCost.unknown} live sponsorships were restored from an earlier release without a recorded gas ` +
-          `cost and no MAX_SPONSORSHIP_GAS_WEI is set to budget them: new sponsorships are refused until they expire ` +
-          `at ${new Date(restoredWithoutCost.until * 1000).toISOString()}`,
+          `cost: new sponsorships are refused until they expire at ${new Date(restoredWithoutCost.until * 1000).toISOString()}`,
       );
     }
 
@@ -879,7 +876,7 @@ export class RelayerService {
             probeRegistry(this.client, this.config.paymaster, this.registry.router, [...this.instances.keys()]),
           ),
     ]);
-    const committed = committedGasCost(this.sponsored.outstanding(now), this.config.maxSponsorshipGasWei);
+    const committed = committedGasCost(this.sponsored.outstanding(now));
     if (!committed.known) {
       unavailable['deposit.committedWei'] =
         `${committed.unknown} restored sponsorships have no recorded gas cost until ${new Date(committed.until * 1000).toISOString()}`;
@@ -971,12 +968,11 @@ export class RelayerService {
       throw new ValidationError(`cannot read the paymaster's EntryPoint deposit: ${shortError(err)}`, -32004);
     }
     // Everything already promised and not yet expired, including this request's own reservation.
-    const budget = committedGasCost(this.sponsored.outstanding(now), cap);
+    const budget = committedGasCost(this.sponsored.outstanding(now));
     if (!budget.known) {
       throw new ValidationError(
         `${budget.unknown} live sponsorships restored from an earlier release have no recorded gas cost: ` +
-          `not signing until they expire at ${new Date(budget.until * 1000).toISOString()} ` +
-          '(or set MAX_SPONSORSHIP_GAS_WEI to budget them at that cap)',
+          `not signing until they expire at ${new Date(budget.until * 1000).toISOString()}`,
         -32004,
       );
     }

@@ -368,11 +368,9 @@ describe('sponsorship store', () => {
     expect(store.get(OTHER)).toBeUndefined();
     expect(store.get(PENDING)).toBeUndefined();
     expect(store.reserve(NH, a).ok).toBe(false);
-    // Without a per-operation cap the budget is unknown until the entry expires …
+    // Its cost is unknown, so the budget is unknown until the entry expires …
     expect(committedGasCost(store.outstanding(1_000))).toEqual({ known: false, unknown: 1, until: 2_000 });
-    // … with one, the entry is budgeted at the cap.
-    expect(committedGasCost(store.outstanding(1_000), 7n)).toEqual({ known: true, wei: 7n });
-    // After it expires the budget is known again.
+    // … after which it is known again.
     store.prune(2_001);
     expect(committedGasCost(store.outstanding(2_001))).toEqual({ known: true, wei: 0n });
     // The rewrite at start-up dropped the expired and the pending entry.
@@ -399,7 +397,7 @@ describe('sponsorship store', () => {
     expect(store.outstanding(2_000_000_001)).toEqual([]);
   });
 
-  it('committedGasCost sums known costs and budgets unknown ones only at an explicit cap', () => {
+  it('committedGasCost sums known costs and treats any unknown one as an unknown total', () => {
     const note = (validUntil: number, maxGasCostWei?: bigint): SponsoredNote => ({
       validUntil,
       sender: SENDER,
@@ -411,7 +409,8 @@ describe('sponsorship store', () => {
     expect(committedGasCost([])).toEqual({ known: true, wei: 0n });
     expect(committedGasCost([note(10, 3n), note(10, 4n)])).toEqual({ known: true, wei: 7n });
     expect(committedGasCost([note(10, 3n), note(20), note(15)])).toEqual({ known: false, unknown: 2, until: 20 });
-    expect(committedGasCost([note(10, 3n), note(20)], 100n)).toEqual({ known: true, wei: 103n });
+    // A single entry without a recorded cost makes the whole total unknown, however large the known part.
+    expect(committedGasCost([note(10, 10n ** 30n), note(20)])).toEqual({ known: false, unknown: 1, until: 20 });
   });
 });
 
